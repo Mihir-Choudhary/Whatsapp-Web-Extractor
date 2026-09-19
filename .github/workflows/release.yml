@@ -1,0 +1,62 @@
+name: release
+# Build standalone binaries with PyInstaller and attach them to a GitHub Release.
+# Triggers on a version tag (v*), or manually. PyInstaller can't cross-compile, so the
+# Windows .exe is built on a Windows runner and the Linux binary on an Ubuntu runner.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            out: wawf.exe
+            asset: wawf-windows-x64.exe
+          - os: ubuntu-latest
+            out: wawf
+            asset: wawf-linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller                 # build-only (not a runtime dep)
+          pip install -r requirements.txt
+      - name: Build
+        run: pyinstaller wawf.spec --noconfirm
+      - name: Rename artifact
+        shell: bash
+        run: cp "dist/${{ matrix.out }}" "${{ matrix.asset }}"
+      - name: Smoke test
+        shell: bash
+        run: ./${{ matrix.asset }} --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

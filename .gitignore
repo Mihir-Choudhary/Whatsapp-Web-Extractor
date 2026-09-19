@@ -1,0 +1,38 @@
+# NEVER commit real evidence, decrypted data, or credentials
+evidence/
+analysis/
+notes/
+STATE.md
+CONTINUE.md
+tools/reconnect/node_modules/
+reconnect_creds.json
+noise_keys.json
+*.pkl
+__pycache__/
+*.pyc
+
+# Runtime secrets/outputs — un-anchored so they match at the repo root TOO, not just
+# under tools/reconnect/. The frozen .exe writes these into the CURRENT directory
+# (creds_in.json = Noise private key; companion_enc_static.txt = the at-rest master key),
+# so a `git add .` from a repo clone must never be able to stage them.
+creds_in.json
+companion_enc_static.txt
+signal_state.json
+anchors.json
+notifs.json
+history_*.json
+
+# Akhil Dara's WAInsight is a SEPARATE MIT repo — do NOT bundle it
+WAInsight/
+wainsight_case/
+storage_export/
+wa_decrypted/
+
+# PyInstaller build artifacts (the recipe wawf.spec IS committed; the outputs are not)
+build/
+dist/
+*.log
+
+# reconnect runtime logs/outputs (secrets themselves are covered un-anchored above)
+tools/reconnect/baileys.log
+wa_sqlite/

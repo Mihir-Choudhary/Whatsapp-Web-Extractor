@@ -1,0 +1,11 @@
+{
+  "name": "wa-forensic-reconnect",
+  "version": "1.0.0",
+  "description": "Reconnect to WhatsApp with disk-recovered Noise creds to capture companion_enc_static",
+  "type": "commonjs",
+  "private": true,
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "qrcode-terminal": "^0.12.0"
+  }
+}

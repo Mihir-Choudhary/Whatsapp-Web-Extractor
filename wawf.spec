@@ -1,0 +1,38 @@
+# -*- mode: python ; coding: utf-8 -*-
+# PyInstaller spec for the wawf unified CLI (onefile). Build:  pyinstaller wawf.spec
+# Produces dist/wawf (Linux) or dist/wawf.exe (Windows). See BUILD.md for the Windows note.
+import glob, os
+from PyInstaller.utils.hooks import collect_all, collect_submodules
+
+datas, binaries, hiddenimports = [], [], []
+
+# Third-party packages the helpers import dynamically (not visible to static analysis).
+# websocket = websocket-client, used by wa_reconnect.py for the pure-Python Noise reconnect.
+for pkg in ("ccl_chromium_reader", "cramjam", "websocket"):
+    d, b, h = collect_all(pkg)
+    datas += d; binaries += b; hiddenimports += h
+hiddenimports += collect_submodules("cryptography")
+
+# Bundle every helper script as data so runpy + the runtime sys.path insert resolve them
+# (chromium_reader, wa_decrypt, export_baileys_creds, wa_forensic, export_sqlite,
+#  wa_reconnect + _wa_tokens, snappy_pure*, sclone, ...). They live under _MEIPASS/scripts at runtime.
+datas += [(f, "scripts") for f in glob.glob("scripts/*.py")]
+
+a = Analysis(
+    ["wawf.py"],
+    pathex=["scripts"],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hiddenimports,
+    hookspath=[],
+    runtime_hooks=[],
+    excludes=["tkinter", "PySide6", "PyQt5", "matplotlib", "numpy.testing"],
+    noarchive=False,
+)
+pyz = PYZ(a.pure)
+exe = EXE(
+    pyz, a.scripts, a.binaries, a.datas, [],
+    name="wawf",
+    debug=False, bootloader_ignore_signals=False, strip=False, upx=False,
+    runtime_tmpdir=None, console=True, disable_windowed_traceback=False,
+)

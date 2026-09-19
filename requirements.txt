@@ -1,0 +1,9 @@
+# Runtime dependencies for wawf (Linux/macOS "run with Python" path).
+# Windows users can just download the .exe from the releases page — no Python needed.
+#   pip install -r requirements.txt
+cryptography
+cramjam                 # pure-Python Snappy (Firefox IndexedDB + cached media)
+websocket-client        # imported as `websocket`; used by the pure-Python reconnect
+# Chromium/Chrome/Edge/Brave/Opera support (LevelDB + V8 deserialization):
+ccl_chromium_reader @ git+https://github.com/cclgroupltd/ccl_chromium_reader.git
+# For building the standalone binary, additionally: pip install pyinstaller  (see BUILD.md)
