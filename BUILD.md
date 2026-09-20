@@ -44,8 +44,10 @@ the helper's `__main__` in-process via `runpy`. In dev mode it just runs
 
 ## Verified (Linux onefile, PyInstaller 6.22.2, Python 3.14)
 - `wawf --help`, subcommand help, clean argparse errors
-- `decrypt` offline — root-key extraction for Firefox (51,577 msgs) and Chrome (23,481 msgs)
-- `decrypt --enc-static <correct>` — validated 40/40, all bodies decrypted, 0 failed
+- `decrypt` offline — root-key extraction on both Firefox and Chrome profiles (tens of thousands of msgs)
+- `decrypt --enc-static <correct>` — key validated against on-disk ciphertext, all bodies decrypted, 0 failed
 - `decrypt --enc-static <wrong>`   — rejected (exit 3), no output written
 - `creds` — Noise keypair X25519-verified, account identity recovered
+- `sqlite` — parse + key-validate pipeline, refuses a wrong key (exit 3), writes nothing on rejection
+- frozen `.exe`: `_runpy` dispatch (`sqlite`/`memory`), `history` guard, `memory` EOF/platform handling
 - exit codes: 0 ok · 1 error · 2 usage · 3 wrong key · 4 file-not-found
