@@ -358,9 +358,11 @@ def _prompt_yes(question, assume_yes=False):
         return False
 
 def _find_node():
-    """node(.exe) on PATH, or at a known install location — a freshly winget-installed Node is not yet on
-    this process's PATH. Returns the node path or None."""
+    """A bundled Node (standalone .exe), else node(.exe) on PATH, else a known install location (a freshly
+    winget-installed Node is not yet on this process's PATH). Returns the node path or None."""
     import shutil
+    bundled = os.path.join(HERE, "node", "node.exe") if sys.platform == "win32" else os.path.join(HERE, "node", "bin", "node")
+    if os.path.isfile(bundled): return bundled          # standalone build: Node is packaged inside the .exe
     n = shutil.which("node")
     if n: return n
     for c in [r"C:\Program Files\nodejs\node.exe", r"C:\Program Files (x86)\nodejs\node.exe",
@@ -426,6 +428,14 @@ def cmd_history(a):
     if node_dir and node_dir not in os.environ.get("PATH", "").split(os.pathsep):
         os.environ["PATH"] = node_dir + os.pathsep + os.environ.get("PATH", "")
     if not _ensure_baileys(rec, node, getattr(a, "yes", False)): return 2   # find Baileys, or offer npm install
+    # Where OUTPUTS (creds/state/anchors/recovered history) go. For a standalone .exe the Node client (rec)
+    # lives inside the temp extraction dir, which is wiped on exit — so write outputs to a persistent folder
+    # next to the executable instead, and keep the resume ledger there across runs.
+    if getattr(sys, "frozen", False) and os.path.abspath(rec).startswith(os.path.abspath(HERE)):
+        work = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "wawf-history")
+        os.makedirs(work, exist_ok=True); log.info("history data dir: %s", work)
+    else:
+        work = rec                                       # from-source / repo-adjacent: outputs live in tools/reconnect
     # engine args shared by creds / signal-state / anchors
     _resolve_source(a)                                   # no profile/--origin given -> auto-detect the browser
     if a.profile and os.path.isdir(os.path.join(a.profile, "IndexedDB")):
@@ -435,20 +445,20 @@ def cmd_history(a):
         if not origin: log.error("pass a profile or --origin"); return 2
         eng = ["--origin", origin]
     log.info("[1/4] recovering reconnect creds ...")
-    if cmd_creds(argparse.Namespace(profile=a.profile, origin=a.origin, out=os.path.join(rec, "creds_in.json"), _internal=True)):
+    if cmd_creds(argparse.Namespace(profile=a.profile, origin=a.origin, out=os.path.join(work, "creds_in.json"), _internal=True)):
         return 3
     log.info("[2/4] recovering Signal state (identity + prekeys) ...")
-    if _sub("export_signal_state.py", eng + ["--out", os.path.join(rec, "signal_state.json")]): return 3
+    if _sub("export_signal_state.py", eng + ["--out", os.path.join(work, "signal_state.json")]): return 3
     log.info("[3/4] building anchors from on-disk messages ...")
-    if _sub("build_anchors.py", eng + ["--out", os.path.join(rec, "anchors.json")]): return 3
+    if _sub("build_anchors.py", eng + ["--out", os.path.join(work, "anchors.json")]): return 3
     log.warning("[4/4] NETWORKED iterative history sync — logs in as your linked device and asks your phone, "
                 "chat by chat, for messages older than the cache, re-anchoring deeper each pass until the "
                 "phone's retained history is drained. Own account / authorized use only; this can take many "
                 "minutes and repeated passes.")
     env = dict(os.environ, TOP="100000", COUNT="50", MAXPAGES="100000")   # every chat, page until exhausted
-    anchors_path = os.path.join(rec, "anchors.json")
-    pass_out = os.path.join(rec, "history_recovered.json")   # human-facing final output (full accumulated set)
-    accum = os.path.join(rec, "history_all.json")            # resume ledger, accumulated across ALL runs
+    anchors_path = os.path.join(work, "anchors.json")
+    pass_out = os.path.join(work, "history_recovered.json")   # human-facing final output (full accumulated set)
+    accum = os.path.join(work, "history_all.json")            # resume ledger, accumulated across ALL runs
     master = {}                                              # msg id -> msg (dedup across passes AND runs)
 
     def _checkpoint(path):
@@ -471,7 +481,7 @@ def cmd_history(a):
         for p in range(1, MAX_PASSES + 1):
             log.info("──── history pass %d ────", p)
             if os.path.exists(pass_out): os.remove(pass_out)   # else a node failure re-reads a stale pass as "new"
-            rc = subprocess.run([node, "history_extract.js"], cwd=rec, env=env).returncode
+            rc = subprocess.run([node, os.path.join(rec, "history_extract.js")], cwd=work, env=env).returncode
             try: passd = json.load(open(pass_out))
             except Exception:
                 log.error("pass %d produced no output (node exit=%s; connection failed / phone not serving) "
