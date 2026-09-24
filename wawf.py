@@ -5,15 +5,20 @@ A single tool (PyInstaller-packageable to a .exe) that decrypts and exports What
 browser profile. Global -v/--verbose surfaces DEBUG logs and full tracebacks; --log-file mirrors
 everything to a file.
 
+The [profile] argument is OPTIONAL: with no profile and no --origin, wawf auto-detects an installed
+browser's WhatsApp Web profile (Chrome/Edge/Brave/Chromium/Opera/Vivaldi + Firefox) and uses the most
+recently updated one. Pass a profile dir (or Firefox --origin) to target a specific one.
+
 Subcommands:
-  decrypt   <profile|--origin> [--enc-static]  decrypt WhatsApp bodies (or offline inventory)
-  creds     <profile|--origin> [--out]         recover reconnect creds (Noise key + account id)
-  reconnect <profile|--origin|--creds>         log back in (pure-Python Noise) -> companion_enc_static
-  history   <profile|--origin>                  pull ALL chat history older than the cache from WA (needs Node)
+  decrypt   [profile|--origin] [--enc-static]  decrypt WhatsApp bodies (or offline inventory)
+  creds     [profile|--origin] [--out]         recover reconnect creds (Noise key + account id)
+  reconnect [profile|--origin|--creds]         log back in (pure-Python Noise) -> companion_enc_static
+  history   [profile|--origin]                  pull ALL chat history older than the cache from WA (needs Node)
   memory    (--live|--memimage F) [--deep]     find companion_enc_static in RAM/swap/hiberfil/process
-  sqlite    <profile|--origin> --enc-static    export decrypted chats to a SQLite DB (msgstore.db + wa.db)
+  sqlite    [profile|--origin] --enc-static    export decrypted chats to a SQLite DB (msgstore.db + wa.db)
 
 Examples:
+  wawf decrypt                                  # auto-detect the browser, offline inventory
   wawf decrypt ~/.config/google-chrome/Default --enc-static <b64> --out out/ -v
   wawf decrypt --origin .../storage/default/https+++web.whatsapp.com --enc-static <b64>
 """
@@ -41,11 +46,74 @@ def setup_logging(verbose: bool, logfile: str | None):
         fh.setLevel(logging.DEBUG); root.addHandler(fh)
         log.debug("logging to file %s", logfile)
 
+# ---------------- profile auto-detection ----------------
+def _wa_profiles():
+    """Scan installed browsers for a WhatsApp Web store. Returns [(engine, label, path), ...] where path is
+    a Chromium profile dir or a Firefox origin dir. Cross-platform (Windows / macOS / Linux)."""
+    import glob
+    home = os.path.expanduser("~"); hits = []
+    if sys.platform == "win32":
+        la = os.environ.get("LOCALAPPDATA", os.path.join(home, "AppData", "Local"))
+        ad = os.environ.get("APPDATA", os.path.join(home, "AppData", "Roaming"))
+        chromium = {"Chrome": os.path.join(la, "Google", "Chrome", "User Data"),
+                    "Edge": os.path.join(la, "Microsoft", "Edge", "User Data"),
+                    "Brave": os.path.join(la, "BraveSoftware", "Brave-Browser", "User Data"),
+                    "Chromium": os.path.join(la, "Chromium", "User Data"),
+                    "Vivaldi": os.path.join(la, "Vivaldi", "User Data"),
+                    "Opera": os.path.join(ad, "Opera Software", "Opera Stable")}
+        firefox = [os.path.join(ad, "Mozilla", "Firefox", "Profiles")]
+    elif sys.platform == "darwin":
+        asup = os.path.join(home, "Library", "Application Support")
+        chromium = {"Chrome": os.path.join(asup, "Google", "Chrome"), "Edge": os.path.join(asup, "Microsoft Edge"),
+                    "Brave": os.path.join(asup, "BraveSoftware", "Brave-Browser"), "Chromium": os.path.join(asup, "Chromium")}
+        firefox = [os.path.join(asup, "Firefox", "Profiles")]
+    else:
+        cfg = os.path.join(home, ".config")
+        chromium = {"Chrome": os.path.join(cfg, "google-chrome"), "Edge": os.path.join(cfg, "microsoft-edge"),
+                    "Brave": os.path.join(cfg, "BraveSoftware", "Brave-Browser"),
+                    "Chromium": os.path.join(cfg, "chromium"), "Opera": os.path.join(cfg, "opera")}
+        firefox = [os.path.join(home, ".mozilla", "firefox"),
+                   os.path.join(home, "snap", "firefox", "common", ".mozilla", "firefox")]
+    for browser, root in chromium.items():
+        if not os.path.isdir(root): continue
+        for prof in [root] + glob.glob(os.path.join(root, "*")):   # root itself (Opera) or Default/Profile* children
+            if os.path.isdir(prof) and glob.glob(os.path.join(prof, "IndexedDB", "https_web.whatsapp.com_0.indexeddb.leveldb")):
+                hits.append(("chromium", browser + "/" + os.path.basename(prof), prof))
+    for root in firefox:
+        for origin in glob.glob(os.path.join(root, "*", "storage", "default", "https+++web.whatsapp.com")):
+            hits.append(("firefox", "Firefox/" + os.path.basename(origin.split(os.sep + "storage")[0]), origin))
+    return hits
+
+def _example_cmd():
+    if sys.platform == "win32":
+        return ('  wawf decrypt "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\Default"\n'
+                '  wawf decrypt "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\Default"')
+    if sys.platform == "darwin":
+        return "  wawf decrypt ~/Library/Application\\ Support/Google/Chrome/Default"
+    return ("  wawf decrypt ~/.config/google-chrome/Default\n"
+            "  wawf decrypt --origin ~/.mozilla/firefox/<name>.default/storage/default/https+++web.whatsapp.com")
+
+def _resolve_source(a):
+    """If neither a profile nor --origin was given, auto-detect a browser's WhatsApp Web store and fill it in
+    (a.profile for Chromium, a.origin for Firefox). Raises SystemExit with examples if none is found."""
+    if getattr(a, "profile", None) or getattr(a, "origin", None): return
+    hits = _wa_profiles()
+    if not hits:
+        raise SystemExit("no WhatsApp Web profile auto-detected. Log into web.whatsapp.com in a browser first, "
+                         "or pass the profile dir explicitly, e.g.:\n" + _example_cmd())
+    hits.sort(key=lambda h: (os.path.getmtime(h[2]) if os.path.exists(h[2]) else 0), reverse=True)
+    eng, label, path = hits[0]
+    if eng == "firefox": a.origin = path
+    else: a.profile = path
+    log.info("auto-detected WhatsApp Web profile: %s  (%s)", label, path)
+    if len(hits) > 1:
+        log.info("%d profiles found; using the most recently updated. To pick another, pass its path: %s",
+                 len(hits), " | ".join(h[1] for h in hits))
+
 # ---------------- subcommands ----------------
 def _load_wa(a):
     WD, _ = _imp()
-    if not getattr(a, "profile", None) and not getattr(a, "origin", None):
-        raise SystemExit("pass a profile dir (Firefox/Chromium) or --origin <Firefox web.whatsapp.com dir>")
+    _resolve_source(a)                                   # no profile/--origin given -> auto-detect the browser
     engine, ls, root, msgs, meta = WD.load(getattr(a, "profile", None), getattr(a, "origin", None))
     log.info("engine=%s  messages=%d  root_key=%s  ls_keys=%d", engine, len(msgs), "yes" if root else "NO", len(ls))
     if not root: raise SystemExit("root key not found in wawc_db_enc/keys (is this a WhatsApp Web profile?)")
@@ -139,6 +207,7 @@ def cmd_creds(a):
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
     _, BC = _imp()
+    _resolve_source(a)                                   # no profile/--origin given -> auto-detect the browser
     if a.origin: ls, root, meta = BC.load_firefox(a.origin)
     elif a.profile and os.path.isdir(os.path.join(a.profile, "IndexedDB")): ls, root, meta = BC.load_chromium(a.profile)
     elif a.profile: ls, root, meta = BC.load_firefox(os.path.join(a.profile, "storage/default/https+++web.whatsapp.com"))
@@ -215,9 +284,7 @@ def cmd_reconnect(a):
     creds_path = a.creds
     if not creds_path:
         creds_path = "creds_in.json"
-        if not a.profile and not a.origin:
-            log.error("pass a profile or --origin (to recover creds), or --creds <existing creds_in.json>")
-            return 2
+        _resolve_source(a)                              # auto-detect the browser if no profile/--origin/--creds given
         rc = cmd_creds(argparse.Namespace(profile=a.profile, origin=a.origin, out=creds_path, _internal=True))
         if rc: return rc
     elif not os.path.exists(creds_path):
@@ -267,23 +334,100 @@ def _resume_master(accum, anchors_path, master):
         log.warning("could not reload prior history (%s) — starting fresh.", e)
         return 0
 
+def _find_reconnect_dir():
+    """Locate the Node client dir (tools/reconnect). The bundled Python scripts live inside the .exe, but the
+    Node/Baileys stack can't be frozen — so when running as a frozen exe, look next to the executable and in
+    the CWD (NOT in HERE, which is the temp extraction dir). Returns the dir, or None if not found."""
+    cands = [os.path.join(HERE, "tools", "reconnect")]
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        cands = [os.path.join(exe_dir, "tools", "reconnect"),                  # .exe sitting in the repo root
+                 os.path.join(os.path.dirname(exe_dir), "tools", "reconnect"), # .exe in dist/, repo one level up
+                 os.path.join(os.getcwd(), "tools", "reconnect")] + cands      # run from inside the repo
+    for c in cands:
+        if os.path.isfile(os.path.join(c, "history_extract.js")):
+            return c
+    return None
+
+def _prompt_yes(question, assume_yes=False):
+    if assume_yes:
+        log.info("%s  -> yes (--yes)", question); return True
+    try:
+        return input(question + " [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:                                     # non-interactive stdin -> treat as no
+        return False
+
+def _find_node():
+    """node(.exe) on PATH, or at a known install location — a freshly winget-installed Node is not yet on
+    this process's PATH. Returns the node path or None."""
+    import shutil
+    n = shutil.which("node")
+    if n: return n
+    for c in [r"C:\Program Files\nodejs\node.exe", r"C:\Program Files (x86)\nodejs\node.exe",
+              os.path.expandvars(r"%LOCALAPPDATA%\Programs\nodejs\node.exe")]:
+        if os.path.isfile(c): return c
+    return None
+
+def _ensure_node(assume_yes=False):
+    """Return a path to node, offering to install Node.js if it's missing. None if unavailable."""
+    node = _find_node()
+    if node: return node
+    if sys.platform != "win32":
+        log.error("Node.js is required for history sync. Install it from https://nodejs.org and re-run."); return None
+    if not _prompt_yes("history sync needs Node.js, which isn't installed. Install it now via winget?", assume_yes):
+        log.error("Node.js is required — install it from https://nodejs.org, then re-run `wawf history`."); return None
+    log.info("installing Node.js LTS via winget (a UAC prompt may appear) ...")
+    try:
+        subprocess.run(["winget", "install", "--id", "OpenJS.NodeJS.LTS", "-e",
+                        "--accept-source-agreements", "--accept-package-agreements"])
+    except Exception as e:
+        log.error("could not run winget (%s). Install Node.js from https://nodejs.org and re-run.", e); return None
+    node = _find_node()
+    if not node:
+        log.error("Node.js still not found after install — open a NEW terminal (to pick up PATH) and re-run."); return None
+    log.info("Node.js ready: %s", node)
+    return node
+
+def _ensure_baileys(rec, node, assume_yes=False):
+    """Ensure tools/reconnect/node_modules (Baileys) exists, offering to `npm install` if missing."""
+    if os.path.isdir(os.path.join(rec, "node_modules")): return True
+    if not _prompt_yes("the Baileys packages aren't installed in tools/reconnect. Run `npm install` now?", assume_yes):
+        log.error("Baileys is required — run `npm install` in %s once, then re-run.", rec); return False
+    npm_cli = os.path.join(os.path.dirname(node), "node_modules", "npm", "bin", "npm-cli.js")
+    cmd = [node, npm_cli, "install"] if os.path.isfile(npm_cli) else None
+    if cmd is None:
+        import shutil
+        cmd = [shutil.which("npm") or "npm", "install"]
+    log.info("running `npm install` in %s (one-time, ~1 min) ...", rec)
+    try:
+        rc = subprocess.run(cmd, cwd=rec).returncode
+    except Exception as e:
+        log.error("npm install failed (%s). Run it manually in %s.", e, rec); return False
+    if rc != 0 or not os.path.isdir(os.path.join(rec, "node_modules")):
+        log.error("npm install did not complete — run it manually in %s.", rec); return False
+    return True
+
 def cmd_history(a):
     """On-demand history sync: pull messages OLDER than the browser cache from WhatsApp's servers, per
     chat, going back toward each chat's start — ITERATIVELY: each pass re-anchors on the oldest message
     recovered so far and pulls deeper, accumulating (deduped) until it converges. Recovers creds + Signal
-    state + anchors (pure Python) then runs the Node/Baileys extractor. NEEDS Node + `npm install` in
-    tools/reconnect — the Signal/E2E stack isn't ported to Python, so this isn't in the .exe."""
-    import shutil
-    rec = os.path.join(HERE, "tools", "reconnect")
-    if getattr(sys, "frozen", False) or not os.path.isdir(rec):
-        log.error("history sync needs the repo's Node client (tools/reconnect) — it is NOT in the .exe. "
-                  "Clone the repo and run `wawf history` from source (with Node installed).")
+    state + anchors (pure Python) then runs the Node/Baileys extractor. The Signal/E2E stack isn't ported
+    to Python, so this needs Node + `npm install` in tools/reconnect: the .exe will use that folder if it
+    sits next to the executable (e.g. the repo's dist/), but it is not bundled inside the .exe itself."""
+    rec = _find_reconnect_dir()
+    if not rec:
+        log.error("history needs the Node client (tools/reconnect/history_extract.js), which is not bundled "
+                  "in the .exe. Run wawf from the repo, or keep the .exe inside the repo (its dist/ folder is "
+                  "fine) so tools/reconnect sits alongside it.")
         return 2
-    if not shutil.which("node"):
-        log.error("Node.js not found on PATH — install Node.js, then `cd tools/reconnect && npm install`."); return 2
-    if not os.path.isdir(os.path.join(rec, "node_modules")):
-        log.error("tools/reconnect/node_modules missing — run `cd tools/reconnect && npm install` once first."); return 2
+    node = _ensure_node(getattr(a, "yes", False))        # find Node, or offer to install it
+    if not node: return 2
+    node_dir = os.path.dirname(node)                     # make node/npm resolvable for this run's subprocesses
+    if node_dir and node_dir not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = node_dir + os.pathsep + os.environ.get("PATH", "")
+    if not _ensure_baileys(rec, node, getattr(a, "yes", False)): return 2   # find Baileys, or offer npm install
     # engine args shared by creds / signal-state / anchors
+    _resolve_source(a)                                   # no profile/--origin given -> auto-detect the browser
     if a.profile and os.path.isdir(os.path.join(a.profile, "IndexedDB")):
         eng = ["--profile", a.profile]
     else:
@@ -327,7 +471,7 @@ def cmd_history(a):
         for p in range(1, MAX_PASSES + 1):
             log.info("──── history pass %d ────", p)
             if os.path.exists(pass_out): os.remove(pass_out)   # else a node failure re-reads a stale pass as "new"
-            rc = subprocess.run(["node", "history_extract.js"], cwd=rec, env=env).returncode
+            rc = subprocess.run([node, "history_extract.js"], cwd=rec, env=env).returncode
             try: passd = json.load(open(pass_out))
             except Exception:
                 log.error("pass %d produced no output (node exit=%s; connection failed / phone not serving) "
@@ -355,6 +499,7 @@ def cmd_history(a):
     return 0
 
 def cmd_sqlite(a):
+    _resolve_source(a)                                   # no profile/--origin given -> auto-detect the browser
     extra = ["--enc-static", a.enc_static, "--out", a.out]
     if a.profile and os.path.isdir(os.path.join(a.profile, "IndexedDB")):
         extra += ["--profile", a.profile]          # Chromium (Chrome/Edge/Brave/Opera)
@@ -366,7 +511,24 @@ def cmd_sqlite(a):
         if origin: extra += ["--origin", origin]
     return _sub("export_sqlite.py", extra)
 
+def _win_utf8_console():
+    """Windows consoles default to a legacy codepage that renders our em dashes / arrows / box characters as
+    mojibake (e.g. `?`). Switch the console AND our stdio to UTF-8 for this run, restoring the codepage on
+    exit so the user's shell is left as it was. No-op off Windows."""
+    if sys.platform != "win32": return
+    try:
+        import ctypes, atexit
+        k = ctypes.windll.kernel32
+        old_out, old_in = k.GetConsoleOutputCP(), k.GetConsoleCP()
+        if k.SetConsoleOutputCP(65001): atexit.register(k.SetConsoleOutputCP, old_out)
+        if k.SetConsoleCP(65001): atexit.register(k.SetConsoleCP, old_in)
+        for s in (sys.stdout, sys.stderr):
+            try: s.reconfigure(encoding="utf-8")
+            except Exception: pass
+    except Exception: pass
+
 def main():
+    _win_utf8_console()                                  # render em dashes / arrows / box chars, not mojibake
     # frozen dispatch: `<exe> _runpy <script.py> [args...]` runs a bundled helper in-process
     # (a onefile binary cannot exec a loose .py; the helper's own __main__ runs via runpy).
     if getattr(sys, "frozen", False) and len(sys.argv) >= 3 and sys.argv[1] == "_runpy":
@@ -375,15 +537,21 @@ def main():
         sys.argv = [path] + sys.argv[3:]
         runpy.run_path(path, run_name="__main__")
         return 0
-    p = argparse.ArgumentParser(prog="wawf", description="WhatsApp Web Forensics (Firefox + Chromium)")
+    p = argparse.ArgumentParser(
+        prog="wawf", description="WhatsApp Web Forensics (Firefox + Chromium).",
+        epilog="Each command takes an optional [profile] dir (or Firefox --origin); omit it and wawf "
+               "auto-detects an installed browser's WhatsApp Web profile. Run `wawf <command> -h` for a "
+               "command's options. Quick start: `wawf decrypt` (auto-detect, offline inventory).",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("-v", "--verbose", action="store_true", help="DEBUG logs + full tracebacks on error")
     p.add_argument("--log-file", help="mirror all logs (DEBUG) to this file")
     sub = p.add_subparsers(dest="cmd", required=True)
     def prof_args(sp, origin=True):
-        sp.add_argument("profile", nargs="?", help="browser profile dir (Firefox .default or Chromium Default)")
+        sp.add_argument("profile", nargs="?", help="browser profile dir (Chromium Default / Firefox .default). "
+                        "OPTIONAL — omit it to auto-detect an installed browser's WhatsApp Web profile.")
         if origin: sp.add_argument("--origin", help="Firefox web.whatsapp.com storage dir (alternative to profile)")
     _ENC = "companion_enc_static (base64) — the at-rest key; get it from `memory` or `reconnect`"
-    s = sub.add_parser("decrypt", help="decrypt chats to transcripts.txt + chats.json (no key = offline inventory)",
+    s = sub.add_parser("decrypt", help="[profile|--origin] [--enc-static] — chats to transcripts.txt + chats.json (no key = offline inventory)",
                        description="Decrypt WhatsApp Web chats to transcripts.txt + chats.json. Without --enc-static "
                        "it prints an offline inventory (counts, date range, contacts) and decrypts no message text.")
     prof_args(s); s.add_argument("--enc-static", help=_ENC + " (omit for offline inventory only)")
@@ -391,23 +559,24 @@ def main():
     s.set_defaults(fn=cmd_decrypt)
     # when frozen (.exe) HERE is a temp extraction dir that's deleted on exit -> write creds to CWD instead
     _creds_out = "creds_in.json" if getattr(sys, "frozen", False) else os.path.join(HERE, "tools/reconnect/creds_in.json")
-    s = sub.add_parser("creds", help="recover + verify reconnect credentials (Noise key + account identity)",
+    s = sub.add_parser("creds", help="[profile|--origin] — recover + verify reconnect credentials (Noise key + account identity)",
                        description="Recover and verify the reconnect credentials (Noise X25519 keypair + account "
                        "identity) from disk. Read-only; writes creds_in.json for `reconnect`/history. No message text.")
     prof_args(s); s.add_argument("--out", default=_creds_out, help="where to write creds_in.json")
     s.set_defaults(fn=cmd_creds)
-    s = sub.add_parser("reconnect", help="log back in (pure-Python Noise) and capture companion_enc_static",
+    s = sub.add_parser("reconnect", help="[profile|--origin|--creds] — log back in (pure-Python Noise) and capture companion_enc_static",
                        description="Log back in as the linked companion device via the pure-Python Noise handshake "
                        "and capture companion_enc_static. NETWORKED — own account / authorized use only.")
     prof_args(s); s.add_argument("--creds", help="existing creds_in.json (skip creds recovery)")
     s.add_argument("--out", default="companion_enc_static.txt", help="where to write the captured key (default: companion_enc_static.txt)")
     s.set_defaults(fn=cmd_reconnect)
-    s = sub.add_parser("history", help="pull chat history older than the browser cache from your phone (needs Node)",
+    s = sub.add_parser("history", help="[profile|--origin] — pull chat history older than the browser cache from your phone (needs Node)",
                        description="Iteratively pull messages older than the browser cache from WhatsApp's servers, "
                        "per chat, re-anchoring deeper each pass and accumulating (deduped) across passes AND separate "
                        "runs until it converges. NETWORKED; needs Node + tools/reconnect (npm install); not in the .exe.")
-    prof_args(s); s.set_defaults(fn=cmd_history)
-    s = sub.add_parser("memory", help="find companion_enc_static in RAM / swap / hibernation",
+    prof_args(s); s.add_argument("--yes", action="store_true", help="auto-confirm installing Node / Baileys if missing")
+    s.set_defaults(fn=cmd_history)
+    s = sub.add_parser("memory", help="(--live | --memimage FILE) — find companion_enc_static in RAM / swap / hibernation",
                        description="Recover companion_enc_static from volatile memory (live process, RAM/swap dump, or "
                        "hibernation file). Live scanning of another process's memory typically needs elevated privileges.")
     s.add_argument("--live", action="store_true", help="scan the running browser's memory on this machine")
@@ -417,7 +586,7 @@ def main():
     s.add_argument("--origin", help="Firefox web.whatsapp.com storage dir (to validate a found key)")
     s.add_argument("--yes", action="store_true", help="skip the confirmation prompt for scanning live memory")
     s.set_defaults(fn=cmd_memory)
-    s = sub.add_parser("sqlite", help="export decrypted chats to Android msgstore.db + wa.db (needs key)",
+    s = sub.add_parser("sqlite", help="[profile|--origin] --enc-static — export decrypted chats to Android msgstore.db + wa.db",
                        description="Export decrypted chats to an Android-style SQLite database (msgstore.db + wa.db). "
                        "Requires --enc-static. Firefox (--origin) and Chromium (profile) both supported.")
     prof_args(s); s.add_argument("--enc-static", required=True, help=_ENC)
