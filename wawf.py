@@ -455,6 +455,16 @@ def cmd_history(a):
                 "chat by chat, for messages older than the cache, re-anchoring deeper each pass until the "
                 "phone's retained history is drained. Own account / authorized use only; this can take many "
                 "minutes and repeated passes.")
+    log.warning("HOW THIS WORKS / WHAT TO EXPECT: the messages come from your PHONE, not from WhatsApp's "
+                "servers — the servers only relay the request. So this is NOT guaranteed to return anything: "
+                "the phone often answers partially, and sometimes answers nothing at all EVEN WHEN it is "
+                "online and connected. WhatsApp throttles these requests and the exact conditions under "
+                "which a phone declines are still being researched, so an empty result is a known outcome, "
+                "not necessarily a failure of this tool.")
+    log.warning("FOR THE BEST CHANCE: open WhatsApp on your phone and leave it on-screen, keep it on a "
+                "stable network, and close every web.whatsapp.com tab (a live web session competes with "
+                "this one for the same linked device). Progress is saved after every pass, so re-running "
+                "later simply continues deeper — an empty pass loses nothing.")
     env = dict(os.environ, TOP="100000", COUNT="50", MAXPAGES="100000")   # every chat, page until exhausted
     anchors_path = os.path.join(work, "anchors.json")
     pass_out = os.path.join(work, "history_recovered.json")   # human-facing final output (full accumulated set)
@@ -476,7 +486,6 @@ def cmd_history(a):
     if n: log.info("resuming: %s messages recovered on prior runs — continuing older than those.", f"{n:,}")
 
     MIN_NEW, MAX_PASSES = 40, 25                             # stop when a pass adds < MIN_NEW; hard safety cap
-    got_output = False
     try:
         for p in range(1, MAX_PASSES + 1):
             log.info("──── history pass %d ────", p)
@@ -486,7 +495,6 @@ def cmd_history(a):
             except Exception:
                 log.error("pass %d produced no output (node exit=%s; connection failed / phone not serving) "
                           "— stopping.", p, rc); break
-            got_output = True
             new = 0
             for m in (passd.get("messages") or []):
                 i = m.get("id")
@@ -494,19 +502,37 @@ def cmd_history(a):
             by = _checkpoint(accum)                          # checkpoint the accumulated set every pass
             log.info("pass %d: +%d new  ·  total recovered: %d across %d chats", p, new, len(master), len(by))
             if new < MIN_NEW:
-                log.info("converged — last pass added < %d new messages. Stopping.", MIN_NEW); break
+                if master:
+                    log.info("converged — last pass added < %d new messages. Stopping.", MIN_NEW)
+                else:                                        # never say "converged" when nothing ever arrived
+                    log.warning("pass %d came back empty — the phone answered none of the requests. Stopping.", p)
+                break
             _deepen_anchors(anchors_path, master)            # go deeper next pass
     except KeyboardInterrupt:
         log.warning("interrupted — checkpointing %s recovered messages before exit.", f"{len(master):,}")
         _checkpoint(accum); _checkpoint(pass_out); raise
 
     by = _checkpoint(pass_out); _checkpoint(accum)           # final full accumulated set -> both files
-    log.info("HISTORY DONE: recovered %s messages older than the cache, across %d chats -> %s",
-             f"{len(master):,}", len(by), pass_out)
-    if not got_output and not master:
-        log.error("no history recovered (phone not serving / connection failed). Retry when your phone is "
-                  "online and active."); return 1
-    return 0
+    if master:
+        log.info("HISTORY DONE: recovered %s messages older than the cache, across %d chats -> %s",
+                 f"{len(master):,}", len(by), pass_out)
+        log.warning("NOTE: this is NOT necessarily everything. What you get is whatever your phone chose to "
+                    "serve — it commonly returns only part of what it holds, and the rest may come on a later "
+                    "run. Re-run `wawf history` to continue deeper from here (progress is saved and deduped); "
+                    "a pass that adds nothing does not mean the older history is gone.")
+        return 0
+    # Nothing at all came back: explain WHY, so an empty result isn't read as a broken tool.
+    log.warning("NOTHING RECOVERED — and this is usually NOT a fault in this tool. On-demand history is "
+                "served by your PHONE (WhatsApp's servers only relay the request). Your phone answered none "
+                "of the requests this run. That happens even with the phone online and connected: WhatsApp "
+                "throttles these requests, and the exact reasons a phone silently declines are still under "
+                "research. Everything up to this step (credentials, Signal state, anchors, the login) "
+                "succeeded — only the phone's replies were missing.")
+    log.warning("WHAT TO TRY: open WhatsApp on your phone and leave it on-screen on a stable network, close "
+                "every web.whatsapp.com tab (a live web session fights this one for the same linked device), "
+                "then run `wawf history` again. Nothing was lost — it resumes where it left off. Repeated "
+                "attempts at different times are normal and often succeed where one did not.")
+    return 1
 
 def cmd_sqlite(a):
     _resolve_source(a)                                   # no profile/--origin given -> auto-detect the browser
