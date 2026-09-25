@@ -5,20 +5,21 @@ A single tool (PyInstaller-packageable to a .exe) that decrypts and exports What
 browser profile. Global -v/--verbose surfaces DEBUG logs and full tracebacks; --log-file mirrors
 everything to a file.
 
-The [profile] argument is OPTIONAL: with no profile and no --origin, wawf auto-detects an installed
-browser's WhatsApp Web profile (Chrome/Edge/Brave/Chromium/Opera/Vivaldi + Firefox) and uses the most
-recently updated one. Pass a profile dir (or Firefox --origin) to target a specific one.
+You must say WHICH browser profile to examine: every data command takes a <profile> directory, or
+Firefox's --origin storage dir. Nothing is auto-detected — the profile is always your explicit choice.
+For Chromium (Chrome/Edge/Brave/Opera/Vivaldi) pass the profile dir itself, e.g. ".../User Data/Default";
+for Firefox pass the profile dir (".../<name>.default") or --origin for its web.whatsapp.com storage dir.
 
 Subcommands:
-  decrypt   [profile|--origin] [--enc-static]  decrypt WhatsApp bodies (or offline inventory)
-  creds     [profile|--origin] [--out]         recover reconnect creds (Noise key + account id)
-  reconnect [profile|--origin|--creds]         log back in (pure-Python Noise) -> companion_enc_static
-  history   [profile|--origin]                  pull ALL chat history older than the cache from WA (needs Node)
+  decrypt   <profile|--origin> [--enc-static]  decrypt WhatsApp bodies (or offline inventory)
+  creds     <profile|--origin> [--out]         recover reconnect creds (Noise key + account id)
+  reconnect <profile|--origin|--creds>         log back in (pure-Python Noise) -> companion_enc_static
+  history   <profile|--origin>                 pull ALL chat history older than the cache from WA (needs Node)
   memory    (--live|--memimage F) [--deep]     find companion_enc_static in RAM/swap/hiberfil/process
-  sqlite    [profile|--origin] --enc-static    export decrypted chats to a SQLite DB (msgstore.db + wa.db)
+  sqlite    <profile|--origin> --enc-static    export decrypted chats to a SQLite DB (msgstore.db + wa.db)
 
 Examples:
-  wawf decrypt                                  # auto-detect the browser, offline inventory
+  wawf decrypt "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\Default"        # offline inventory (no key)
   wawf decrypt ~/.config/google-chrome/Default --enc-static <b64> --out out/ -v
   wawf decrypt --origin .../storage/default/https+++web.whatsapp.com --enc-static <b64>
 """
@@ -46,69 +47,37 @@ def setup_logging(verbose: bool, logfile: str | None):
         fh.setLevel(logging.DEBUG); root.addHandler(fh)
         log.debug("logging to file %s", logfile)
 
-# ---------------- profile auto-detection ----------------
-def _wa_profiles():
-    """Scan installed browsers for a WhatsApp Web store. Returns [(engine, label, path), ...] where path is
-    a Chromium profile dir or a Firefox origin dir. Cross-platform (Windows / macOS / Linux)."""
-    import glob
-    home = os.path.expanduser("~"); hits = []
+# ---------------- profile / origin plumbing ----------------
+def _profile_help():
+    """Where browser profiles live on this OS, for help text and 'you must pass one' errors."""
     if sys.platform == "win32":
-        la = os.environ.get("LOCALAPPDATA", os.path.join(home, "AppData", "Local"))
-        ad = os.environ.get("APPDATA", os.path.join(home, "AppData", "Roaming"))
-        chromium = {"Chrome": os.path.join(la, "Google", "Chrome", "User Data"),
-                    "Edge": os.path.join(la, "Microsoft", "Edge", "User Data"),
-                    "Brave": os.path.join(la, "BraveSoftware", "Brave-Browser", "User Data"),
-                    "Chromium": os.path.join(la, "Chromium", "User Data"),
-                    "Vivaldi": os.path.join(la, "Vivaldi", "User Data"),
-                    "Opera": os.path.join(ad, "Opera Software", "Opera Stable")}
-        firefox = [os.path.join(ad, "Mozilla", "Firefox", "Profiles")]
-    elif sys.platform == "darwin":
-        asup = os.path.join(home, "Library", "Application Support")
-        chromium = {"Chrome": os.path.join(asup, "Google", "Chrome"), "Edge": os.path.join(asup, "Microsoft Edge"),
-                    "Brave": os.path.join(asup, "BraveSoftware", "Brave-Browser"), "Chromium": os.path.join(asup, "Chromium")}
-        firefox = [os.path.join(asup, "Firefox", "Profiles")]
-    else:
-        cfg = os.path.join(home, ".config")
-        chromium = {"Chrome": os.path.join(cfg, "google-chrome"), "Edge": os.path.join(cfg, "microsoft-edge"),
-                    "Brave": os.path.join(cfg, "BraveSoftware", "Brave-Browser"),
-                    "Chromium": os.path.join(cfg, "chromium"), "Opera": os.path.join(cfg, "opera")}
-        firefox = [os.path.join(home, ".mozilla", "firefox"),
-                   os.path.join(home, "snap", "firefox", "common", ".mozilla", "firefox")]
-    for browser, root in chromium.items():
-        if not os.path.isdir(root): continue
-        # glob.escape the fixed prefix: a literal [ or ] in a user's path is a glob character class and
-        # would silently match nothing (e.g. C:\Users\foo[work]\...).
-        for prof in [root] + glob.glob(os.path.join(glob.escape(root), "*")):   # root itself (Opera) or Default/Profile*
-            if os.path.isdir(prof) and os.path.isdir(os.path.join(prof, "IndexedDB", "https_web.whatsapp.com_0.indexeddb.leveldb")):
-                hits.append(("chromium", browser + "/" + os.path.basename(prof), prof))
-    for root in firefox:
-        for origin in glob.glob(os.path.join(glob.escape(root), "*", "storage", "default", "https+++web.whatsapp.com")):
-            hits.append(("firefox", "Firefox/" + os.path.basename(origin.split(os.sep + "storage")[0]), origin))
-    return hits
-
-def _example_cmd():
-    if sys.platform == "win32":
-        return ('  wawf decrypt "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\Default"\n'
-                '  wawf decrypt "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\Default"')
+        return ("  Chromium (pass the profile dir itself):\n"
+                "    %LOCALAPPDATA%\\Google\\Chrome\\User Data\\Default\n"
+                "    %LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\Default\n"
+                "    %LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data\\Default\n"
+                "  Firefox (profile dir, or --origin for its web.whatsapp.com storage dir):\n"
+                "    %APPDATA%\\Mozilla\\Firefox\\Profiles\\<name>.default")
     if sys.platform == "darwin":
-        return "  wawf decrypt ~/Library/Application\\ Support/Google/Chrome/Default"
-    return ("  wawf decrypt ~/.config/google-chrome/Default\n"
-            "  wawf decrypt --origin ~/.mozilla/firefox/<name>.default/storage/default/https+++web.whatsapp.com")
+        return ("  Chromium (pass the profile dir itself):\n"
+                "    ~/Library/Application Support/Google/Chrome/Default\n"
+                "    ~/Library/Application Support/Microsoft Edge/Default\n"
+                "  Firefox (profile dir, or --origin for its web.whatsapp.com storage dir):\n"
+                "    ~/Library/Application Support/Firefox/Profiles/<name>.default")
+    return ("  Chromium (pass the profile dir itself):\n"
+            "    ~/.config/google-chrome/Default\n"
+            "    ~/.config/microsoft-edge/Default\n"
+            "  Firefox (profile dir, or --origin for its web.whatsapp.com storage dir):\n"
+            "    ~/.mozilla/firefox/<name>.default\n"
+            "    --origin ~/.mozilla/firefox/<name>.default/storage/default/https+++web.whatsapp.com")
 
-def _wa_store_size(engine, path):
-    """Bytes of WhatsApp Web data in a detected profile. A browser that merely VISITED web.whatsapp.com (or
-    was logged out) leaves an almost-empty store, while a linked+synced session holds megabytes — so this is
-    a far better 'which profile is the real one' signal than a directory mtime."""
-    root = path if engine == "firefox" else os.path.join(
-        path, "IndexedDB", "https_web.whatsapp.com_0.indexeddb.leveldb")
-    total = 0
-    try:
-        for dirpath, _dirs, files in os.walk(root):
-            for f in files:
-                try: total += os.path.getsize(os.path.join(dirpath, f))
-                except OSError: pass
-    except Exception: pass
-    return total
+def _require_source(a, cmd="<command>"):
+    """Every data command needs an explicit profile (or Firefox --origin). Nothing is guessed: which
+    profile gets examined is always the user's choice. Fail with the paths to look in, not a bare usage line."""
+    if getattr(a, "profile", None) or getattr(a, "origin", None): return
+    raise SystemExit("no profile given. Pass the browser profile directory to examine, or --origin for a "
+                     "Firefox\nweb.whatsapp.com storage dir. Profiles are NOT auto-detected.\n\n"
+                     "Profile locations on this system:\n" + _profile_help() +
+                     "\n\nExample:\n  wawf " + cmd + " <profile-dir>")
 
 def _require_session(ls, what="that profile"):
     """A browser can hold WhatsApp Web storage without being a logged-in session (site merely visited, or
@@ -116,32 +85,12 @@ def _require_session(ls, what="that profile"):
     missing = [k for k in ("last-wid-md", "WAWebEncKeySalt", "WANoiseInfo") if k not in ls]
     if missing:
         raise SystemExit("%s has WhatsApp Web storage but is not a logged-in session (missing: %s). Log in to "
-                         "web.whatsapp.com in that browser, or pass a different profile explicitly."
-                         % (what, ", ".join(missing)))
-
-def _resolve_source(a):
-    """If neither a profile nor --origin was given, auto-detect a browser's WhatsApp Web store and fill it in
-    (a.profile for Chromium, a.origin for Firefox). Raises SystemExit with examples if none is found."""
-    if getattr(a, "profile", None) or getattr(a, "origin", None): return
-    hits = _wa_profiles()
-    if not hits:
-        raise SystemExit("no WhatsApp Web profile auto-detected. Log into web.whatsapp.com in a browser first, "
-                         "or pass the profile dir explicitly, e.g.:\n" + _example_cmd())
-    # Rank by how much WhatsApp data each store actually holds: a browser that merely visited the site (or
-    # was logged out) has a near-empty store and must not win over the real, synced session.
-    sized = sorted(((_wa_store_size(e, p), e, l, p) for e, l, p in hits), reverse=True)
-    size, eng, label, path = sized[0]
-    if eng == "firefox": a.origin = path
-    else: a.profile = path
-    log.info("auto-detected WhatsApp Web profile: %s  (%s MB)  %s", label, f"{size/1048576:.0f}", path)
-    if len(sized) > 1:
-        log.info("%d profiles found; using the one with the most data. To pick another, pass its path: %s",
-                 len(sized), " | ".join(f"{l} ({s/1048576:.0f} MB)" for s, _e, l, _p in sized))
+                         "web.whatsapp.com in that browser, or pass a different profile." % (what, ", ".join(missing)))
 
 # ---------------- subcommands ----------------
 def _load_wa(a):
     WD, _ = _imp()
-    _resolve_source(a)                                   # no profile/--origin given -> auto-detect the browser
+    _require_source(a, "decrypt")                           # a profile (or --origin) is required; nothing is auto-detected
     engine, ls, root, msgs, meta = WD.load(getattr(a, "profile", None), getattr(a, "origin", None))
     log.info("engine=%s  messages=%d  root_key=%s  ls_keys=%d", engine, len(msgs), "yes" if root else "NO", len(ls))
     if not root: raise SystemExit("root key not found in wawc_db_enc/keys (is this a WhatsApp Web profile?)")
@@ -236,7 +185,7 @@ def cmd_creds(a):
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
     _, BC = _imp()
-    _resolve_source(a)                                   # no profile/--origin given -> auto-detect the browser
+    _require_source(a, "creds")                             # a profile (or --origin) is required; nothing is auto-detected
     if a.origin: ls, root, meta = BC.load_firefox(a.origin)
     elif a.profile and os.path.isdir(os.path.join(a.profile, "IndexedDB")): ls, root, meta = BC.load_chromium(a.profile)
     elif a.profile: ls, root, meta = BC.load_firefox(os.path.join(a.profile, "storage/default/https+++web.whatsapp.com"))
@@ -314,7 +263,7 @@ def cmd_reconnect(a):
     creds_path = a.creds
     if not creds_path:
         creds_path = "creds_in.json"
-        _resolve_source(a)                              # auto-detect the browser if no profile/--origin/--creds given
+        _require_source(a, "reconnect")                         # a profile (or --origin) is required; nothing is auto-detected
         rc = cmd_creds(argparse.Namespace(profile=a.profile, origin=a.origin, out=creds_path, _internal=True))
         if rc: return rc
     elif not os.path.exists(creds_path):
@@ -491,7 +440,7 @@ def cmd_history(a):
     else:
         work = rec                                       # from-source / repo-adjacent: outputs live in tools/reconnect
     # engine args shared by creds / signal-state / anchors
-    _resolve_source(a)                                   # no profile/--origin given -> auto-detect the browser
+    _require_source(a, "history")                           # a profile (or --origin) is required; nothing is auto-detected
     if a.profile and os.path.isdir(os.path.join(a.profile, "IndexedDB")):
         eng = ["--profile", a.profile]
     else:
@@ -589,7 +538,7 @@ def cmd_history(a):
     return 1
 
 def cmd_sqlite(a):
-    _resolve_source(a)                                   # no profile/--origin given -> auto-detect the browser
+    _require_source(a, "sqlite")                            # a profile (or --origin) is required; nothing is auto-detected
     extra = ["--enc-static", a.enc_static, "--out", a.out]
     if a.profile and os.path.isdir(os.path.join(a.profile, "IndexedDB")):
         extra += ["--profile", a.profile]          # Chromium (Chrome/Edge/Brave/Opera)
@@ -629,19 +578,28 @@ def main():
         return 0
     p = argparse.ArgumentParser(
         prog="wawf", description="WhatsApp Web Forensics (Firefox + Chromium).",
-        epilog="Each command takes an optional [profile] dir (or Firefox --origin); omit it and wawf "
-               "auto-detects an installed browser's WhatsApp Web profile. Run `wawf <command> -h` for a "
-               "command's options. Quick start: `wawf decrypt` (auto-detect, offline inventory).",
+        epilog="YOU MUST PASS A PROFILE. Every data command needs the browser profile directory to examine\n"
+               "(or --origin for a Firefox web.whatsapp.com storage dir). Profiles are NOT auto-detected --\n"
+               "which profile gets examined is always your explicit choice.\n\n"
+               "Profile locations on this system:\n" + _profile_help() + "\n\n"
+               "Chromium = pass the profile dir itself (the folder containing 'IndexedDB').\n"
+               "Firefox  = pass the profile dir, or --origin for its web.whatsapp.com storage dir.\n\n"
+               "Run `wawf <command> -h` for that command's own options.\n"
+               "Start here (no key needed, read-only inventory):\n"
+               "  wawf decrypt <profile-dir>",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("-v", "--verbose", action="store_true", help="DEBUG logs + full tracebacks on error")
     p.add_argument("--log-file", help="mirror all logs (DEBUG) to this file")
     sub = p.add_subparsers(dest="cmd", required=True)
     def prof_args(sp, origin=True):
-        sp.add_argument("profile", nargs="?", help="browser profile dir (Chromium Default / Firefox .default). "
-                        "OPTIONAL — omit it to auto-detect an installed browser's WhatsApp Web profile.")
+        sp.add_argument("profile", nargs="?", metavar="profile",
+                        help="REQUIRED (unless --origin): the browser profile directory to examine. Chromium "
+                             "(Chrome/Edge/Brave/Opera/Vivaldi): the profile dir itself, e.g. "
+                             "'...\\User Data\\Default' or '~/.config/google-chrome/Default'. Firefox: the "
+                             "profile dir, e.g. '~/.mozilla/firefox/<name>.default'. Not auto-detected.")
         if origin: sp.add_argument("--origin", help="Firefox web.whatsapp.com storage dir (alternative to profile)")
     _ENC = "companion_enc_static (base64) — the at-rest key; get it from `memory` or `reconnect`"
-    s = sub.add_parser("decrypt", help="[profile|--origin] [--enc-static] — chats to transcripts.txt + chats.json (no key = offline inventory)",
+    s = sub.add_parser("decrypt", help="<profile|--origin> [--enc-static] — chats to transcripts.txt + chats.json (no key = offline inventory)",
                        description="Decrypt WhatsApp Web chats to transcripts.txt + chats.json. Without --enc-static "
                        "it prints an offline inventory (counts, date range, contacts) and decrypts no message text.")
     prof_args(s); s.add_argument("--enc-static", help=_ENC + " (omit for offline inventory only)")
@@ -649,18 +607,18 @@ def main():
     s.set_defaults(fn=cmd_decrypt)
     # when frozen (.exe) HERE is a temp extraction dir that's deleted on exit -> write creds to CWD instead
     _creds_out = "creds_in.json" if getattr(sys, "frozen", False) else os.path.join(HERE, "tools/reconnect/creds_in.json")
-    s = sub.add_parser("creds", help="[profile|--origin] — recover + verify reconnect credentials (Noise key + account identity)",
+    s = sub.add_parser("creds", help="<profile|--origin> — recover + verify reconnect credentials (Noise key + account identity)",
                        description="Recover and verify the reconnect credentials (Noise X25519 keypair + account "
                        "identity) from disk. Read-only; writes creds_in.json for `reconnect`/history. No message text.")
     prof_args(s); s.add_argument("--out", default=_creds_out, help="where to write creds_in.json")
     s.set_defaults(fn=cmd_creds)
-    s = sub.add_parser("reconnect", help="[profile|--origin|--creds] — log back in (pure-Python Noise) and capture companion_enc_static",
+    s = sub.add_parser("reconnect", help="<profile|--origin|--creds> — log back in (pure-Python Noise) and capture companion_enc_static",
                        description="Log back in as the linked companion device via the pure-Python Noise handshake "
                        "and capture companion_enc_static. NETWORKED — own account / authorized use only.")
     prof_args(s); s.add_argument("--creds", help="existing creds_in.json (skip creds recovery)")
     s.add_argument("--out", default="companion_enc_static.txt", help="where to write the captured key (default: companion_enc_static.txt)")
     s.set_defaults(fn=cmd_reconnect)
-    s = sub.add_parser("history", help="[profile|--origin] — pull chat history older than the browser cache from your phone (needs Node)",
+    s = sub.add_parser("history", help="<profile|--origin> — pull chat history older than the browser cache from your phone (needs Node)",
                        description="Iteratively pull messages older than the browser cache from WhatsApp's servers, "
                        "per chat, re-anchoring deeper each pass and accumulating (deduped) across passes AND separate "
                        "runs until it converges. NETWORKED; needs Node + tools/reconnect (npm install); not in the .exe.")
@@ -676,7 +634,7 @@ def main():
     s.add_argument("--origin", help="Firefox web.whatsapp.com storage dir (to validate a found key)")
     s.add_argument("--yes", action="store_true", help="skip the confirmation prompt for scanning live memory")
     s.set_defaults(fn=cmd_memory)
-    s = sub.add_parser("sqlite", help="[profile|--origin] --enc-static — export decrypted chats to Android msgstore.db + wa.db",
+    s = sub.add_parser("sqlite", help="<profile|--origin> --enc-static — export decrypted chats to Android msgstore.db + wa.db",
                        description="Export decrypted chats to an Android-style SQLite database (msgstore.db + wa.db). "
                        "Requires --enc-static. Firefox (--origin) and Chromium (profile) both supported.")
     prof_args(s); s.add_argument("--enc-static", required=True, help=_ENC)
