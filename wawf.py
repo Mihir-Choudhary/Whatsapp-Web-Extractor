@@ -76,11 +76,13 @@ def _wa_profiles():
                    os.path.join(home, "snap", "firefox", "common", ".mozilla", "firefox")]
     for browser, root in chromium.items():
         if not os.path.isdir(root): continue
-        for prof in [root] + glob.glob(os.path.join(root, "*")):   # root itself (Opera) or Default/Profile* children
-            if os.path.isdir(prof) and glob.glob(os.path.join(prof, "IndexedDB", "https_web.whatsapp.com_0.indexeddb.leveldb")):
+        # glob.escape the fixed prefix: a literal [ or ] in a user's path is a glob character class and
+        # would silently match nothing (e.g. C:\Users\foo[work]\...).
+        for prof in [root] + glob.glob(os.path.join(glob.escape(root), "*")):   # root itself (Opera) or Default/Profile*
+            if os.path.isdir(prof) and os.path.isdir(os.path.join(prof, "IndexedDB", "https_web.whatsapp.com_0.indexeddb.leveldb")):
                 hits.append(("chromium", browser + "/" + os.path.basename(prof), prof))
     for root in firefox:
-        for origin in glob.glob(os.path.join(root, "*", "storage", "default", "https+++web.whatsapp.com")):
+        for origin in glob.glob(os.path.join(glob.escape(root), "*", "storage", "default", "https+++web.whatsapp.com")):
             hits.append(("firefox", "Firefox/" + os.path.basename(origin.split(os.sep + "storage")[0]), origin))
     return hits
 
@@ -93,6 +95,30 @@ def _example_cmd():
     return ("  wawf decrypt ~/.config/google-chrome/Default\n"
             "  wawf decrypt --origin ~/.mozilla/firefox/<name>.default/storage/default/https+++web.whatsapp.com")
 
+def _wa_store_size(engine, path):
+    """Bytes of WhatsApp Web data in a detected profile. A browser that merely VISITED web.whatsapp.com (or
+    was logged out) leaves an almost-empty store, while a linked+synced session holds megabytes — so this is
+    a far better 'which profile is the real one' signal than a directory mtime."""
+    root = path if engine == "firefox" else os.path.join(
+        path, "IndexedDB", "https_web.whatsapp.com_0.indexeddb.leveldb")
+    total = 0
+    try:
+        for dirpath, _dirs, files in os.walk(root):
+            for f in files:
+                try: total += os.path.getsize(os.path.join(dirpath, f))
+                except OSError: pass
+    except Exception: pass
+    return total
+
+def _require_session(ls, what="that profile"):
+    """A browser can hold WhatsApp Web storage without being a logged-in session (site merely visited, or
+    logged out). Say so plainly instead of dying with a KeyError deep inside the key derivation."""
+    missing = [k for k in ("last-wid-md", "WAWebEncKeySalt", "WANoiseInfo") if k not in ls]
+    if missing:
+        raise SystemExit("%s has WhatsApp Web storage but is not a logged-in session (missing: %s). Log in to "
+                         "web.whatsapp.com in that browser, or pass a different profile explicitly."
+                         % (what, ", ".join(missing)))
+
 def _resolve_source(a):
     """If neither a profile nor --origin was given, auto-detect a browser's WhatsApp Web store and fill it in
     (a.profile for Chromium, a.origin for Firefox). Raises SystemExit with examples if none is found."""
@@ -101,14 +127,16 @@ def _resolve_source(a):
     if not hits:
         raise SystemExit("no WhatsApp Web profile auto-detected. Log into web.whatsapp.com in a browser first, "
                          "or pass the profile dir explicitly, e.g.:\n" + _example_cmd())
-    hits.sort(key=lambda h: (os.path.getmtime(h[2]) if os.path.exists(h[2]) else 0), reverse=True)
-    eng, label, path = hits[0]
+    # Rank by how much WhatsApp data each store actually holds: a browser that merely visited the site (or
+    # was logged out) has a near-empty store and must not win over the real, synced session.
+    sized = sorted(((_wa_store_size(e, p), e, l, p) for e, l, p in hits), reverse=True)
+    size, eng, label, path = sized[0]
     if eng == "firefox": a.origin = path
     else: a.profile = path
-    log.info("auto-detected WhatsApp Web profile: %s  (%s)", label, path)
-    if len(hits) > 1:
-        log.info("%d profiles found; using the most recently updated. To pick another, pass its path: %s",
-                 len(hits), " | ".join(h[1] for h in hits))
+    log.info("auto-detected WhatsApp Web profile: %s  (%s MB)  %s", label, f"{size/1048576:.0f}", path)
+    if len(sized) > 1:
+        log.info("%d profiles found; using the one with the most data. To pick another, pass its path: %s",
+                 len(sized), " | ".join(f"{l} ({s/1048576:.0f} MB)" for s, _e, l, _p in sized))
 
 # ---------------- subcommands ----------------
 def _load_wa(a):
@@ -156,6 +184,7 @@ def cmd_decrypt(a):
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     WD, engine, ls, root, msgs, meta = _load_wa(a)
+    _require_session(ls, getattr(a, "profile", None) or getattr(a, "origin", None))
     _summary(engine, ls, msgs, meta)
     salt_ws = base64.b64decode(json.loads(ls["WAWebEncKeySalt"]))
     sch = collections.Counter(m["scheme"] for m in msgs if m["data"])
@@ -212,6 +241,7 @@ def cmd_creds(a):
     elif a.profile and os.path.isdir(os.path.join(a.profile, "IndexedDB")): ls, root, meta = BC.load_chromium(a.profile)
     elif a.profile: ls, root, meta = BC.load_firefox(os.path.join(a.profile, "storage/default/https+++web.whatsapp.com"))
     else: log.error("pass a profile or --origin"); return 2
+    _require_session(ls, a.profile or a.origin)          # storage present but not logged in -> clear error
     salt = base64.b64decode(json.loads(ls["WAWebEncKeySalt"]))
     K = HKDF(algorithm=hashes.SHA256(), length=16, salt=salt, info=b"\x00").derive(root)
     ni = json.loads(ls["WANoiseInfo"]); ivs = [base64.b64decode(x) for x in json.loads(ls["WANoiseInfoIv"])]
@@ -338,12 +368,15 @@ def _find_reconnect_dir():
     """Locate the Node client dir (tools/reconnect). The bundled Python scripts live inside the .exe, but the
     Node/Baileys stack can't be frozen — so when running as a frozen exe, look next to the executable and in
     the CWD (NOT in HERE, which is the temp extraction dir). Returns the dir, or None if not found."""
-    cands = [os.path.join(HERE, "tools", "reconnect")]
+    cands = [os.path.join(HERE, "tools", "reconnect")]   # from source: the repo's own copy
     if getattr(sys, "frozen", False):
         exe_dir = os.path.dirname(os.path.abspath(sys.executable))
-        cands = [os.path.join(exe_dir, "tools", "reconnect"),                  # .exe sitting in the repo root
-                 os.path.join(os.path.dirname(exe_dir), "tools", "reconnect"), # .exe in dist/, repo one level up
-                 os.path.join(os.getcwd(), "tools", "reconnect")] + cands      # run from inside the repo
+        # A standalone build carries its own verified client (js + node_modules) under HERE, so prefer that
+        # over whatever happens to sit on disk — pairing the bundled Node with a stray/partial node_modules
+        # produces confusing failures. For the lean build HERE has no client, so the on-disk lookups apply.
+        cands = cands + [os.path.join(exe_dir, "tools", "reconnect"),                  # .exe in the repo root
+                         os.path.join(os.path.dirname(exe_dir), "tools", "reconnect"), # .exe in dist/, repo above
+                         os.path.join(os.getcwd(), "tools", "reconnect")]              # run from in the repo
     for c in cands:
         if os.path.isfile(os.path.join(c, "history_extract.js")):
             return c
@@ -361,8 +394,11 @@ def _find_node():
     """A bundled Node (standalone .exe), else node(.exe) on PATH, else a known install location (a freshly
     winget-installed Node is not yet on this process's PATH). Returns the node path or None."""
     import shutil
-    bundled = os.path.join(HERE, "node", "node.exe") if sys.platform == "win32" else os.path.join(HERE, "node", "bin", "node")
-    if os.path.isfile(bundled): return bundled          # standalone build: Node is packaged inside the .exe
+    # standalone build: Node is packaged inside the .exe under node/ (the spec bundles the bare binary, but
+    # accept bin/node too in case a whole Node dist is bundled instead).
+    for b in ([os.path.join(HERE, "node", "node.exe")] if sys.platform == "win32"
+              else [os.path.join(HERE, "node", "node"), os.path.join(HERE, "node", "bin", "node")]):
+        if os.path.isfile(b): return b
     n = shutil.which("node")
     if n: return n
     for c in [r"C:\Program Files\nodejs\node.exe", r"C:\Program Files (x86)\nodejs\node.exe",
@@ -409,6 +445,24 @@ def _ensure_baileys(rec, node, assume_yes=False):
         log.error("npm install did not complete — run it manually in %s.", rec); return False
     return True
 
+def _pick_work_dir():
+    """A persistent, WRITABLE folder for history output, used when the Node client is bundled inside the
+    .exe (whose extraction dir is wiped on exit). Prefers a folder beside the executable; falls back to
+    per-user app data when the executable sits somewhere read-only (Program Files, a share, read-only media)."""
+    cands = [os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "wawf-history")]
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~")
+    cands.append(os.path.join(base, "wawf", "history"))
+    for c in cands:
+        try:
+            os.makedirs(c, exist_ok=True)
+            probe = os.path.join(c, ".write-test")       # creatable != writable; prove it
+            with open(probe, "w"): pass
+            os.remove(probe)
+            return c
+        except Exception as e:
+            log.debug("work dir unusable (%s): %s", c, e)
+    raise SystemExit("could not create a writable folder for history output (tried: %s)" % ", ".join(cands))
+
 def cmd_history(a):
     """On-demand history sync: pull messages OLDER than the browser cache from WhatsApp's servers, per
     chat, going back toward each chat's start — ITERATIVELY: each pass re-anchors on the oldest message
@@ -431,9 +485,9 @@ def cmd_history(a):
     # Where OUTPUTS (creds/state/anchors/recovered history) go. For a standalone .exe the Node client (rec)
     # lives inside the temp extraction dir, which is wiped on exit — so write outputs to a persistent folder
     # next to the executable instead, and keep the resume ledger there across runs.
-    if getattr(sys, "frozen", False) and os.path.abspath(rec).startswith(os.path.abspath(HERE)):
-        work = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "wawf-history")
-        os.makedirs(work, exist_ok=True); log.info("history data dir: %s", work)
+    if getattr(sys, "frozen", False) and os.path.abspath(rec) == os.path.abspath(os.path.join(HERE, "tools", "reconnect")):
+        work = _pick_work_dir()                          # exact match on the bundled client, not a prefix test
+        log.info("history data dir: %s", work)
     else:
         work = rec                                       # from-source / repo-adjacent: outputs live in tools/reconnect
     # engine args shared by creds / signal-state / anchors
