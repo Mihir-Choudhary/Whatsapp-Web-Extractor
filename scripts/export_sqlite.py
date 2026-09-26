@@ -52,6 +52,21 @@ def as_bytes(x):                       # bytes across engines: Firefox {'__bytes
             if k in x: return bytes(x[k])
     return None
 
+def as_text(x):
+    """Coerce a value bound for a TEXT column to str. V8 stores Latin-1 ('one-byte') strings compactly and
+    the Chromium reader hands those back as raw bytes — e.g. a pushname like b'S\\xe4m\\xea\\xear'. Inserting
+    them unconverted makes SQLite put a BLOB in a TEXT column, which breaks consumers that expect text
+    (they end up iterating bytes and getting ints). Try UTF-8, then Latin-1, which is lossless for
+    one-byte strings; lossy replacement is a last resort so real names aren't mangled into U+FFFD."""
+    if x is None or isinstance(x, str): return x
+    if isinstance(x, (bytes, bytearray)):
+        b = bytes(x)
+        for enc in ('utf-8', 'latin-1'):
+            try: return b.decode(enc)
+            except UnicodeDecodeError: pass
+        return b.decode('utf-8', 'replace')
+    return str(x)
+
 # ---- engine-aware loader: expose L(key), ROOT (raw root key) and store(name) for BOTH Firefox
 #      (IndexedDB as SQLite + Snappy + Mozilla structured-clone) and Chromium (LevelDB + V8 via ccl).
 #      Everything below this block is engine-agnostic (operates on the decoded WA object dicts).
@@ -155,8 +170,8 @@ def decrypt_body(op):
     return ' '.join(dict.fromkeys(txt))[:8000] if txt else None
 
 def ser(x):
-    if isinstance(x, dict): return x.get('_serialized') or (f"{x.get('user')}@{x.get('server')}" if x.get('user') else None)
-    return x
+    if isinstance(x, dict): return as_text(x.get('_serialized')) or (f"{as_text(x.get('user'))}@{as_text(x.get('server'))}" if x.get('user') else None)
+    return as_text(x)                  # jids/ids can arrive as V8 one-byte bytes too -> always hand back str
 def norm_jid(x):
     x = ser(x)
     if not x: return None
@@ -247,11 +262,12 @@ for o in store(MSG_SID):
     md = None
     if o.get('mediaKey') or o.get('directPath'):
         md = {'media_key': base64.b64decode(o['mediaKey']) if o.get('mediaKey') else None,
-              'direct_path': o.get('directPath'), 'file_hash': o.get('filehash'), 'enc_file_hash': o.get('encFilehash'),
-              'mime_type': o.get('mimetype'), 'file_length': o.get('size'), 'media_name': o.get('filename'),
+              'direct_path': as_text(o.get('directPath')), 'file_hash': as_text(o.get('filehash')),
+              'enc_file_hash': as_text(o.get('encFilehash')),
+              'mime_type': as_text(o.get('mimetype')), 'file_length': o.get('size'), 'media_name': as_text(o.get('filename')),
               'caption': body if typ != 'chat' else None, 'width': o.get('width'), 'height': o.get('height'),
               'duration': o.get('duration'), 'type': typ,
-              'media_key_ts': o.get('mediaKeyTimestamp'), 'message_url': o.get('deprecatedMms3Url')}
+              'media_key_ts': o.get('mediaKeyTimestamp'), 'message_url': as_text(o.get('deprecatedMms3Url'))}
     th = o.get('thumbnail')
     ment = [ser(x) for x in (o.get('mentionedJidList') or []) if ser(x)]
     messages.append({
@@ -261,7 +277,7 @@ for o in store(MSG_SID):
         'timestamp': int(t)*1000 if t else 0, 'message_type': MTYPE.get(typ, 0), 'text_data': body,
         'status': ack_status(o.get('ack')), 'starred': 1 if o.get('star') or o.get('isStarred') else 0,
         'media': md, 'thumb': base64.b64decode(th) if isinstance(th, str) and th else None,
-        'mentioned': ment, 'quoted_id': o.get('quotedStanzaID'), 'quoted_type': o.get('quotedType'),
+        'mentioned': ment, 'quoted_id': as_text(o.get('quotedStanzaID')), 'quoted_type': as_text(o.get('quotedType')),
     })
     jid_id(chat_jid); chat_rowid(chat_jid)
     if messages[-1]['sender_jid']: jid_id(messages[-1]['sender_jid'])
@@ -313,7 +329,7 @@ for c in contacts:
 owner_jid_row = jid_id(OWNER_PHONE)
 for jraw, cid in _chat_id.items():
     ch = chats.get(jraw); g = groups.get(jraw)
-    subject = (g.get('subject') if g else None) or (ch.get('name') if ch else None)
+    subject = as_text((g.get('subject') if g else None) or (ch.get('name') if ch else None))
     created = g.get('creation') if g else None
     sort_ts = int((ch.get('t') if ch else 0) or 0)*1000
     archived = 1 if (ch and ch.get('archive')) else 0
@@ -357,7 +373,7 @@ for o in store(REACT_SID):
     addon_id += 1
     db.execute("INSERT INTO message_add_on(_id,parent_message_row_id,sender_jid_row_id,from_me,timestamp,message_add_on_type) VALUES(?,?,?,?,?,56)",
                (addon_id, pid, jid_id(snd) or 0, fm, int(o.get('timestamp') or 0)))
-    db.execute("INSERT INTO message_add_on_reaction(message_add_on_row_id,reaction) VALUES(?,?)", (addon_id, o.get('reactionText')))
+    db.execute("INSERT INTO message_add_on_reaction(message_add_on_row_id,reaction) VALUES(?,?)", (addon_id, as_text(o.get('reactionText'))))
     rx += 1
 
 # ---- receipts -> receipt_user (outgoing per-recipient) ----
@@ -398,7 +414,7 @@ for o in call_objs:                      # already collected during the single p
     db.execute("""INSERT INTO call_log(_id,jid_row_id,from_me,timestamp,video_call,duration,call_result,bytes_transferred,call_id,is_joinable_group_call)
                   VALUES(?,?,?,?,?,?,?,?,?,0)""",
                (cl, jid_id(other) or 0, fm, int(o.get('t') or 0)*1000, 1 if o.get('isVideoCall') else 0,
-                o.get('duration') or 0, 5 if str(o.get('callOutcome') or '').lower() in ('accepted','answered') else 2, 0, o.get('id')))
+                o.get('duration') or 0, 5 if str(o.get('callOutcome') or '').lower() in ('accepted','answered') else 2, 0, as_text(o.get('id'))))
 
 # ---- pins -> message_add_on(type 79) + message_add_on_pin_in_chat ----
 pn = 0
@@ -422,7 +438,8 @@ wa.execute("CREATE TABLE wa_contacts(_id INTEGER PRIMARY KEY AUTOINCREMENT, jid 
 for c in contacts:
     for jraw in {norm_jid(c.get('id')), norm_jid(c.get('phoneNumber'))} - {None}:
         wa.execute("INSERT OR IGNORE INTO wa_contacts(jid,display_name,wa_name,given_name,status,number) VALUES(?,?,?,?,?,?)",
-                   (jraw, c.get('name'), c.get('pushname'), c.get('shortName'), (c.get('textStatusString') or None), (c.get('phoneNumber') or '').split('@')[0]))
+                   (jraw, as_text(c.get('name')), as_text(c.get('pushname')), as_text(c.get('shortName')),
+                    as_text(c.get('textStatusString')) or None, (as_text(c.get('phoneNumber')) or '').split('@')[0]))
 wa.commit(); wa.close()
 
 # ============ decrypt cached media into Media/ + set file_path ============
