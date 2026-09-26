@@ -47,3 +47,8 @@ dist/
 # reconnect runtime logs/outputs (secrets themselves are covered un-anchored above)
 tools/reconnect/baileys.log
 wa_sqlite/
+
+# Media recovery working files. media_retry_in.json carries mediaKeys (secrets) and chat jids (PII);
+# media_retry_out.json carries freshly minted CDN capability URLs. Un-anchored, like the others.
+media_retry_in.json
+media_retry_out.json
