@@ -33,11 +33,34 @@ log = logging.getLogger("wawf")
 import audit                                   # optional chain-of-custody DB (no-op unless --audit)
 AUDIT = audit.NoAudit()                        # replaced in main() when --audit is given
 
+def _evidence_paths(src):
+    """The actual WhatsApp Web store inside a profile. Recording (and walking) a browser's ENTIRE profile is
+    slow and misleading — most of it is unrelated cache, and the byte count would describe the browser, not
+    the evidence. For Chromium that's the web.whatsapp.com IndexedDB (+ its external blob dir) and the
+    localStorage LevelDB; a Firefox --origin dir already IS the store."""
+    out = []
+    idb = os.path.join(src, "IndexedDB")
+    if os.path.isdir(idb):                                   # a Chromium profile dir
+        for suf in ("_0.indexeddb.leveldb", "_0.indexeddb.blob"):
+            p = os.path.join(idb, "https_web.whatsapp.com" + suf)
+            if os.path.exists(p): out.append(p)
+        lsd = os.path.join(src, "Local Storage", "leveldb")
+        if os.path.isdir(lsd): out.append(lsd)
+    return out or [src]
+
+def _audit_evidence(src):
+    """Record the evidence source: the profile/origin it came from, plus each WhatsApp store inside it with
+    file count and total bytes."""
+    if not src: return
+    AUDIT.event("evidence source", category="acquire", detail={"profile_or_origin": src})
+    for p in _evidence_paths(src):
+        AUDIT.dir_read(p, purpose="WhatsApp Web store (evidence)")
+
 def _audit_db_path(a):
     """The case DB lives WHERE THE OUTPUT GOES, so each case/output dir keeps its own history. --out may be
     a directory (decrypt/sqlite) or a file (creds/reconnect); commands without --out fall back to the CWD."""
-    v = getattr(a, "audit", None)
-    if v and v != "AUTO": return v                          # explicit --audit <path>
+    v = getattr(a, "audit_db", None)
+    if v: return v                                          # explicit --audit-db <path>
     out = getattr(a, "out", None)
     if out:
         base = out if (os.path.isdir(out) or not os.path.splitext(out)[1]) else os.path.dirname(out)
@@ -107,7 +130,7 @@ def _load_wa(a):
     WD, _ = _imp()
     _require_source(a, "decrypt")                           # a profile (or --origin) is required; nothing is auto-detected
     src = getattr(a, "profile", None) or getattr(a, "origin", None)
-    AUDIT.dir_read(src, purpose="WhatsApp Web browser storage (evidence source)")
+    _audit_evidence(src)
     # breadcrumb BEFORE the long read: if the process is killed mid-load, the audit trail still shows the
     # exact stage it died in rather than just 'started'.
     AUDIT.event("reading browser storage (IndexedDB + localStorage) — can take a minute on a large profile",
@@ -238,8 +261,16 @@ def cmd_creds(a):
     elif a.profile: ls, root, meta = BC.load_firefox(os.path.join(a.profile, "storage/default/https+++web.whatsapp.com"))
     else: log.error("pass a profile or --origin"); return 2
     _require_session(ls, a.profile or a.origin)          # storage present but not logged in -> clear error
+    _audit_evidence(a.profile or a.origin)
     salt = base64.b64decode(json.loads(ls["WAWebEncKeySalt"]))
     K = HKDF(algorithm=hashes.SHA256(), length=16, salt=salt, info=b"\x00").derive(root)
+    AUDIT.crypto("recover", key=root, key_source="IndexedDB wawc_db_enc/keys (root key)",
+                 input_desc=(a.profile or a.origin), detail={"root_len": len(root)})
+    # the PRELIMINARY key: derivable from disk alone, and what unwraps the Noise device credential
+    AUDIT.crypto("derive", algorithm="AES-CBC-128", kdf="HKDF-SHA256 len=16", scheme="0 (preliminary)",
+                 key=K, key_source="HKDF(root, salt=WAWebEncKeySalt, info=0x00)",
+                 salt=salt, salt_source="WAWebEncKeySalt (localStorage, on disk)", info="0x00",
+                 input_desc="WANoiseInfo (privKey/pubKey/certificateChainBuffer)")
     ni = json.loads(ls["WANoiseInfo"]); ivs = [base64.b64decode(x) for x in json.loads(ls["WANoiseInfoIv"])]
     def dc(b64, iv):
         pt = Cipher(algorithms.AES(K), modes.CBC(iv)).decryptor().update(base64.b64decode(b64)); p = pt[-1]
@@ -252,7 +283,15 @@ def cmd_creds(a):
                 try:
                     if X25519PrivateKey.from_private_bytes(a1).public_key().public_bytes_raw() == b1: priv, pub = a1, b1
                 except Exception as e: log.debug("x25519 check: %s", e)
-    if not priv: log.error("could not recover/verify the Noise keypair"); return 3
+    if not priv:
+        AUDIT.crypto("verify", algorithm="X25519", validated="FAILED",
+                     input_desc="WANoiseInfo.privKey/pubKey unwrapped with the preliminary key")
+        log.error("could not recover/verify the Noise keypair"); return 3
+    # the device credential itself: recovered from disk and proven by X25519 pub == derive(priv)
+    AUDIT.crypto("recover", algorithm="AES-CBC-128 unwrap + X25519", key=priv,
+                 key_source="WANoiseInfo.privKey (AES-CBC, preliminary key) — Noise device private key",
+                 validated="OK (X25519 pub matches)", input_desc="WANoiseInfo",
+                 detail={"noise_pub_fp": audit.fp(pub), "ivs_available": len(ivs)})
     cert = None                                       # device certificate chain (WANoiseInfo.certificateChainBuffer)
     if ni.get("certificateChainBuffer"):
         for iv in ivs:
@@ -276,6 +315,10 @@ def cmd_creds(a):
     abs_out = os.path.abspath(a.out)
     log.info("Noise keypair VERIFIED (X25519). reg_id=%s device=:%s account=%s -> %s",
              int(regid) if regid is not None else "?", dev, "present" if adv else "MISSING", abs_out)
+    # creds_in.json holds the recovered device private key: record it as an artifact (hashed), not its content
+    AUDIT.artifact(abs_out, kind="reconnect credentials (Noise keypair + account identity)",
+                   detail={"device": dev, "registrationId": (int(regid) if regid is not None else None),
+                           "account_present": bool(adv), "cert_chain": bool(cert)})
     if getattr(sys, "frozen", False) and not getattr(a, "_internal", False):
         # standalone `creds` on the .exe: the reconnect is the pure-Python `wawf reconnect`, or the
         # repo's Node client for history sync. (Suppressed when `reconnect` calls creds internally.)
@@ -677,10 +720,14 @@ def main():
         if origin: sp.add_argument("--origin", help="Firefox web.whatsapp.com storage dir (alternative to profile)")
     def audit_args(sp):
         """Opt-in chain-of-custody log. One DB per case, written where the output goes."""
-        sp.add_argument("--audit", nargs="?", const="AUTO", metavar="DB",
+        # NOTE: a plain flag, NOT nargs='?'. An optional-value option would swallow the following positional,
+        # so `wawf decrypt --audit <profile>` used to treat the profile as the DB path. Path goes in --audit-db.
+        sp.add_argument("--audit", action="store_true",
                         help="record a chain-of-custody audit DB: every file touched, key derivation, network "
-                             "request, artifact (with SHA-256) and error, crash-safe. Omit the value to write "
-                             "wawf_audit.db into the output directory (one DB per case), or give a path.")
+                             "request, artifact (with SHA-256) and error, crash-safe. Written as wawf_audit.db "
+                             "in the output directory (one DB per case); use --audit-db to choose the path.")
+        sp.add_argument("--audit-db", metavar="DB",
+                        help="path for the --audit case database (default: wawf_audit.db in the output dir)")
         sp.add_argument("--audit-secrets", action="store_true",
                         help="with --audit, also store raw key material in the DB (default: only SHA-256 "
                              "fingerprints + derivation parameters, so the log is not a secret store)")
@@ -729,7 +776,7 @@ def main():
     a = p.parse_args()
     setup_logging(a.verbose, a.log_file)
     global AUDIT
-    if getattr(a, "audit", None):
+    if getattr(a, "audit", False) or getattr(a, "audit_db", None):   # --audit-db alone implies --audit
         AUDIT = audit.open_db(_audit_db_path(a), record_secrets=getattr(a, "audit_secrets", False))
         if AUDIT.enabled:
             AUDIT.start_run(a.cmd, sys.argv)
