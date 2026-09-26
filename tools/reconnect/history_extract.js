@@ -58,18 +58,43 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     set:data=>{for(const t in data)for(const id in data[t])mem[`${t}-${id}`]=data[t][id];} };
   let version=[2,3000,1023223821]; try{version=(await B.fetchLatestBaileysVersion()).version;}catch(e){}
   const sock=makeWASocket({version,auth:{creds,keys:store},logger:P?P({level:'silent'}):undefined,
-    printQRInTerminal:false,markOnlineOnConnect:true,syncFullHistory:false,shouldSyncHistoryMessage:()=>true,
+    printQRInTerminal:false,markOnlineOnConnect:true,syncFullHistory:false,
+    // CRITICAL: accept ON_DEMAND history only, and decline the INITIAL (RECENT/bootstrap) sync.
+    // On connect Baileys calls ev.buffer() and holds every event. If this predicate says yes to the
+    // initial sync it waits for that notification, enters 'Syncing', and only flushes after
+    // resyncAppState() finishes -- which needs app-state-sync keys we deliberately do not restore (we
+    // recover identity + prekeys only). resyncAppState then never completes, ev.flush() never runs, and
+    // the on-demand replies sit in the buffer forever, looking exactly like "the phone never answered".
+    // Declining here takes the 'History sync is disabled by config' branch -> Online + immediate flush,
+    // while ON_DEMAND notifications are still processed (ON_DEMAND is in PROCESSABLE_HISTORY_TYPES).
+    shouldSyncHistoryMessage:h=>{ try{ return !!h && h.syncType===B.proto.Message.HistorySyncNotification.HistorySyncType.ON_DEMAND; }catch(e){ return false; } },
     getMessage:async()=>undefined,browser:['Forensic','Recovery','1.0']});
 
   // Correlate each response to its request by peerDataRequestSessionId (== the fetchMessageHistory id),
   // so a late/duplicate notification can't resolve a different chat's page. Only matched notifications
   // are downloaded. The resolver is bound to its own promise, so a late completion after timeout is a no-op.
   const pending=new Map();          // requestId -> resolver
+  let lastRequestId=null;           // fallback target when a reply's session id doesn't match (see resolveFor)
+  // Never DISCARD a history blob we were sent. If the reply's peerDataRequestSessionId doesn't match a
+  // pending id (id schemes can differ by WhatsApp/Baileys version), fall back to the outstanding request
+  // instead of dropping recovered evidence on the floor -- silently ignoring it is indistinguishable from
+  // "the phone never answered", which is exactly the failure that is hardest to diagnose.
+  const resolveFor=(sid,what)=>{
+    let r=sid!=null && pending.get(sid);
+    if(r){ pending.delete(sid); return r; }
+    if(pending.size===1){ const [k,v]=pending.entries().next().value;
+      console.error(`  [${what}] session id ${sid} did not match; attributing to the single outstanding request ${k}`);
+      pending.delete(k); return v; }
+    if(lastRequestId!=null && pending.has(lastRequestId)){ const v=pending.get(lastRequestId);
+      console.error(`  [${what}] session id ${sid} did not match; attributing to the most recent request ${lastRequestId}`);
+      pending.delete(lastRequestId); return v; }
+    console.error(`  [${what}] unmatched reply (session ${sid}) and no outstanding request -- ignored`);
+    return null;
+  };
   sock.ev.on('messages.upsert', async u=>{ for(const m of (u.messages||[])){
     const hn=histNotif(m.message); if(!hn) continue;
-    const sid=hn.peerDataRequestSessionId; const r=pending.get(sid);
-    if(!r) continue;                // not ours / already resolved -> ignore (don't even download)
-    pending.delete(sid);
+    const sid=hn.peerDataRequestSessionId; const r=resolveFor(sid,'upsert');
+    if(!r) continue;
     let msgs=null;                  // null = download/decode error (distinct from [] = genuine empty page)
     try{ const blob=await fetchBlob(hn.directPath); const inf=decryptHistory(blob, Buffer.from(hn.mediaKey));
          msgs=flatten(B.proto.HistorySync.decode(inf)); }
@@ -81,22 +106,27 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   // event Baileys officially emits for history; the messages.upsert path above may not fire on every
   // version, so listen on both and let whichever resolves first win (the other is a no-op).
   sock.ev.on('messaging-history.set', d=>{
-    const sid=d && d.peerDataRequestSessionId; const r=sid && pending.get(sid);
+    if(!d) return;
+    const sid=d.peerDataRequestSessionId; const r=resolveFor(sid,'messaging-history.set');
     if(!r) return;
-    pending.delete(sid);
     const msgs=(d.messages||[]).map(w=>({ chat:w.key&&w.key.remoteJid, id:w.key&&w.key.id, fromMe:!!(w.key&&w.key.fromMe),
       ts:Number(w.messageTimestamp)||0, text:txt(w.message), type:w.message?Object.keys(w.message)[0]:'?' })).filter(m=>m.chat&&m.id);
     console.error('  [messaging-history.set] '+msgs.length+' msgs for session '+sid);
     r(msgs);
   });
 
-  // Single request in SECONDS (WA-native messageTimestamp unit; the anchor message id is what the phone
-  // keys on, verified: sec requests returned data). Register the resolver under the returned id — the id
-  // resolves locally in ms, long before any round-trip response, so there is no registration race.
+  // The proto field is HistorySyncOnDemandRequest.oldestMsgTimestampMs -- MILLISECONDS. WhatsApp Web's
+  // on-disk `t` and WebMessageInfo.messageTimestamp are both SECONDS, so passing them through unscaled
+  // asked the phone for messages older than ~Jan 1970: nothing is older, so the phone answered nothing and
+  // every chat timed out as "no response". The browser's own button sends real milliseconds, which is why
+  // it worked where this did not. Convert here, tolerating a value that is already ms.
+  const toMs=t=>{ t=Number(t)||0; return t>1e12 ? Math.round(t) : Math.round(t*1000); };
+  // Register the resolver under the returned id — the id resolves locally, long before any round-trip
+  // response, so there is no registration race.
   const requestPage=(key,tsSec)=>new Promise(res=>{
     let id=null; const timer=setTimeout(()=>{ if(id!=null) pending.delete(id); res(null); }, 45000);
-    sock.fetchMessageHistory(COUNT, key, tsSec)
-      .then(rid=>{ id=rid; pending.set(rid, msgs=>{ clearTimeout(timer); res(msgs); }); })
+    sock.fetchMessageHistory(COUNT, key, toMs(tsSec))
+      .then(rid=>{ id=rid; lastRequestId=rid; pending.set(rid, msgs=>{ clearTimeout(timer); res(msgs); }); })
       .catch(e=>{ clearTimeout(timer); console.error('  fetch err', e.message); res(null); }); });
 
   const all=new Map(); let done=false, opened=false;
