@@ -28,6 +28,15 @@ wainsight_case/
 storage_export/
 wa_decrypted/
 
+# Chain-of-custody case databases (--audit) and common output dirs: these hold real evidence
+# (decrypted messages, contacts, evidence hashes, key fingerprints) and must never be committed.
+wawf_audit.db
+wawf_audit.db-wal
+wawf_audit.db-shm
+*.audit.db
+db/
+out/
+
 # PyInstaller build artifacts (the recipe wawf.spec IS committed; the outputs are not)
 build/
 dist/

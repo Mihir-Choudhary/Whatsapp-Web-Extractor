@@ -30,6 +30,21 @@ HERE = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))  # _
 sys.path.insert(0, os.path.join(HERE, "scripts")); sys.path.insert(0, HERE)
 log = logging.getLogger("wawf")
 
+import audit                                   # optional chain-of-custody DB (no-op unless --audit)
+AUDIT = audit.NoAudit()                        # replaced in main() when --audit is given
+
+def _audit_db_path(a):
+    """The case DB lives WHERE THE OUTPUT GOES, so each case/output dir keeps its own history. --out may be
+    a directory (decrypt/sqlite) or a file (creds/reconnect); commands without --out fall back to the CWD."""
+    v = getattr(a, "audit", None)
+    if v and v != "AUTO": return v                          # explicit --audit <path>
+    out = getattr(a, "out", None)
+    if out:
+        base = out if (os.path.isdir(out) or not os.path.splitext(out)[1]) else os.path.dirname(out)
+    else:
+        base = os.getcwd()
+    return os.path.join(base or ".", "wawf_audit.db")
+
 # lazy imports so a missing optional dep (e.g. ccl for Chromium) only bites when actually used
 def _imp():
     import wa_decrypt, export_baileys_creds
@@ -91,8 +106,22 @@ def _require_session(ls, what="that profile"):
 def _load_wa(a):
     WD, _ = _imp()
     _require_source(a, "decrypt")                           # a profile (or --origin) is required; nothing is auto-detected
+    src = getattr(a, "profile", None) or getattr(a, "origin", None)
+    AUDIT.dir_read(src, purpose="WhatsApp Web browser storage (evidence source)")
+    # breadcrumb BEFORE the long read: if the process is killed mid-load, the audit trail still shows the
+    # exact stage it died in rather than just 'started'.
+    AUDIT.event("reading browser storage (IndexedDB + localStorage) — can take a minute on a large profile",
+                category="stage", detail={"source": src})
     engine, ls, root, msgs, meta = WD.load(getattr(a, "profile", None), getattr(a, "origin", None))
     log.info("engine=%s  messages=%d  root_key=%s  ls_keys=%d", engine, len(msgs), "yes" if root else "NO", len(ls))
+    # what came OUT of the evidence source, and the on-disk root key that everything derives from
+    AUDIT.event("loaded WhatsApp Web store", category="acquire",
+                detail={"engine": engine, "source": src, "messages": len(msgs),
+                        "localStorage_keys": len(ls), "stores": meta, "root_key_found": bool(root)})
+    if root:
+        AUDIT.crypto("recover", key=root, key_source="IndexedDB wawc_db_enc/keys (root key, non-extractable "
+                     "CryptoKey serialized to disk)", input_desc=src,
+                     detail={"engine": engine, "root_len": len(root)})
     if not root: raise SystemExit("root key not found in wawc_db_enc/keys (is this a WhatsApp Web profile?)")
     return WD, engine, ls, root, msgs, meta
 
@@ -142,7 +171,15 @@ def cmd_decrypt(a):
         log.info("no --enc-static: offline inventory only. Message TEXT needs companion_enc_static "
                  "(memory or reconnect). Media keys/metadata are already on disk.")
         return 0
-    key = HKDF(algorithm=hashes.SHA256(), length=16, salt=base64.b64decode(a.enc_static), info=salt_ws).derive(root)
+    enc_static = base64.b64decode(a.enc_static)
+    key = HKDF(algorithm=hashes.SHA256(), length=16, salt=enc_static, info=salt_ws).derive(root)
+    # exactly what derived the message key, so an examiner can reproduce it: root (on disk) + server-only
+    # companion_enc_static as HKDF salt + WAWebEncKeySalt as info -> AES-CBC-128
+    AUDIT.crypto("derive", algorithm="AES-CBC-128", kdf="HKDF-SHA256 len=16", scheme="1 (final)",
+                 key=key, key_source="HKDF(root, salt=companion_enc_static, info=WAWebEncKeySalt)",
+                 salt=enc_static, salt_source="companion_enc_static (--enc-static; server-issued, never on disk)",
+                 info="WAWebEncKeySalt (localStorage)", input_desc="msgRowOpaqueData._data (scheme 1)",
+                 detail={"root_fp": audit.fp(root), "root_len": len(root), "salt_len": len(enc_static)})
     def strict(b): return bool(b) and len(b) % 16 == 0 and 1 <= b[-1] <= 16 and b[-b[-1]:] == bytes([b[-1]])*b[-1]
     refs = [m for m in msgs if m["data"] and m["scheme"] == 1][:40]; good = 0   # scheme-1 only
     for m in refs:
@@ -151,8 +188,12 @@ def cmd_decrypt(a):
         except Exception as e: log.debug("ref decrypt error: %s", e)
     if refs and good < len(refs) * 0.5:
         log.error("companion_enc_static INVALID for this profile/device (%d/%d refs validate). Not writing garbage.", good, len(refs))
+        AUDIT.crypto("verify", algorithm="AES-CBC-128", key=key, validated="FAILED",
+                     input_desc="strict PKCS7 on reference ciphertexts", records_in=len(refs), records_ok=good)
         return 3
     log.info("companion_enc_static VALIDATED (%d/%d reference messages)", good, len(refs))
+    AUDIT.crypto("verify", algorithm="AES-CBC-128", key=key, validated="OK",
+                 input_desc="strict PKCS7 on reference ciphertexts", records_in=len(refs), records_ok=good)
     os.makedirs(a.out, exist_ok=True)
     def ts(v):
         try:
@@ -177,6 +218,12 @@ def cmd_decrypt(a):
             for m in ml:
                 if m["text"]: f.write(f"[{m['t']}] {m['dir']:>4}: {m['text']}\n")
     log.info("decrypted %d bodies (%d failed) -> %s/ (chats.json + transcripts.txt)", ok, fail, a.out)
+    # outcome of the bulk decrypt + hashes of what was produced (so the exports are tamper-evident)
+    AUDIT.crypto("decrypt", algorithm="AES-CBC-128", scheme="1 (final)", key=key,
+                 input_desc="all scheme-1 msgRowOpaqueData bodies", records_in=ok + fail,
+                 records_ok=ok, records_failed=fail, detail={"chats": len(chats)})
+    AUDIT.artifact(f"{a.out}/chats.json", kind="decrypted chats (JSON)", records=ok)
+    AUDIT.artifact(f"{a.out}/transcripts.txt", kind="decrypted transcripts (text)", records=ok)
     return 0
 
 def cmd_creds(a):
@@ -245,7 +292,11 @@ def _sub(script, extra):
     else:
         cmd = [sys.executable, os.path.join(HERE, "scripts", script)] + extra
     log.info("running %s", " ".join(cmd))
-    return subprocess.run(cmd).returncode
+    AUDIT.event("helper subprocess start", category="subprocess", detail={"script": script, "argv": cmd})
+    rc = subprocess.run(cmd, env=AUDIT.child_env()).returncode   # child appends to the same case DB
+    AUDIT.event("helper subprocess exit rc=%s" % rc, level=("INFO" if rc == 0 else "ERROR"),
+                category="subprocess", detail={"script": script, "rc": rc})
+    return rc
 
 def cmd_memory(a):
     extra = []
@@ -394,6 +445,26 @@ def _ensure_baileys(rec, node, assume_yes=False):
         log.error("npm install did not complete — run it manually in %s.", rec); return False
     return True
 
+def _run_node_audited(cmd, cwd, env, pass_no):
+    """Run the Node extractor with its output teed into the audit DB. The client prints a line per chat page
+    request and per response ('page0: no response', '[+] OPEN', '[DONE] recovered=...'), so capturing them
+    puts every on-demand history request/response into the chain of custody. Console output is preserved."""
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding="utf-8", errors="replace", bufsize=1)
+    for line in proc.stdout:
+        line = line.rstrip("\r\n")
+        if not line: continue
+        sys.stderr.write(line + "\n"); sys.stderr.flush()    # keep the live view the user expects
+        low = line.lower()
+        if ("page" in low) or ("no response" in low) or ("[done]" in low) or ("open" in low) or ("closed" in low):
+            AUDIT.net("in" if ("response" in low or "[done]" in low or "closed" in low) else "out",
+                      endpoint="web.whatsapp.com", protocol="noise/websocket", kind="fetchMessageHistory",
+                      detail={"pass": pass_no, "line": line})
+        else:
+            AUDIT.event(line, category="node", detail={"pass": pass_no})
+    proc.wait()
+    return proc.returncode
+
 def _pick_work_dir():
     """A persistent, WRITABLE folder for history output, used when the Node client is bundled inside the
     .exe (whose extraction dir is wiped on exit). Prefers a folder beside the executable; falls back to
@@ -493,7 +564,11 @@ def cmd_history(a):
         for p in range(1, MAX_PASSES + 1):
             log.info("──── history pass %d ────", p)
             if os.path.exists(pass_out): os.remove(pass_out)   # else a node failure re-reads a stale pass as "new"
-            rc = subprocess.run([node, os.path.join(rec, "history_extract.js")], cwd=work, env=env).returncode
+            ncmd = [node, os.path.join(rec, "history_extract.js")]
+            AUDIT.event("history pass %d: launching Node extractor" % p, category="stage",
+                        detail={"argv": ncmd, "cwd": work})
+            rc = (_run_node_audited(ncmd, work, env, p) if AUDIT.enabled
+                  else subprocess.run(ncmd, cwd=work, env=env).returncode)
             try: passd = json.load(open(pass_out))
             except Exception:
                 log.error("pass %d produced no output (node exit=%s; connection failed / phone not serving) "
@@ -516,6 +591,8 @@ def cmd_history(a):
         _checkpoint(accum); _checkpoint(pass_out); raise
 
     by = _checkpoint(pass_out); _checkpoint(accum)           # final full accumulated set -> both files
+    AUDIT.artifact(pass_out, kind="recovered history (older than the browser cache)", records=len(master))
+    AUDIT.artifact(accum, kind="history resume ledger (cumulative across runs)", records=len(master))
     if master:
         log.info("HISTORY DONE: recovered %s messages older than the cache, across %d chats -> %s",
                  f"{len(master):,}", len(by), pass_out)
@@ -598,32 +675,41 @@ def main():
                              "'...\\User Data\\Default' or '~/.config/google-chrome/Default'. Firefox: the "
                              "profile dir, e.g. '~/.mozilla/firefox/<name>.default'. Not auto-detected.")
         if origin: sp.add_argument("--origin", help="Firefox web.whatsapp.com storage dir (alternative to profile)")
+    def audit_args(sp):
+        """Opt-in chain-of-custody log. One DB per case, written where the output goes."""
+        sp.add_argument("--audit", nargs="?", const="AUTO", metavar="DB",
+                        help="record a chain-of-custody audit DB: every file touched, key derivation, network "
+                             "request, artifact (with SHA-256) and error, crash-safe. Omit the value to write "
+                             "wawf_audit.db into the output directory (one DB per case), or give a path.")
+        sp.add_argument("--audit-secrets", action="store_true",
+                        help="with --audit, also store raw key material in the DB (default: only SHA-256 "
+                             "fingerprints + derivation parameters, so the log is not a secret store)")
     _ENC = "companion_enc_static (base64) — the at-rest key; get it from `memory` or `reconnect`"
     s = sub.add_parser("decrypt", help="<profile|--origin> [--enc-static] — chats to transcripts.txt + chats.json (no key = offline inventory)",
                        description="Decrypt WhatsApp Web chats to transcripts.txt + chats.json. Without --enc-static "
                        "it prints an offline inventory (counts, date range, contacts) and decrypts no message text.")
     prof_args(s); s.add_argument("--enc-static", help=_ENC + " (omit for offline inventory only)")
     s.add_argument("--out", default="wa_decrypted", help="output dir for transcripts.txt + chats.json (default: wa_decrypted)")
-    s.set_defaults(fn=cmd_decrypt)
+    audit_args(s); s.set_defaults(fn=cmd_decrypt)
     # when frozen (.exe) HERE is a temp extraction dir that's deleted on exit -> write creds to CWD instead
     _creds_out = "creds_in.json" if getattr(sys, "frozen", False) else os.path.join(HERE, "tools/reconnect/creds_in.json")
     s = sub.add_parser("creds", help="<profile|--origin> — recover + verify reconnect credentials (Noise key + account identity)",
                        description="Recover and verify the reconnect credentials (Noise X25519 keypair + account "
                        "identity) from disk. Read-only; writes creds_in.json for `reconnect`/history. No message text.")
     prof_args(s); s.add_argument("--out", default=_creds_out, help="where to write creds_in.json")
-    s.set_defaults(fn=cmd_creds)
+    audit_args(s); s.set_defaults(fn=cmd_creds)
     s = sub.add_parser("reconnect", help="<profile|--origin|--creds> — log back in (pure-Python Noise) and capture companion_enc_static",
                        description="Log back in as the linked companion device via the pure-Python Noise handshake "
                        "and capture companion_enc_static. NETWORKED — own account / authorized use only.")
     prof_args(s); s.add_argument("--creds", help="existing creds_in.json (skip creds recovery)")
     s.add_argument("--out", default="companion_enc_static.txt", help="where to write the captured key (default: companion_enc_static.txt)")
-    s.set_defaults(fn=cmd_reconnect)
+    audit_args(s); s.set_defaults(fn=cmd_reconnect)
     s = sub.add_parser("history", help="<profile|--origin> — pull chat history older than the browser cache from your phone (needs Node)",
                        description="Iteratively pull messages older than the browser cache from WhatsApp's servers, "
                        "per chat, re-anchoring deeper each pass and accumulating (deduped) across passes AND separate "
                        "runs until it converges. NETWORKED; needs Node + tools/reconnect (npm install); not in the .exe.")
     prof_args(s); s.add_argument("--yes", action="store_true", help="auto-confirm installing Node / Baileys if missing")
-    s.set_defaults(fn=cmd_history)
+    audit_args(s); s.set_defaults(fn=cmd_history)
     s = sub.add_parser("memory", help="(--live | --memimage FILE) — find companion_enc_static in RAM / swap / hibernation",
                        description="Recover companion_enc_static from volatile memory (live process, RAM/swap dump, or "
                        "hibernation file). Live scanning of another process's memory typically needs elevated privileges.")
@@ -633,28 +719,48 @@ def main():
     s.add_argument("--enc-static", help="verify this candidate key against on-disk ciphertext instead of scanning")
     s.add_argument("--origin", help="Firefox web.whatsapp.com storage dir (to validate a found key)")
     s.add_argument("--yes", action="store_true", help="skip the confirmation prompt for scanning live memory")
-    s.set_defaults(fn=cmd_memory)
+    audit_args(s); s.set_defaults(fn=cmd_memory)
     s = sub.add_parser("sqlite", help="<profile|--origin> --enc-static — export decrypted chats to Android msgstore.db + wa.db",
                        description="Export decrypted chats to an Android-style SQLite database (msgstore.db + wa.db). "
                        "Requires --enc-static. Firefox (--origin) and Chromium (profile) both supported.")
     prof_args(s); s.add_argument("--enc-static", required=True, help=_ENC)
     s.add_argument("--out", default="wa_sqlite", help="output dir for msgstore.db + wa.db (default: wa_sqlite)")
-    s.set_defaults(fn=cmd_sqlite)
+    audit_args(s); s.set_defaults(fn=cmd_sqlite)
     a = p.parse_args()
     setup_logging(a.verbose, a.log_file)
+    global AUDIT
+    if getattr(a, "audit", None):
+        AUDIT = audit.open_db(_audit_db_path(a), record_secrets=getattr(a, "audit_secrets", False))
+        if AUDIT.enabled:
+            AUDIT.start_run(a.cmd, sys.argv)
+            # mirror EVERY log record (and any exc_info traceback) into the DB, so the trail is complete
+            logging.getLogger().addHandler(AUDIT.logging_handler())
+            log.info("audit: case %s  run %s  -> %s", AUDIT.case_id, AUDIT.run_id, AUDIT.path)
+            if AUDIT.record_secrets:
+                log.warning("--audit-secrets: raw key material WILL be stored in %s — protect it accordingly.",
+                            AUDIT.path)
     t0 = time.time()
+    rc, status, err, tb = 0, "ok", None, None
     try:
         rc = a.fn(a)
+        status = "ok" if not rc else "error"
     except SystemExit as e:
-        log.error("%s", e); return int(e.code) if isinstance(e.code, int) else 1
+        log.error("%s", e); rc = int(e.code) if isinstance(e.code, int) else 1
+        status, err = "error", e
+    except KeyboardInterrupt:
+        log.error("interrupted by user"); rc, status = 130, "interrupted"
     except FileNotFoundError as e:
-        log.error("file not found: %s", e); (a.verbose and log.exception("traceback")); return 4
+        log.error("file not found: %s", e); (a.verbose and log.exception("traceback"))
+        import traceback as _tb; rc, status, err, tb = 4, "error", e, _tb.format_exc()
     except Exception as e:
         log.error("%s: %s", type(e).__name__, e)
         log.exception("traceback") if a.verbose else log.error("(re-run with -v for the full traceback)")
-        return 1
+        import traceback as _tb; rc, status, err, tb = 1, "error", e, _tb.format_exc()
     finally:
         log.debug("elapsed %.1fs", time.time() - t0)
+        # record the outcome even on failure: a 'running' status left behind means the process was killed
+        AUDIT.end_run(rc or 0, status=status, error=err, tb=tb)
+        AUDIT.close()
     return rc or 0
 
 if __name__ == "__main__":

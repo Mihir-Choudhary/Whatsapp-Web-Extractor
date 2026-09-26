@@ -37,6 +37,10 @@ _ap.add_argument('--origin', default=None, help='Firefox web.whatsapp.com storag
 _ap.add_argument('--profile', default=None, help='Chromium profile dir (Chrome/Edge/Brave .../Default)')
 _ap.add_argument('--out', default='wa_sqlite', help='output directory for the SQLite DB + Media')
 _args = _ap.parse_args()
+import audit                                   # appends to the SAME case DB as the parent (WAWF_AUDIT_DB)
+A = audit.from_env("sqlite")
+A.event("export_sqlite start", category="stage",
+        detail={"profile": _args.profile, "origin": _args.origin, "out": _args.out})
 SALT = base64.b64decode(_args.enc_static)
 OUT  = _args.out
 # NOTE: output dirs are created only AFTER key validation passes (below), so a rejected
@@ -124,6 +128,13 @@ _salt = L('WAWebEncKeySalt')
 if _salt is None: print('ERROR: WAWebEncKeySalt not in localStorage — not a WhatsApp Web profile?'); sys.exit(2)
 INFO = base64.b64decode(json.loads(_salt))
 MSGKEY = HKDF(algorithm=hashes.SHA256(), length=16, salt=SALT, info=INFO).derive(ROOT)
+A.dir_read(_args.profile or O, purpose="WhatsApp Web browser storage (evidence source)")
+A.crypto("recover", key=ROOT, key_source="IndexedDB wawc_db_enc/keys (root key)",
+         input_desc=(_args.profile or O), detail={"engine": "chromium" if _is_chromium else "firefox"})
+A.crypto("derive", algorithm="AES-CBC-128", kdf="HKDF-SHA256 len=16", scheme="1 (final)", key=MSGKEY,
+         key_source="HKDF(root, salt=companion_enc_static, info=WAWebEncKeySalt)",
+         salt=SALT, salt_source="companion_enc_static (--enc-static)", info="WAWebEncKeySalt (localStorage)",
+         input_desc="msgRowOpaqueData._data (scheme 1)")
 
 def pk7(b):
     if not b or len(b) % 16: return b
@@ -225,9 +236,14 @@ for _iv, _ct in _refs:
         if _strict_pk7(Cipher(algorithms.AES(MSGKEY), modes.CBC(_iv)).decryptor().update(_ct)): _good += 1
     except Exception: pass
 if _refs and _good < len(_refs) * 0.5:
+    A.crypto("verify", algorithm="AES-CBC-128", key=MSGKEY, validated="FAILED",
+             input_desc="strict PKCS7 on reference bodies", records_in=len(_refs), records_ok=_good)
+    A.end_run(3, status="error", error=RuntimeError("companion_enc_static INVALID (%d/%d)" % (_good, len(_refs))))
     print(f"ERROR: companion_enc_static is INVALID for this profile/device — only {_good}/{len(_refs)} "
           f"reference message bodies validate. Refusing to write a garbage msgstore. (Wrong key, empty key, "
           f"or wrong browser's salt.)"); sys.exit(3)
+A.crypto("verify", algorithm="AES-CBC-128", key=MSGKEY, validated="OK",
+         input_desc="strict PKCS7 on reference bodies", records_in=len(_refs), records_ok=_good)
 print(f"[+] companion_enc_static VALIDATED ({_good}/{len(_refs)} reference bodies).")
 os.makedirs(OUT, exist_ok=True); os.makedirs(f'{OUT}/Media/WhatsApp Web', exist_ok=True)
 
@@ -483,6 +499,14 @@ for f in (glob.glob(C + '/*/*.final') if C else []):
 db.commit(); db.close()
 print(f"WROTE SQLite DB: {mp} + {wp}  (+ {OUT}/Media)")
 print(f"  jids={len(_jid_id)} chats={len(_chat_id)} messages={mid} mentions={ment_id} reactions={rx} receipts={rc} polls={pl}/votes={pv} media_decrypted_to_disk={decrypted}")
+A.crypto("decrypt", algorithm="AES-CBC-128", scheme="1 (final)", key=MSGKEY,
+         input_desc="all scheme-1 message bodies", records_in=mid, records_ok=mid)
+A.artifact(mp, kind="Android msgstore.db (decrypted messages)", records=mid)
+A.artifact(wp, kind="Android wa.db (contacts)", records=len(contacts))
+A.event("export_sqlite complete", category="stage",
+        detail={"jids": len(_jid_id), "chats": len(_chat_id), "messages": mid, "mentions": ment_id,
+                "reactions": rx, "receipts": rc, "polls": pl, "votes": pv, "media_written": decrypted})
+A.end_run(0, status="ok")
 # ---- human-readable summary ----
 import datetime as _dt
 _secs=[m['timestamp']/1000 for m in messages if m.get('timestamp') and 1e9 < m['timestamp']/1000 < 2e9]

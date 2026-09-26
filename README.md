@@ -44,6 +44,40 @@ build your own binary for any OS with `pyinstaller wawf.spec` — see [BUILD.md]
 
 Add `-v` for full logs and tracebacks, `--log-file FILE` to save them, `--out DIR` to choose the output folder.
 
+## Chain of custody — `--audit` (optional)
+
+Add `--audit` to any command and the tool records everything it did into a SQLite **case database**, written
+into the output directory (one DB per case — never a single global log):
+
+```bash
+wawf decrypt <profile> --enc-static <b64> --out out/ --audit     # -> out/wawf_audit.db
+wawf sqlite  <profile> --enc-static <b64> --out db/  --audit     # appends to db/wawf_audit.db
+wawf decrypt <profile> --audit /cases/acme/custody.db            # or name the DB yourself
+```
+
+Re-running **appends** a new `run` row, so a whole workflow (`creds` → `reconnect` → `decrypt` → `sqlite`)
+accumulates in one case history. Helper subprocesses and the Node history client write into the *same* DB.
+
+| Table | What it records |
+|---|---|
+| `case_info` | case id, creation time, tool + schema version |
+| `run` | one row per invocation: command, full argv, start/finish, exit code, status, error + traceback, host, OS user, pid, tool version, parent run |
+| `event` | the ordered narrative — **every** log line (with tracebacks), plus stage breadcrumbs |
+| `file_access` | which files/directories were opened, purpose, size, mtime, SHA-256, record counts |
+| `crypto_op` | what decrypted what: algorithm, KDF, scheme, key **fingerprint**, salt source, info, records in/ok/failed, validation result |
+| `network_event` | requests sent and responses received (e.g. each on-demand history page) |
+| `artifact` | every output produced, with size, row count and **SHA-256** |
+
+**Crash forensics.** The DB is autocommit + WAL + `synchronous=FULL`, so each row is durable the instant it's
+written. If the tool dies, the last `event` row shows the stage it was in; a `run` still marked `running`
+with no `finished_utc` means the process was killed rather than exiting. Handled failures record the
+exception type, message and traceback.
+
+**Secrets.** Key material is stored as a **SHA-256 fingerprint plus the derivation parameters** (KDF, salt
+source, info, lengths, scheme) — enough to prove which key produced which plaintext, and to match a key you
+hold, without turning the audit log into a secret store. Pass `--audit-secrets` if your process genuinely
+requires the raw values. Message *content* is not duplicated into the DB; artifacts are referenced by hash.
+
 ## Workflow
 
 Message **text** needs the `companion_enc_static` key (`--enc-static`), and that key is **never stored on
