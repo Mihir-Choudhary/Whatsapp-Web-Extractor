@@ -18,6 +18,8 @@ __pycache__/
 creds_in.json
 companion_enc_static.txt
 signal_state.json
+signal_runtime.json
+signal_runtime.json.tmp
 anchors.json
 notifs.json
 history_*.json

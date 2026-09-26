@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
-"""export_signal_state.py — recover the full Signal protocol state from a Firefox WhatsApp Web
-profile so a Baileys reconnect can DECRYPT (not just authenticate): device identity keypair,
-registrationId, the current signed prekey, and all one-time prekeys.
+"""export_signal_state.py — recover the full Signal protocol state from a WhatsApp Web profile
+(Firefox or Chromium) so a Baileys reconnect can DECRYPT (not just authenticate): device identity
+keypair, registrationId, the current signed prekey, all one-time prekeys, the Double Ratchet
+SESSIONS and the group SENDER KEYS.
+
+The sessions are what make inbound traffic readable at all: every payload the phone or a contact
+sends is encrypted to an existing ratchet, so without them libsignal throws SessionError and the
+message is dropped — including the historySyncNotification that answers an on-demand history
+request. WhatsApp Web keeps that ratchet state in signal-storage in PLAINTEXT; its serialisation
+differs from the Node libsignal package's, and signal_sessions.py does the translation.
 
 The device identity keypair is stored in signal-meta-store under 'signal_static_privkey' /
 'signal_static_pubkey' as a WebCrypto CryptoKey wrapper: {encKey:<AES-CTR key,16B>, value:<ct,32B>};
@@ -14,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from snappy_pure import uncompress
 from idbutil import store_id, as_bytes as ab   # shared byte-coercion helper
 import sclone
+import signal_sessions                          # browser -> node libsignal session translation
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 def b64(b): return base64.b64encode(b).decode()
@@ -65,8 +73,11 @@ def load_chromium_signal(profile):
         if not isinstance(r,dict) or 'keyId' not in r: continue
         kp=r.get('keyPair') or {}; pv,pu=ab(kp.get('privKey')),ab(kp.get('pubKey'))
         if pv and pu: prekeys[str(r['keyId'])]={"private":b64(pv),"public":b64(pu)}
+    warn=lambda m: print("[!] "+m, file=sys.stderr)
+    sessions   = signal_sessions.build_sessions(sig.get('session-store'), warn)
+    senderkeys = signal_sessions.build_sender_keys(sig.get('senderkey-store'), warn)
     return {"registrationId":reg,"signedIdentityKey":{"private":b64(id_priv),"public":b64(id_pub)},
-            "signedPreKey":cur,"preKeys":prekeys}
+            "signedPreKey":cur,"preKeys":prekeys,"sessions":sessions,"senderKeys":senderkeys}
 
 def main():
     ap = argparse.ArgumentParser()
@@ -79,7 +90,8 @@ def main():
         if X25519PrivateKey.from_private_bytes(ip).public_key().public_bytes_raw()!=base64.b64decode(out["signedIdentityKey"]["public"]):
             raise SystemExit("identity keypair failed X25519 self-check")
         os.makedirs(os.path.dirname(a.out), exist_ok=True); json.dump(out, open(a.out,"w"))
-        print(f"[+] (chromium) identity VERIFIED. regId={out['registrationId']} signedPreKey=id{out['signedPreKey']['keyId']} preKeys={len(out['preKeys'])} -> {a.out}")
+        print(f"[+] (chromium) identity VERIFIED. regId={out['registrationId']} signedPreKey=id{out['signedPreKey']['keyId']} "
+              f"preKeys={len(out['preKeys'])} sessions={len(out['sessions'])} senderKeys={len(out['senderKeys'])} -> {a.out}")
         return
     o = a.origin
     if not o: raise SystemExit("pass --origin (Firefox) or --profile (Chromium)")
@@ -130,12 +142,30 @@ def main():
         pv, pu = ab(kp.get('privKey')), ab(kp.get('pubKey'))
         if pv and pu: prekeys[str(ob['keyId'])] = {"private": b64(pv), "public": b64(pu)}
 
+    # sessions + sender keys: the Double Ratchet state, without which nothing INBOUND decrypts.
+    # Firefox stores these as Mozilla structured clones; the record shapes inside are the same as
+    # Chromium's, so the same translation applies.
+    def _rows(store):
+        sid = store_id(c, store)
+        if sid is None: return []
+        rows = []
+        for (rr,) in c.execute(f"SELECT data FROM object_data WHERE object_store_id={sid}"):
+            try: ob = sclone.loads(uncompress(rr))
+            except Exception: continue
+            if isinstance(ob, dict): rows.append(ob)
+        return rows
+    warn = lambda m: print("[!] " + m, file=sys.stderr)
+    sessions   = signal_sessions.build_sessions(_rows('session-store'), warn)
+    senderkeys = signal_sessions.build_sender_keys(_rows('senderkey-store'), warn)
+
     out = {"registrationId": int(reg_id) if reg_id is not None else None,
            "signedIdentityKey": {"private": b64(id_priv), "public": b64(id_pub)},
-           "signedPreKey": cur, "preKeys": prekeys}
+           "signedPreKey": cur, "preKeys": prekeys,
+           "sessions": sessions, "senderKeys": senderkeys}
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
     json.dump(out, open(a.out, "w"))
-    print(f"[+] identity VERIFIED (X25519). regId={reg_id} signedPreKey=id{cur['keyId']} preKeys={len(prekeys)} -> {a.out}")
+    print(f"[+] identity VERIFIED (X25519). regId={reg_id} signedPreKey=id{cur['keyId']} preKeys={len(prekeys)} "
+          f"sessions={len(sessions)} senderKeys={len(senderkeys)} -> {a.out}")
 
 if __name__ == "__main__":
     main()

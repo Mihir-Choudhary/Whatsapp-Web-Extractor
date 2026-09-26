@@ -160,6 +160,23 @@ deeper, accumulating (deduped) until a pass stops finding meaningfully more. Pro
 `wawf history` continues from where the last run left off (older than everything already recovered) rather
 than re-pulling the same window.
 
+**What has to be recovered for this to work.** The phone's answer comes back as a normal end-to-end
+encrypted message, so authenticating as the linked device is not enough — the Signal state has to come
+with it. `wawf` reads it straight out of the profile (`signal-storage`, where WhatsApp Web keeps the
+ratchet state in plaintext) and translates it into the serialisation the Node Signal stack expects:
+the identity keypair and registration id, the signed prekey, every one-time prekey, the **Double
+Ratchet sessions** (including superseded ones, kept closed, so older messages still decrypt) and the
+**group sender keys**. Without the sessions every inbound payload fails to decrypt and is discarded
+before it can be recognised as a history reply — indistinguishable from "the phone never answered".
+
+A ratchet is live state, though, not a file: the copy in the profile is a snapshot that the phone has
+already moved past. So `wawf` renegotiates the session with your own device from a freshly fetched
+prekey bundle, asks any sender it cannot read to re-encrypt (a retry receipt carrying our keys), and
+**persists everything it learns** in `signal_runtime.json` beside the output, so the next run continues
+from the live ratchet instead of the stale snapshot. That file is key material — protect it like the
+credentials. Your browser's own stored session for this linked device goes stale as a result; WhatsApp
+Web re-establishes it by itself the next time you open it. The profile and the phone are not modified.
+
 There is **no fixed 50K ceiling** — the limit is what your phone still retains. On-demand serving is
 **phone-side and rate-limited**: your phone must be online/active and WhatsApp throttles it, so a pass may
 return little while a later run (when the phone is more responsive) returns more — just run it again. It

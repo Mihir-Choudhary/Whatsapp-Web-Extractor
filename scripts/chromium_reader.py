@@ -71,6 +71,18 @@ def read_localstorage(profile: str) -> dict:
     db.close()
     return out
 
+def _recency(rec):
+    """Sort key for an IndexedDbRecord: live records first, then newest LevelDB write first.
+
+    LevelDB never overwrites in place, so an object store holds older versions of a key next to
+    the current one. ccl surfaces `is_live` (this is the value a read would return) and
+    `ldb_seq_no` (monotonic write order), which together give a reliable recency ordering — far
+    better than guessing from the record's contents.
+    """
+    try: seq = int(getattr(rec, "ldb_seq_no", 0) or 0)
+    except (TypeError, ValueError): seq = 0
+    return (1 if getattr(rec, "is_live", False) else 0, seq)
+
 def read_indexeddb(profile: str) -> dict:
     from ccl_chromium_reader import ccl_chromium_indexeddb as idb
     src = glob.glob(os.path.join(profile, WA_IDB_GLOB))
@@ -90,12 +102,17 @@ def read_indexeddb(profile: str) -> dict:
             def _skip(*a, _c=_sk, **k): _c[0] += 1        # count bad records instead of silently dropping them
             try:
                 for r in db.get_object_store_by_name(osn).iterate_records(bad_deserializer_data_handler=_skip):
-                    recs.append(r.value)
+                    recs.append(r)
             except Exception as e:                        # a forensic store must not truncate silently -> warn, loud
                 log.warning("idb %s/%s: iteration stopped early after %d records (%s) — store may be INCOMPLETE",
                             dbid.name, osn, len(recs), e)
             if _sk[0]: skipped[f"{dbid.name}/{osn}"] = _sk[0]
-            stores[osn] = recs
+            # We deliberately read superseded and deleted versions too (they are evidence), so the
+            # same key can appear several times. Order NEWEST FIRST — live before stale, then by
+            # descending LevelDB sequence number — so a caller that wants the current value can
+            # just take the first match, while the older copies stay available behind it.
+            recs.sort(key=_recency, reverse=True)
+            stores[osn] = [r.value for r in recs]
         out[dbid.name] = stores
     if skipped:                                           # surface dropped records at default log level
         log.warning("idb: %d record(s) across %d store(s) could not be deserialized and were skipped: %s",

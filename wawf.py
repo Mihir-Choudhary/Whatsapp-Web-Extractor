@@ -668,7 +668,7 @@ def cmd_history(a):
     log.info("[1/4] recovering reconnect creds ...")
     if cmd_creds(argparse.Namespace(profile=a.profile, origin=a.origin, out=os.path.join(work, "creds_in.json"), _internal=True)):
         return 3
-    log.info("[2/4] recovering Signal state (identity + prekeys) ...")
+    log.info("[2/4] recovering Signal state (identity, prekeys, sessions, sender keys) ...")
     if _sub("export_signal_state.py", eng + ["--out", os.path.join(work, "signal_state.json")]): return 3
     log.info("[3/4] building anchors from on-disk messages ...")
     if _sub("build_anchors.py", eng + ["--out", os.path.join(work, "anchors.json")]): return 3
@@ -686,6 +686,12 @@ def cmd_history(a):
                 "stable network, and close every web.whatsapp.com tab (a live web session competes with "
                 "this one for the same linked device). Progress is saved after every pass, so re-running "
                 "later simply continues deeper — an empty pass loses nothing.")
+    log.warning("SIDE EFFECT ON THE DEVICE: your phone's replies are end-to-end encrypted to a Signal "
+                "session, and the copy in the browser profile is a snapshot of a ratchet that keeps moving, "
+                "so this renegotiates that session and then keeps its own copy (signal_runtime.json, next "
+                "to the output — treat it as key material). The browser's stored session for this linked "
+                "device therefore goes stale; WhatsApp Web re-establishes it by itself the next time you "
+                "open it. Nothing on the phone or in the profile is modified.")
     env = dict(os.environ, TOP="100000", COUNT="50", MAXPAGES="100000")   # every chat, page until exhausted
     anchors_path = os.path.join(work, "anchors.json")
     pass_out = os.path.join(work, "history_recovered.json")   # human-facing final output (full accumulated set)

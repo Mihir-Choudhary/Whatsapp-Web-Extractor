@@ -53,11 +53,30 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   creds.me={id:inp.me_id,lid:inp.lid};
   creds.account={details:bb(inp.account.details),accountSignatureKey:bb(inp.account.accountSignatureKey),accountSignature:bb(inp.account.accountSignature),deviceSignature:bb(inp.account.deviceSignature)};
   creds.registered=true; creds.platform='web';
-  const preKeys=S.preKeys, mem={};
-  const store={ get:(t,ids)=>{const d={};for(const id of ids){const k=mem[`${t}-${id}`];if(k!==undefined){if(k!==null)d[id]=k;continue;}if(t==='pre-key'){const p=preKeys[String(id)];if(p)d[id]={private:bb(p.private),public:bb(p.public)};}}return d;},
-    set:data=>{for(const t in data)for(const id in data[t])mem[`${t}-${id}`]=data[t][id];} };
+  // Signal sessions + sender keys recovered from the browser profile, plus whatever this tool
+  // learned on earlier runs. Without these every inbound payload fails to decrypt (SessionError)
+  // and is dropped, including the phone's history reply.
+  const signalStore=require('./signal_store');
+  const rt=signalStore.open({signalState:S,creds,
+    statePath:signalStore.defaultStatePath(path.dirname(mustFind('signal_state.json'))),
+    bufferJSON:B.BufferJSON});
+  const store=rt.keys;
+  console.error(`[i] signal state: ${rt.stats.sessions} session(s), ${rt.stats.senderKeys} sender key(s), `
+    +`${rt.stats.preKeys} prekey(s) | runtime overlay: ${rt.stats.state}, ${rt.stats.carried} record(s) carried over`);
+  if(!rt.stats.sessions&&!rt.stats.carried) console.error('[!] no Signal sessions recovered -- inbound messages will NOT decrypt; re-run the credential export against the browser profile');
   let version=[2,3000,1023223821]; try{version=(await B.fetchLatestBaileysVersion()).version;}catch(e){}
-  const sock=makeWASocket({version,auth:{creds,keys:store},logger:P?P({level:'silent'}):undefined,
+  // Make the FIRST retry receipt carry a fresh prekey bundle. When a payload cannot be decrypted
+  // (inevitable here: the session in the profile is a snapshot of a live ratchet that has moved on)
+  // the only way to recover is to ask the sender to re-encrypt to a NEW session, and the sender can
+  // only do that if the retry receipt includes our keys. Baileys attaches them from retry #2
+  // (`if (retryCount > 1 || forceIncludeKeys)`) and keeps the counter in a per-process cache, so a
+  // short forensic run never reached #2: every retry just fetched the same unreadable ciphertext
+  // again. Starting the counter at 1 asks for re-encryption immediately. The prekey it mints is
+  // persisted by signal_store, so the phone's re-encrypted copy is still decryptable next run.
+  const retryCounters=new Map();
+  const msgRetryCounterCache={ get:k=>{const v=retryCounters.get(k); return v===undefined?1:v;},
+    set:(k,v)=>retryCounters.set(k,v), del:k=>retryCounters.delete(k) };
+  const sock=makeWASocket({version,auth:{creds,keys:store},logger:P?P({level:'silent'}):undefined,msgRetryCounterCache,
     printQRInTerminal:false,markOnlineOnConnect:true,syncFullHistory:false,
     // CRITICAL: accept ON_DEMAND history only, and decline the INITIAL (RECENT/bootstrap) sync.
     // On connect Baileys calls ev.buffer() and holds every event. If this predicate says yes to the
@@ -91,6 +110,14 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     console.error(`  [${what}] unmatched reply (session ${sid}) and no outstanding request -- ignored`);
     return null;
   };
+  sock.ev.on('creds.update', ()=>rt.save());   // persist rotated prekeys / app-state ids
+  // Raising the retry floor above skips the placeholder-resend request Baileys makes on retry #1,
+  // so ask for it explicitly: the two mechanisms are complementary. The retry receipt hands the
+  // sender our keys so it CAN re-encrypt; the placeholder request asks the phone to actually
+  // resend the specific message it could not deliver readably.
+  sock.ev.on('messages.upsert',u=>{ for(const m of (u.messages||[])){
+    if(m.messageStubType===B.proto.WebMessageInfo.StubType.CIPHERTEXT&&m.key)
+      Promise.resolve(sock.requestPlaceholderResend(m.key)).catch(()=>{}); } });
   sock.ev.on('messages.upsert', async u=>{ for(const m of (u.messages||[])){
     const hn=histNotif(m.message); if(!hn) continue;
     const sid=hn.peerDataRequestSessionId; const r=resolveFor(sid,'upsert');
@@ -152,6 +179,19 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     if(u.connection==='open'){ opened=true; console.error('[+] OPEN — paginating history for',targets.length,'chats');
       try{await sock.sendPresenceUpdate('available');}catch(e){}
       await sleep(4000);
+      // Rebuild the Signal session with our own primary device from a freshly fetched prekey
+      // bundle before asking it for anything. The copy in the browser profile is a snapshot of a
+      // live ratchet the phone has since advanced, so its replies would arrive on a chain we
+      // cannot derive and be dropped as undecryptable. Forcing the rebuild makes US the initiator,
+      // so the reply comes back on a ratchet we hold end to end.
+      // Unconditionally, every run: the phone may have re-keyed since (it does so whenever it
+      // cannot read something we sent), and a renegotiation costs one of its one-time prekeys,
+      // which is far cheaper than a whole pass that returns nothing because the reply was dropped.
+      try{
+        const selfJids=[...new Set([inp.lid,inp.me_id].filter(Boolean).map(B.jidNormalizedUser))];
+        await sock.assertSessions(selfJids,true);
+        console.error('[i] rebuilt the Signal session with our own device(s) before requesting history');
+      }catch(e){ console.error('[!] could not rebuild the self session:', e&&e.message, '-- replies may not decrypt'); }
       for(const a of targets){
         let key={remoteJid:a.chat,id:a.oldest_id,fromMe:!!a.oldest_fromMe}, ts=a.oldest_ts, got=0;
         for(let pg=0; pg<MAXPAGES; pg++){

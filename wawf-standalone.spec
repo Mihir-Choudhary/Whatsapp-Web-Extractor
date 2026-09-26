@@ -25,7 +25,8 @@ datas += [(NODE_EXE, "node")]
 
 # --- bundle the Node client (history_extract.js + reconnect.js + node_modules), minus secrets/outputs ---
 recon = Tree("tools/reconnect", prefix="tools/reconnect",
-             excludes=["creds_in.json", "signal_state.json", "anchors.json", "notifs.json",
+             excludes=["creds_in.json", "signal_state.json", "signal_runtime.json",
+                       "anchors.json", "notifs.json",
                        "history_*.json", "*.tmp", "*.log", "baileys.log"])
 
 a = Analysis(
