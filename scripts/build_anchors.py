@@ -61,7 +61,7 @@ def main():
             per[chat] = {'chat': chat, 'oldest_id': keyid, 'oldest_ts': t, 'oldest_fromMe': from_me}
 
     anchors = sorted(per.values(), key=lambda x: -cnt.get(x['chat'], 0))   # busiest chats first
-    json.dump({'anchors': anchors, 'ondisk_ids': sorted(ondisk)}, open(a.out, 'w'))
+    json.dump({'anchors': anchors, 'ondisk_ids': sorted(ondisk)}, open(a.out, 'w', encoding='utf-8'))
     print(f"[+] anchors.json: {len(anchors)} chats, {len(ondisk)} on-disk message ids -> {a.out}")
 
 

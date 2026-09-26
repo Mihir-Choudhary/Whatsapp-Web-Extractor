@@ -80,8 +80,8 @@ def parse_history(pt, ondisk):
     return convs, msgs, new, samples, newids
 
 def main():
-    notifs=json.load(open(sys.argv[1]))
-    ondisk=set(json.load(open(sys.argv[2]))["ondisk_ids"]) if len(sys.argv)>2 else set()
+    notifs=json.load(open(sys.argv[1], encoding="utf-8"))
+    ondisk=set(json.load(open(sys.argv[2], encoding="utf-8"))["ondisk_ids"]) if len(sys.argv)>2 else set()
     tot_c=tot_m=tot_new=0; allsamp=[]; alln=set()
     for i,n in enumerate(notifs):
         try:

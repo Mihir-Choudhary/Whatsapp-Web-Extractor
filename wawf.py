@@ -240,7 +240,7 @@ def cmd_run(a):
             log.error("could not capture the at-rest key, so there is nothing to decrypt with. "
                       "Supply one with --enc-static, or recover it from memory with --memory.")
             return rc
-        key = open(keyfile).read().strip()
+        key = open(keyfile, encoding="utf-8").read().strip()
 
     log.info("[3/3] decrypting to %d output(s) ...", len(outs))
     for fmt, path in outs:
@@ -389,7 +389,7 @@ def cmd_creds(a):
            "registrationId": int(regid) if regid is not None else None, "user": user, "device": int(dev),
            "me_id": f"{user}:{dev}@s.whatsapp.net", "lid": lid, "account": adv, "cert_chain": cert}
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
-    json.dump(out, open(a.out, "w"), indent=1)
+    json.dump(out, open(a.out, "w", encoding="utf-8"), indent=1)
     abs_out = os.path.abspath(a.out)
     log.info("Noise keypair VERIFIED (X25519). reg_id=%s device=:%s account=%s -> %s",
              int(regid) if regid is not None else "?", dev, "present" if adv else "MISSING", abs_out)
@@ -446,7 +446,7 @@ def cmd_reconnect(a):
     if a.verbose: extra.append("-v")
     rc = _sub("wa_reconnect.py", extra)
     if rc == 0 and os.path.exists(a.out):
-        key = open(a.out).read().strip()
+        key = open(a.out, encoding="utf-8").read().strip()
         log.info("companion_enc_static captured (%d chars) -> %s", len(key), os.path.abspath(a.out))
         log.info("next:  wawf decrypt <profile> --enc-static %s --out out/", key)
     return rc
@@ -454,7 +454,7 @@ def cmd_reconnect(a):
 def _deepen_anchors(anchors_path, master):
     """Re-anchor each chat on the OLDEST message recovered so far and add all recovered ids to the
     on-disk set, so the next history pass continues further back instead of re-pulling the same window."""
-    a = json.load(open(anchors_path))
+    a = json.load(open(anchors_path, encoding="utf-8"))
     ondisk = set(a["ondisk_ids"]); by = {x["chat"]: x for x in a["anchors"]}
     oldest = {}
     for m in master.values():
@@ -468,7 +468,7 @@ def _deepen_anchors(anchors_path, master):
     # continue the chats we just went deeper on first, then the rest
     newanchors = list(oldest.values()) + [x for c, x in by.items() if c not in oldest]
     tmp = anchors_path + ".tmp"                            # atomic write: a failed/interrupted write must not
-    with open(tmp, "w") as f: json.dump({"anchors": newanchors, "ondisk_ids": sorted(ondisk)}, f)  # corrupt
+    with open(tmp, "w", encoding="utf-8") as f: json.dump({"anchors": newanchors, "ondisk_ids": sorted(ondisk)}, f)  # corrupt
     os.replace(tmp, anchors_path)                          # the anchors.json the node client reads next pass
 
 def _resume_master(accum, anchors_path, master):
@@ -477,7 +477,7 @@ def _resume_master(accum, anchors_path, master):
     re-requesting the same window. Returns how many prior messages were reloaded (0 if none / on error)."""
     if not os.path.exists(accum): return 0
     try:
-        for m in (json.load(open(accum)).get("messages") or []):
+        for m in (json.load(open(accum, encoding="utf-8")).get("messages") or []):
             if m.get("id"): master[m["id"]] = m
         if master: _deepen_anchors(anchors_path, master)
         return len(master)
@@ -702,7 +702,7 @@ def cmd_history(a):
         by = collections.Counter(m.get("chat") for m in master.values())
         tmp = path + ".tmp"                                  # atomic write: never leave a half-written file
         json.dump({"recovered_total": len(master), "new_not_on_disk": len(master),
-                   "by_chat": dict(by), "messages": list(master.values())}, open(tmp, "w"))
+                   "by_chat": dict(by), "messages": list(master.values())}, open(tmp, "w", encoding="utf-8"))
         os.replace(tmp, path)
         return by
 
@@ -722,7 +722,13 @@ def cmd_history(a):
                         detail={"argv": ncmd, "cwd": work})
             rc = (_run_node_audited(ncmd, work, env, p) if AUDIT.enabled
                   else subprocess.run(ncmd, cwd=work, env=env).returncode)
-            try: passd = json.load(open(pass_out))
+            # utf-8 EXPLICITLY: the Node client writes this file with JSON.stringify, which does not
+            # escape non-ASCII, so any emoji or non-Latin script in a recovered message is raw UTF-8.
+            # Python's default here is the locale encoding (cp1252 on Windows), which raises
+            # UnicodeDecodeError -- and this read is wrapped in `except Exception`, so a successful
+            # pass was reported as "produced no output" and then OVERWRITTEN with an empty file by the
+            # final _checkpoint. Measured: a 10,842-message pass discarded in full.
+            try: passd = json.load(open(pass_out, encoding="utf-8"))
             except Exception:
                 log.error("pass %d produced no output (node exit=%s; connection failed / phone not serving) "
                           "— stopping.", p, rc); break

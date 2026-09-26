@@ -421,7 +421,7 @@ def main():
         print("[!] creds file not found: %s — run `wawf creds <profile>` first" % a.creds, file=sys.stderr)
         A.end_run(6, status="error", error=RuntimeError("creds file not found: %s" % a.creds)); return 6
     A.file_read(a.creds, purpose="reconnect credentials (disk-recovered Noise keypair)", hash_it=True)
-    creds = json.load(open(a.creds))
+    creds = json.load(open(a.creds, encoding="utf-8"))
     try:
         import websocket  # noqa: F401
     except ImportError:

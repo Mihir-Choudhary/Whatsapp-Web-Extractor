@@ -89,7 +89,7 @@ def main():
         ip=base64.b64decode(out["signedIdentityKey"]["private"])
         if X25519PrivateKey.from_private_bytes(ip).public_key().public_bytes_raw()!=base64.b64decode(out["signedIdentityKey"]["public"]):
             raise SystemExit("identity keypair failed X25519 self-check")
-        os.makedirs(os.path.dirname(a.out), exist_ok=True); json.dump(out, open(a.out,"w"))
+        os.makedirs(os.path.dirname(a.out), exist_ok=True); json.dump(out, open(a.out,"w",encoding="utf-8"))
         print(f"[+] (chromium) identity VERIFIED. regId={out['registrationId']} signedPreKey=id{out['signedPreKey']['keyId']} "
               f"preKeys={len(out['preKeys'])} sessions={len(out['sessions'])} senderKeys={len(out['senderKeys'])} -> {a.out}")
         return
@@ -163,7 +163,7 @@ def main():
            "signedPreKey": cur, "preKeys": prekeys,
            "sessions": sessions, "senderKeys": senderkeys}
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
-    json.dump(out, open(a.out, "w"))
+    json.dump(out, open(a.out, "w", encoding="utf-8"))
     print(f"[+] identity VERIFIED (X25519). regId={reg_id} signedPreKey=id{cur['keyId']} preKeys={len(prekeys)} "
           f"sessions={len(sessions)} senderKeys={len(senderkeys)} -> {a.out}")
 

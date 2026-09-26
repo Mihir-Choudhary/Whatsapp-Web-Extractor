@@ -113,7 +113,7 @@ def main():
            "registrationId": int(regid) if regid is not None else None, "user": user, "device": int(dev),
            "me_id": f"{user}:{dev}@s.whatsapp.net", "lid": lid, "account": adv, "cert_chain": cert}
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
-    json.dump(out, open(a.out, "w"), indent=1)
+    json.dump(out, open(a.out, "w", encoding="utf-8"), indent=1)
     print(f"[+] Noise keypair VERIFIED (X25519). reg_id={regid} device=:{dev}. wrote {a.out}")
     print(f"    account creds present: {list(adv.keys()) if adv else 'MISSING adv_signed_identity'}")
 
