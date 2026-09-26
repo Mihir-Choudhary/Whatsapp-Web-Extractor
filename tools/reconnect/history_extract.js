@@ -73,8 +73,14 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   // short forensic run never reached #2: every retry just fetched the same unreadable ciphertext
   // again. Starting the counter at 1 asks for re-encryption immediately. The prekey it mints is
   // persisted by signal_store, so the phone's re-encrypted copy is still decryptable next run.
+  // ... but NEVER for a peer message. A PDO response is one-shot: the phone does not re-encrypt one
+  // on retry (observed 0 of ~100). Retrying it only keeps it queued, and an unacked queue is fatal
+  // here -- see the forced flush below. So peer messages report a count above maxMsgRetryCount,
+  // which makes Baileys skip the retry, and we acknowledge them instead.
+  const peerIds=new Set();
   const retryCounters=new Map();
-  const msgRetryCounterCache={ get:k=>{const v=retryCounters.get(k); return v===undefined?1:v;},
+  const msgRetryCounterCache={ get:k=>{ if(peerIds.has(String(k).split(':')[0])) return 1e6;
+      const v=retryCounters.get(k); return v===undefined?1:v; },
     set:(k,v)=>retryCounters.set(k,v), del:k=>retryCounters.delete(k) };
   const sock=makeWASocket({version,auth:{creds,keys:store},logger:P?P({level:'silent'}):undefined,msgRetryCounterCache,
     printQRInTerminal:false,markOnlineOnConnect:true,syncFullHistory:false,
@@ -111,13 +117,17 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     return null;
   };
   sock.ev.on('creds.update', ()=>rt.save());   // persist rotated prekeys / app-state ids
+  // Note which stanzas are peer messages before Baileys' async decrypt reaches its retry decision.
+  sock.ws.on('CB:message', node=>{ const at=node.attrs||{}; if(at.category==='peer') peerIds.add(at.id); });
   // Raising the retry floor above skips the placeholder-resend request Baileys makes on retry #1,
   // so ask for it explicitly: the two mechanisms are complementary. The retry receipt hands the
   // sender our keys so it CAN re-encrypt; the placeholder request asks the phone to actually
-  // resend the specific message it could not deliver readably.
+  // resend the specific message it could not deliver readably. Peer messages get neither -- they
+  // get acknowledged, because an unacked message stays in the offline queue forever.
   sock.ev.on('messages.upsert',u=>{ for(const m of (u.messages||[])){
-    if(m.messageStubType===B.proto.WebMessageInfo.StubType.CIPHERTEXT&&m.key)
-      Promise.resolve(sock.requestPlaceholderResend(m.key)).catch(()=>{}); } });
+    if(m.messageStubType!==B.proto.WebMessageInfo.StubType.CIPHERTEXT||!m.key) continue;
+    if(peerIds.has(m.key.id)) Promise.resolve(sock.sendReceipt(m.key.remoteJid,undefined,[m.key.id],'peer_msg')).catch(()=>{});
+    else Promise.resolve(sock.requestPlaceholderResend(m.key)).catch(()=>{}); } });
   sock.ev.on('messages.upsert', async u=>{ for(const m of (u.messages||[])){
     const hn=histNotif(m.message); if(!hn) continue;
     const sid=hn.peerDataRequestSessionId; const r=resolveFor(sid,'upsert');
@@ -150,9 +160,32 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   const toMs=t=>{ t=Number(t)||0; return t>1e12 ? Math.round(t) : Math.round(t*1000); };
   // Register the resolver under the returned id — the id resolves locally, long before any round-trip
   // response, so there is no registration race.
+  // Ask for a page ourselves instead of via sock.fetchMessageHistory(), for one reason: WHICH self
+  // jid the peer message is addressed to decides WHICH Signal session encrypts it. relayMessage's
+  // peer path derives the recipient as
+  //   jidEncode(isMe && isLid ? creds.me.lid : user, isLid ? 'lid' : 's.whatsapp.net', device)
+  // and fetchMessageHistory -> sendPeerDataOperationMessage always passes the PHONE-NUMBER jid. So
+  // the request went out on the <pn>.0 session while the phone's answers come back on <lid>.0 --
+  // two different sessions. We renegotiate the one we send on, so the phone could always READ our
+  // request (it acks it), but it never re-keys the one it ANSWERS on, so every reply landed on a
+  // ratchet we only had a stale snapshot of and was discarded. Addressing the LID jid puts the
+  // request on that same session, so the phone re-keys it and the answer is readable.
+  // Measured, same chat and anchor in one run: PN-routed -> silent, LID-routed -> 50 messages.
+  const PDO_TYPE=B.proto.Message.ProtocolMessage.Type.PEER_DATA_OPERATION_REQUEST_MESSAGE;
+  const selfLid=inp.lid?B.jidNormalizedUser(inp.lid):null;
+  const askHistory=(count,key,tsMs)=>{
+    const req={chatJid:key.remoteJid, oldestMsgId:key.id, oldestMsgFromMe:!!key.fromMe,
+      oldestMsgTimestampMs:tsMs, onDemandMsgCount:count};
+    if(selfLid) req.accountLid=selfLid;
+    const pdo={historySyncOnDemandRequest:req, peerDataOperationRequestType:B.proto.Message.PeerDataOperationRequestType.HISTORY_SYNC_ON_DEMAND};
+    if(!selfLid) return sock.sendPeerDataOperationMessage(pdo);        // no LID known: old behaviour
+    return sock.relayMessage(selfLid, {protocolMessage:{peerDataOperationRequestMessage:pdo, type:PDO_TYPE}},
+      {additionalAttributes:{category:'peer', push_priority:'high_force'}});
+  };
+
   const requestPage=(key,tsSec)=>new Promise(res=>{
     let id=null; const timer=setTimeout(()=>{ if(id!=null) pending.delete(id); res(null); }, 45000);
-    sock.fetchMessageHistory(COUNT, key, toMs(tsSec))
+    askHistory(COUNT, key, toMs(tsSec))
       .then(rid=>{ id=rid; lastRequestId=rid; pending.set(rid, msgs=>{ clearTimeout(timer); res(msgs); }); })
       .catch(e=>{ clearTimeout(timer); console.error('  fetch err', e.message); res(null); }); });
 
@@ -178,6 +211,18 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     if(u.connection==='close'){ const e=u.lastDisconnect&&u.lastDisconnect.error; console.error('[x] closed', e&&e.output&&e.output.statusCode, e&&e.message); finish(opened?0:4); }  // non-zero if we never connected
     if(u.connection==='open'){ opened=true; console.error('[+] OPEN — paginating history for',targets.length,'chats');
       try{await sock.sendPresenceUpdate('available');}catch(e){}
+      // THE reason this tool reported "no response" for every chat even when the phone answered.
+      // Baileys calls ev.buffer() on connect and flushes it ONLY when the server sends
+      // <ib><offline/>, its "offline queue fully handled" marker. That marker needs every queued
+      // message acknowledged -- but Baileys does not acknowledge a message it failed to decrypt (it
+      // sends a retry request instead), so one unreadable payload wedges the buffer permanently.
+      // Nothing then reaches messaging-history.set or messages.upsert: a history page could arrive,
+      // decrypt perfectly, and still be recorded as "no response". WhatsApp Web never hits this
+      // because it can decrypt everything it is sent. Drive the flush ourselves instead of trusting
+      // the queue to complete, and keep driving it, because Baileys re-buffers around its own node
+      // processing (processNodeWithBuffer) and around each app-state sync.
+      const pump=setInterval(()=>{ try{ if(sock.ev.isBuffering()) sock.ev.flush(); }catch(e){} },1500);
+      if(pump.unref) pump.unref();
       await sleep(4000);
       // Rebuild the Signal session with our own primary device from a freshly fetched prekey
       // bundle before asking it for anything. The copy in the browser profile is a snapshot of a
