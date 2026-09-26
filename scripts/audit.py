@@ -125,6 +125,19 @@ class Audit:
                             " VALUES(?,?,?,?,?)", (self.case_id, _utc(), "wawf", _tool_version(), SCHEMA_VERSION))
         self.run_id = None
         self.parent_run_id = parent_run_id
+        self._ended = False
+        # Scripts exit through many sys.exit() paths that never reach end_run(). Without this, a clean
+        # error-exit would be indistinguishable from a kill (both leave status='running'). Mark those
+        # 'exited' at interpreter shutdown, so 'running' keeps its precise meaning: never finished at all.
+        import atexit; atexit.register(self._finalize_atexit)
+
+    def _finalize_atexit(self):
+        if self._ended or self.run_id is None: return
+        try:
+            self.db.execute("UPDATE run SET finished_utc=?, status='exited' WHERE run_id=? AND status='running'",
+                            (_utc(), self.run_id))
+        except Exception:
+            pass
 
     # ---------- run lifecycle ----------
     def start_run(self, command, argv=None):
@@ -138,6 +151,7 @@ class Audit:
         return self.run_id
 
     def end_run(self, exit_code=0, status=None, error=None, tb=None):
+        self._ended = True
         self.db.execute("UPDATE run SET finished_utc=?, exit_code=?, status=?, error_type=?, error_message=?,"
                         " traceback=? WHERE run_id=?",
                         (_utc(), exit_code, status or ("ok" if not exit_code else "error"),

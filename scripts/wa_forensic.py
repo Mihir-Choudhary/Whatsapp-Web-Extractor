@@ -216,6 +216,12 @@ def main():
     ap.add_argument('--deep', action='store_true', help='brute raw 16B key from memory (fallback if salt string absent)')
     ap.add_argument('--yes', action='store_true', help='skip authorization prompt')
     a = ap.parse_args()
+    import audit                               # appends to the case DB from --audit (no-op otherwise)
+    global A
+    A = audit.from_env("memory")
+    A.event("memory scan requested", category="stage",
+            detail={"live": bool(a.live), "memimage": a.memimage, "deep": bool(a.deep),
+                    "verify_only": bool(a.enc_static), "origin": a.origin, "profile": a.profile})
 
     if not a.yes:
         try:
@@ -232,8 +238,13 @@ def main():
     origin = a.origin or (base + '/storage/default/https+++web.whatsapp.com')
     if not os.path.isdir(origin): print("WhatsApp origin not found:", origin); sys.exit(2)
     print("[*] origin:", origin)
+    A.dir_read(origin, purpose="WhatsApp Web store (validation reference for candidate keys)")
     v = Vault(origin)
     print(f"[*] loaded root IKM ({len(v.ikm)}B), HKDF info ({len(v.info)}B), {len(v.refs)} reference ciphertexts")
+    A.crypto("recover", key=v.ikm, key_source="IndexedDB wawc_db_enc/keys (root key)", input_desc=origin,
+             detail={"info_len": len(v.info), "reference_ciphertexts": len(v.refs)})
+    if a.memimage:
+        A.file_read(a.memimage, purpose="memory image scanned for companion_enc_static", hash_it=False)
 
     salt = None
     if a.enc_static:
@@ -284,13 +295,26 @@ def main():
         print("[-] companion_enc_static not recovered from the given source.")
         print("    Dead disk alone cannot yield it; supply a RAM/hiberfil/swap image via --memimage,")
         print("    or capture it live. Metadata/media are already recoverable without it.")
+        A.event("companion_enc_static NOT recovered from the given memory source", level="ERROR",
+                category="result")
+        A.end_run(6, status="error", error=RuntimeError("companion_enc_static not recovered"))
         sys.exit(6)
     if isinstance(salt, tuple) and salt[0] == 'RAWKEY':
         key = salt[1]
+        A.crypto("recover", algorithm="AES-CBC-128", key=key, key_source="raw message key found in memory",
+                 validated="validated against on-disk ciphertext",
+                 input_desc=(a.memimage or "live process memory"))
     else:
         key = v.derive(salt)
+        A.crypto("recover", key=salt, key_source="companion_enc_static found in memory",
+                 validated="validated against on-disk ciphertext",
+                 input_desc=(a.memimage or "live process memory"))
+        A.crypto("derive", algorithm="AES-CBC-128", kdf="HKDF-SHA256 len=16", scheme="1 (final)", key=key,
+                 key_source="HKDF(root, salt=companion_enc_static, info=WAWebEncKeySalt)",
+                 salt=salt, salt_source="companion_enc_static recovered from memory")
     print("[+] AES-CBC-128 message key:", key.hex())
     decrypt_all(v, key)
+    A.end_run(0, status="ok")
 
 if __name__ == '__main__':
     main()

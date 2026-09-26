@@ -488,6 +488,38 @@ def _ensure_baileys(rec, node, assume_yes=False):
         log.error("npm install did not complete — run it manually in %s.", rec); return False
     return True
 
+_NODE_PAGE_RE = None    # compiled lazily: "  <chat> page<N>: <result>" from history_extract.js
+
+def _audit_node_line(line, pass_no):
+    """Record one line of Node-client output. The client prints a line per history page request and per
+    outcome, so parse those shapes EXPLICITLY: loose substring matching mislabels the chain of custody
+    (e.g. 'Closing open session ...' is a Signal log, not a request, and '+50 (new 50)' is a response
+    even though it contains no 'response')."""
+    global _NODE_PAGE_RE
+    if _NODE_PAGE_RE is None:
+        import re
+        _NODE_PAGE_RE = re.compile(r"^\s*(?P<chat>\S+)\s+page(?P<page>\d+):\s*(?P<rest>.+)$")
+    m = _NODE_PAGE_RE.match(line)
+    if m:
+        rest = m.group("rest").strip()
+        if rest.startswith("no response"):                   # request sent, nothing came back in time
+            direction, status = "out", "no response (timeout)"
+        elif rest.startswith("empty"):                       # reply arrived, nothing older to give
+            direction, status = "in", "empty (start of chat reached)"
+        else:                                                # reply arrived with messages
+            direction, status = "in", "data returned"
+        AUDIT.net(direction, endpoint="web.whatsapp.com", protocol="noise/websocket",
+                  kind="fetchMessageHistory", status=status,
+                  detail={"pass": pass_no, "chat": m.group("chat"), "page": int(m.group("page")),
+                          "result": rest})
+        return
+    if line.startswith("[+] OPEN") or line.startswith("[x] closed"):
+        AUDIT.net("in" if line.startswith("[x]") else "out", endpoint="web.whatsapp.com",
+                  protocol="noise/websocket", kind="connection", status=line.strip(),
+                  detail={"pass": pass_no})
+        return
+    AUDIT.event(line, category="node", detail={"pass": pass_no})   # everything else is narrative
+
 def _run_node_audited(cmd, cwd, env, pass_no):
     """Run the Node extractor with its output teed into the audit DB. The client prints a line per chat page
     request and per response ('page0: no response', '[+] OPEN', '[DONE] recovered=...'), so capturing them
@@ -498,13 +530,7 @@ def _run_node_audited(cmd, cwd, env, pass_no):
         line = line.rstrip("\r\n")
         if not line: continue
         sys.stderr.write(line + "\n"); sys.stderr.flush()    # keep the live view the user expects
-        low = line.lower()
-        if ("page" in low) or ("no response" in low) or ("[done]" in low) or ("open" in low) or ("closed" in low):
-            AUDIT.net("in" if ("response" in low or "[done]" in low or "closed" in low) else "out",
-                      endpoint="web.whatsapp.com", protocol="noise/websocket", kind="fetchMessageHistory",
-                      detail={"pass": pass_no, "line": line})
-        else:
-            AUDIT.event(line, category="node", detail={"pass": pass_no})
+        _audit_node_line(line, pass_no)
     proc.wait()
     return proc.returncode
 

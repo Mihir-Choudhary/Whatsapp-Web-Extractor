@@ -284,6 +284,9 @@ def fetch_version():
     return list(FALLBACK_VERSION)
 
 
+import audit                                    # appends to the case DB from --audit (no-op otherwise)
+A = audit.NoAudit()                             # replaced in main()
+
 def run(creds, out_path, timeout=30, log=lambda *a: None):
     import websocket   # websocket-client; imported here so import errors are actionable
     noise_priv = base64.b64decode(creds["noise_priv"])
@@ -301,9 +304,12 @@ def run(creds, out_path, timeout=30, log=lambda *a: None):
     version = fetch_version()
     log("using WA version %s" % ".".join(map(str, version)))
 
+    A.net("out", endpoint=WS_URL, protocol="websocket", kind="connect",
+          detail={"wa_version": ".".join(map(str, version)), "device": device, "user_suffix": str(user)[-4:]})
     ws = websocket.create_connection(WS_URL, timeout=20,
                                      header=["Origin: https://web.whatsapp.com",
                                              "User-Agent: Mozilla/5.0"])
+    A.net("in", endpoint=WS_URL, protocol="websocket", kind="connected", status="open")
     inbuf = bytearray()
     sent_intro = [False]
 
@@ -346,6 +352,12 @@ def run(creds, out_path, timeout=30, log=lambda *a: None):
         send_frame(_fld_len(4, _fld_len(1, key_enc) + _fld_len(2, payload_enc)))
         noise.finish()
         log("handshake complete; awaiting <success>")
+        A.crypto("handshake", algorithm="Noise_XX_25519_AESGCM_SHA256",
+                 key=noise_priv, key_source="disk-recovered Noise device private key (creds_in.json)",
+                 validated="handshake completed", input_desc="WhatsApp Noise login",
+                 detail={"wa_version": ".".join(map(str, version)), "device": device})
+        A.net("out", endpoint=WS_URL, protocol="noise/websocket", kind="login ClientFinish",
+              detail={"passive": False})
         # 5. read stanzas, scan for companion_enc_static
         captured = None
         deadline = time.time() + timeout
@@ -360,19 +372,31 @@ def run(creds, out_path, timeout=30, log=lambda *a: None):
             for node in pull_frames():
                 tag = node.get("tag")
                 log("recv <%s> %s" % (tag, {k: node["attrs"][k] for k in list(node.get("attrs", {}))[:4]}))
+                A.net("in", endpoint=WS_URL, protocol="noise/websocket", kind="stanza <%s>" % tag,
+                      detail={"attrs": {k: node["attrs"][k] for k in list(node.get("attrs", {}))[:6]}})
                 hits = []; scan_for_key(node, hits)
                 if hits:
                     captured = hits[0][1]
                     log("CAPTURED %s = %s" % (hits[0][0], captured))
+                    # the server-issued at-rest key: fingerprint only unless --audit-secrets
+                    A.crypto("receive", algorithm="companion_enc_static (server-issued)",
+                             key=base64.b64decode(captured) if captured else None,
+                             key_source="<%s> stanza attribute '%s' over the Noise session" % (tag, hits[0][0]),
+                             validated="captured", input_desc="post-login stanza")
                     break
                 if tag == "failure":
+                    A.net("in", endpoint=WS_URL, protocol="noise/websocket", kind="stanza <failure>",
+                          status="login rejected", detail={"attrs": node.get("attrs")})
                     print("[!] login rejected (<failure> %s) — creds not accepted" % node.get("attrs"),
                           file=sys.stderr)
+                    A.end_run(2, status="error", error=RuntimeError("login rejected by server"))
                     return 2
                 if tag in ("stream:error", "xmlstreamend"):
-                    log("stream error/end"); return 4
+                    log("stream error/end")
+                    A.end_run(4, status="error", error=RuntimeError("stream error/end <%s>" % tag)); return 4
         if captured:
             with open(out_path, "w") as f: f.write(captured)
+            A.artifact(out_path, kind="companion_enc_static (at-rest key captured from the server)")
             print(captured)                                    # stdout = just the key (scriptable)
             print("[+] companion_enc_static -> %s" % os.path.abspath(out_path), file=sys.stderr)
             return 0
@@ -390,17 +414,26 @@ def main():
     ap.add_argument("--timeout", type=int, default=30)
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
+    global A
+    A = audit.from_env("reconnect")
     log = (lambda *m: print("[ns]", *m, file=sys.stderr)) if a.verbose else (lambda *m: None)
     if not os.path.exists(a.creds):
         print("[!] creds file not found: %s — run `wawf creds <profile>` first" % a.creds, file=sys.stderr)
-        return 6
+        A.end_run(6, status="error", error=RuntimeError("creds file not found: %s" % a.creds)); return 6
+    A.file_read(a.creds, purpose="reconnect credentials (disk-recovered Noise keypair)", hash_it=True)
     creds = json.load(open(a.creds))
     try:
         import websocket  # noqa: F401
     except ImportError:
         print("[!] the 'websocket-client' package is required (pip install websocket-client)", file=sys.stderr)
-        return 6
-    return run(creds, a.out, a.timeout, log)
+        A.end_run(6, status="error", error=RuntimeError("websocket-client not installed")); return 6
+    try:
+        rc = run(creds, a.out, a.timeout, log)
+    except Exception as e:
+        import traceback as _tb
+        A.end_run(1, status="error", error=e, tb=_tb.format_exc()); raise
+    A.end_run(rc, status=("ok" if rc == 0 else "error"))
+    return rc
 
 
 if __name__ == "__main__":
