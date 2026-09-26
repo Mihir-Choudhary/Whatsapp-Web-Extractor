@@ -5,23 +5,27 @@ A single tool (PyInstaller-packageable to a .exe) that decrypts and exports What
 browser profile. Global -v/--verbose surfaces DEBUG logs and full tracebacks; --log-file mirrors
 everything to a file.
 
-You must say WHICH browser profile to examine: every data command takes a <profile> directory, or
-Firefox's --origin storage dir. Nothing is auto-detected — the profile is always your explicit choice.
-For Chromium (Chrome/Edge/Brave/Opera/Vivaldi) pass the profile dir itself, e.g. ".../User Data/Default";
-for Firefox pass the profile dir (".../<name>.default") or --origin for its web.whatsapp.com storage dir.
+There are no sub-commands. Point the tool at a browser profile and it does the whole job:
 
-Subcommands:
-  decrypt   <profile|--origin> [--enc-static]  decrypt WhatsApp bodies (or offline inventory)
-  creds     <profile|--origin> [--out]         recover reconnect creds (Noise key + account id)
-  reconnect <profile|--origin|--creds>         log back in (pure-Python Noise) -> companion_enc_static
-  history   <profile|--origin>                 pull ALL chat history older than the cache from WA (needs Node)
-  memory    (--live|--memimage F) [--deep]     find companion_enc_static in RAM/swap/hiberfil/process
-  sqlite    <profile|--origin> --enc-static    export decrypted chats to a SQLite DB (msgstore.db + wa.db)
+  wawf <PROFILE>        recover the device credentials -> capture the at-rest key (reconnect)
+                        -> decrypt.  (Formerly the separate creds / reconnect / decrypt commands.)
+
+You must say WHICH profile to examine — nothing is auto-detected. For Chromium
+(Chrome/Edge/Brave/Opera/Vivaldi) pass the profile folder itself (the one containing "IndexedDB");
+for Firefox pass the profile folder, or --origin for its web.whatsapp.com storage folder.
+
+Output is chosen with --out [FORMAT:]PATH (repeatable; FORMAT = txt | json | sqlite/db). A plain path
+writes transcripts.txt + chats.json; sqlite: writes an Android-style msgstore.db + wa.db. A Windows
+drive letter is never mistaken for a FORMAT.
+
+Two alternative actions replace the default job:
+  --history                     pull chat history OLDER than the browser cache from the phone (Node)
+  --memory (--live|--memimage)  hunt the at-rest key in RAM / swap / hibernation
 
 Examples:
-  wawf decrypt "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\Default"        # offline inventory (no key)
-  wawf decrypt ~/.config/google-chrome/Default --enc-static <b64> --out out/ -v
-  wawf decrypt --origin .../storage/default/https+++web.whatsapp.com --enc-static <b64>
+  wawf "C:\\Users\\<you>\\AppData\\Local\\Microsoft\\Edge\\User Data\\Default"
+  wawf <PROFILE> --out sqlite:D:\\case\\db --out txt:D:\\case\\out
+  wawf <PROFILE> --enc-static <b64> --out json:D:\\case --audit
 """
 from __future__ import annotations
 import argparse, sys, os, json, base64, logging, collections, datetime as dt, subprocess, time
@@ -87,26 +91,56 @@ def setup_logging(verbose: bool, logfile: str | None):
 
 # ---------------- profile / origin plumbing ----------------
 def _profile_help():
-    """Where browser profiles live on this OS, for help text and 'you must pass one' errors."""
+    """Where browser profiles live on THIS machine. Paths are fully expanded (no %LOCALAPPDATA% style
+    placeholders) so they can be copy-pasted straight onto the command line."""
+    home = os.path.expanduser("~")
     if sys.platform == "win32":
-        return ("  Chromium (pass the profile dir itself):\n"
-                "    %LOCALAPPDATA%\\Google\\Chrome\\User Data\\Default\n"
-                "    %LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\Default\n"
-                "    %LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data\\Default\n"
-                "  Firefox (profile dir, or --origin for its web.whatsapp.com storage dir):\n"
-                "    %APPDATA%\\Mozilla\\Firefox\\Profiles\\<name>.default")
+        la = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+        ad = os.environ.get("APPDATA") or os.path.join(home, "AppData", "Roaming")
+        return ("  Chromium - pass the profile folder itself (the one containing 'IndexedDB'):\n"
+                "    " + os.path.join(la, "Google", "Chrome", "User Data", "Default") + "\n"
+                "    " + os.path.join(la, "Microsoft", "Edge", "User Data", "Default") + "\n"
+                "    " + os.path.join(la, "BraveSoftware", "Brave-Browser", "User Data", "Default") + "\n"
+                "  Firefox - the profile folder (or --origin for its web.whatsapp.com storage folder):\n"
+                "    " + os.path.join(ad, "Mozilla", "Firefox", "Profiles", "<name>.default"))
     if sys.platform == "darwin":
-        return ("  Chromium (pass the profile dir itself):\n"
-                "    ~/Library/Application Support/Google/Chrome/Default\n"
-                "    ~/Library/Application Support/Microsoft Edge/Default\n"
-                "  Firefox (profile dir, or --origin for its web.whatsapp.com storage dir):\n"
-                "    ~/Library/Application Support/Firefox/Profiles/<name>.default")
-    return ("  Chromium (pass the profile dir itself):\n"
-            "    ~/.config/google-chrome/Default\n"
-            "    ~/.config/microsoft-edge/Default\n"
-            "  Firefox (profile dir, or --origin for its web.whatsapp.com storage dir):\n"
-            "    ~/.mozilla/firefox/<name>.default\n"
-            "    --origin ~/.mozilla/firefox/<name>.default/storage/default/https+++web.whatsapp.com")
+        asup = os.path.join(home, "Library", "Application Support")
+        return ("  Chromium - pass the profile folder itself (the one containing 'IndexedDB'):\n"
+                "    " + os.path.join(asup, "Google", "Chrome", "Default") + "\n"
+                "    " + os.path.join(asup, "Microsoft Edge", "Default") + "\n"
+                "  Firefox - the profile folder (or --origin for its web.whatsapp.com storage folder):\n"
+                "    " + os.path.join(asup, "Firefox", "Profiles", "<name>.default"))
+    return ("  Chromium - pass the profile folder itself (the one containing 'IndexedDB'):\n"
+            "    " + os.path.join(home, ".config", "google-chrome", "Default") + "\n"
+            "    " + os.path.join(home, ".config", "microsoft-edge", "Default") + "\n"
+            "  Firefox - the profile folder (or --origin for its web.whatsapp.com storage folder):\n"
+            "    " + os.path.join(home, ".mozilla", "firefox", "<name>.default"))
+
+def _example_profile():
+    """One real, copy-pasteable profile path for this machine, used in the help examples."""
+    home = os.path.expanduser("~")
+    if sys.platform == "win32":
+        la = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+        return os.path.join(la, "Microsoft", "Edge", "User Data", "Default")
+    if sys.platform == "darwin":
+        return os.path.join(home, "Library", "Application Support", "Google", "Chrome", "Default")
+    return os.path.join(home, ".config", "google-chrome", "Default")
+
+_OUT_FORMATS = ("txt", "json", "sqlite", "db")
+
+def _parse_out(spec):
+    """'--out FORMAT:PATH' -> (format, path); a bare path -> (None, path) meaning 'all text formats'.
+    Only a KNOWN format counts as a prefix, so a Windows path like D:\\case\\out keeps its drive letter
+    instead of being read as format 'D'."""
+    if ":" in spec:
+        head, rest = spec.split(":", 1)
+        if head.lower() in _OUT_FORMATS and rest:
+            return ("sqlite" if head.lower() in ("sqlite", "db") else head.lower()), rest
+    return None, spec
+
+def _out_workdir(path):
+    """The folder an --out target lives in (the target itself when it names a folder)."""
+    return path if (os.path.isdir(path) or not os.path.splitext(path)[1]) else (os.path.dirname(path) or ".")
 
 def _require_source(a, cmd="<command>"):
     """Every data command needs an explicit profile (or Firefox --origin). Nothing is guessed: which
@@ -180,6 +214,44 @@ def _summary(engine, ls, msgs, meta):
     log.info("  msg types   : %s", top)
     log.info("─────────────────────────────────")
 
+def cmd_run(a):
+    """THE DEFAULT ACTION and the whole point of the tool: recover the device credentials from the profile,
+    obtain the at-rest key, and decrypt — in one step. Previously this was three separate sub-commands
+    (creds -> reconnect -> decrypt) that the user had to chain by hand."""
+    _require_source(a, "")
+    outs = [_parse_out(s) for s in (a.out or [])] or [(None, "wawf_out")]
+    workdir = _out_workdir(outs[0][1])
+    os.makedirs(workdir, exist_ok=True)
+
+    log.info("[1/3] recovering device credentials from the profile ...")
+    creds_path = os.path.join(workdir, "creds_in.json")
+    if cmd_creds(argparse.Namespace(profile=a.profile, origin=a.origin, out=creds_path, _internal=True)):
+        return 3
+
+    key = a.enc_static
+    if key:
+        log.info("[2/3] using the companion_enc_static given with --enc-static (no reconnect needed)")
+    else:
+        log.info("[2/3] reconnecting as the linked device to capture companion_enc_static (NETWORKED) ...")
+        keyfile = os.path.join(workdir, "companion_enc_static.txt")
+        rc = cmd_reconnect(argparse.Namespace(profile=a.profile, origin=a.origin, creds=creds_path,
+                                              out=keyfile, verbose=a.verbose))
+        if rc:
+            log.error("could not capture the at-rest key, so there is nothing to decrypt with. "
+                      "Supply one with --enc-static, or recover it from memory with --memory.")
+            return rc
+        key = open(keyfile).read().strip()
+
+    log.info("[3/3] decrypting to %d output(s) ...", len(outs))
+    for fmt, path in outs:
+        if fmt == "sqlite":
+            rc = cmd_sqlite(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=key, out=path))
+        else:
+            rc = cmd_decrypt(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=key,
+                                                out=path, only=fmt))
+        if rc: return rc
+    return 0
+
 def cmd_decrypt(a):
     from cryptography.hazmat.primitives.kdf.hkdf import HKDF
     from cryptography.hazmat.primitives import hashes
@@ -232,7 +304,13 @@ def cmd_decrypt(a):
                                  "type": m["type"], "sender": m["sender"], "text": " ".join(dict.fromkeys(WD.leaves(pt)))[:2000]})
         ok += 1
     for c in chats: chats[c].sort(key=lambda x: x["t"])
-    json.dump(chats, open(f"{a.out}/chats.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1, default=str)
+    only = getattr(a, "only", None)                      # 'txt' / 'json' from --out FORMAT:PATH; None = both
+    if only != "txt":
+        json.dump(chats, open(f"{a.out}/chats.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1, default=str)
+    if only == "json":
+        log.info("decrypted %d bodies (%d failed) -> %s/chats.json", ok, fail, a.out)
+        AUDIT.artifact(f"{a.out}/chats.json", kind="decrypted chats (JSON)", records=ok)
+        return 0
     with open(f"{a.out}/transcripts.txt", "w", encoding="utf-8") as f:  # message text has emoji/non-Latin -> pin UTF-8 (Windows default is cp1252)
         for c, ml in sorted(chats.items(), key=lambda kv: -len(kv[1])):
             tm = [m for m in ml if m["text"]]
@@ -723,84 +801,91 @@ def main():
         runpy.run_path(path, run_name="__main__")
         return 0
     p = argparse.ArgumentParser(
-        prog="wawf", description="WhatsApp Web Forensics (Firefox + Chromium).",
-        epilog="YOU MUST PASS A PROFILE. Every data command needs the browser profile directory to examine\n"
-               "(or --origin for a Firefox web.whatsapp.com storage dir). Profiles are NOT auto-detected --\n"
-               "which profile gets examined is always your explicit choice.\n\n"
-               "Profile locations on this system:\n" + _profile_help() + "\n\n"
-               "Chromium = pass the profile dir itself (the folder containing 'IndexedDB').\n"
-               "Firefox  = pass the profile dir, or --origin for its web.whatsapp.com storage dir.\n\n"
-               "Run `wawf <command> -h` for that command's own options.\n"
-               "Start here (no key needed, read-only inventory):\n"
-               "  wawf decrypt <profile-dir>",
+        prog="wawf",
+        description="WhatsApp Web Forensics (Firefox + Chromium). Point it at a browser profile and it "
+                    "recovers the device credentials, captures the at-rest key, and decrypts your chats.",
+        epilog=
+        "WHAT IT DOES BY DEFAULT\n"
+        "  wawf <PROFILE>        recover credentials -> capture the at-rest key (reconnect) -> decrypt.\n"
+        "                        That is the whole job; there are no sub-commands to chain.\n"
+        "\n"
+        "OUTPUT  --out [FORMAT:]PATH   (repeatable; default: wawf_out as text + JSON)\n"
+        "  --out D:\\case\\out                transcripts.txt AND chats.json in that folder\n"
+        "  --out txt:D:\\case\\out            only transcripts.txt (readable transcripts)\n"
+        "  --out json:D:\\case\\out           only chats.json (structured, per chat)\n"
+        "  --out sqlite:D:\\case\\db          Android-style msgstore.db + wa.db (open in any SQLite\n"
+        "                                     viewer, or ingest with a WhatsApp forensic suite)\n"
+        "  --out sqlite:D:\\case\\db --out txt:D:\\case\\out       write several formats at once\n"
+        "  (FORMAT is one of txt, json, sqlite/db. A plain path with no FORMAT: writes text + JSON.\n"
+        "   A drive letter is never mistaken for a format, so D:\\case\\out works as you'd expect.)\n"
+        "\n"
+        "OPTIONAL EXTRAS\n"
+        "  --enc-static <b64>    already have the at-rest key? use it and skip the reconnect\n"
+        "  --history             instead of decrypting, pull chat history OLDER than the browser\n"
+        "                        cache from your phone (networked, needs Node; phone must answer)\n"
+        "  --memory --live       instead of reconnecting, hunt the key in RAM/swap/hibernation\n"
+        "  --audit               write a chain-of-custody database beside the output\n"
+        "\n"
+        "EXAMPLES\n"
+        "  wawf \"" + _example_profile() + "\"\n"
+        "  wawf \"" + _example_profile() + "\" --out sqlite:D:\\case\\db\n"
+        "  wawf \"" + _example_profile() + "\" --enc-static <b64> --out json:D:\\case --audit\n"
+        "\n"
+        "PROFILE LOCATIONS ON THIS SYSTEM\n" + _profile_help() + "\n",
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("-v", "--verbose", action="store_true", help="DEBUG logs + full tracebacks on error")
-    p.add_argument("--log-file", help="mirror all logs (DEBUG) to this file")
-    sub = p.add_subparsers(dest="cmd", required=True)
-    def prof_args(sp, origin=True):
-        sp.add_argument("profile", nargs="?", metavar="profile",
-                        help="REQUIRED (unless --origin): the browser profile directory to examine. Chromium "
-                             "(Chrome/Edge/Brave/Opera/Vivaldi): the profile dir itself, e.g. "
-                             "'...\\User Data\\Default' or '~/.config/google-chrome/Default'. Firefox: the "
-                             "profile dir, e.g. '~/.mozilla/firefox/<name>.default'. Not auto-detected.")
-        if origin: sp.add_argument("--origin", help="Firefox web.whatsapp.com storage dir (alternative to profile)")
-    def audit_args(sp):
-        """Opt-in chain-of-custody log. One DB per case, written where the output goes."""
-        # NOTE: a plain flag, NOT nargs='?'. An optional-value option would swallow the following positional,
-        # so `wawf decrypt --audit <profile>` used to treat the profile as the DB path. Path goes in --audit-db.
-        sp.add_argument("--audit", action="store_true",
-                        help="record a chain-of-custody audit DB: every file touched, key derivation, network "
-                             "request, artifact (with SHA-256) and error, crash-safe. Written as wawf_audit.db "
-                             "in the output directory (one DB per case); use --audit-db to choose the path.")
-        sp.add_argument("--audit-db", metavar="DB",
-                        help="path for the --audit case database (default: wawf_audit.db in the output dir)")
-        sp.add_argument("--audit-secrets", action="store_true",
-                        help="with --audit, also store raw key material in the DB (default: only SHA-256 "
-                             "fingerprints + derivation parameters, so the log is not a secret store)")
-    _ENC = "companion_enc_static (base64) — the at-rest key; get it from `memory` or `reconnect`"
-    s = sub.add_parser("decrypt", help="<profile|--origin> [--enc-static] — chats to transcripts.txt + chats.json (no key = offline inventory)",
-                       description="Decrypt WhatsApp Web chats to transcripts.txt + chats.json. Without --enc-static "
-                       "it prints an offline inventory (counts, date range, contacts) and decrypts no message text.")
-    prof_args(s); s.add_argument("--enc-static", help=_ENC + " (omit for offline inventory only)")
-    s.add_argument("--out", default="wa_decrypted", help="output dir for transcripts.txt + chats.json (default: wa_decrypted)")
-    audit_args(s); s.set_defaults(fn=cmd_decrypt)
-    # when frozen (.exe) HERE is a temp extraction dir that's deleted on exit -> write creds to CWD instead
-    _creds_out = "creds_in.json" if getattr(sys, "frozen", False) else os.path.join(HERE, "tools/reconnect/creds_in.json")
-    s = sub.add_parser("creds", help="<profile|--origin> — recover + verify reconnect credentials (Noise key + account identity)",
-                       description="Recover and verify the reconnect credentials (Noise X25519 keypair + account "
-                       "identity) from disk. Read-only; writes creds_in.json for `reconnect`/history. No message text.")
-    prof_args(s); s.add_argument("--out", default=_creds_out, help="where to write creds_in.json")
-    audit_args(s); s.set_defaults(fn=cmd_creds)
-    s = sub.add_parser("reconnect", help="<profile|--origin|--creds> — log back in (pure-Python Noise) and capture companion_enc_static",
-                       description="Log back in as the linked companion device via the pure-Python Noise handshake "
-                       "and capture companion_enc_static. NETWORKED — own account / authorized use only.")
-    prof_args(s); s.add_argument("--creds", help="existing creds_in.json (skip creds recovery)")
-    s.add_argument("--out", default="companion_enc_static.txt", help="where to write the captured key (default: companion_enc_static.txt)")
-    audit_args(s); s.set_defaults(fn=cmd_reconnect)
-    s = sub.add_parser("history", help="<profile|--origin> — pull chat history older than the browser cache from your phone (needs Node)",
-                       description="Iteratively pull messages older than the browser cache from WhatsApp's servers, "
-                       "per chat, re-anchoring deeper each pass and accumulating (deduped) across passes AND separate "
-                       "runs until it converges. NETWORKED; needs Node + tools/reconnect (npm install); not in the .exe.")
-    prof_args(s); s.add_argument("--yes", action="store_true", help="auto-confirm installing Node / Baileys if missing")
-    audit_args(s); s.set_defaults(fn=cmd_history)
-    s = sub.add_parser("memory", help="(--live | --memimage FILE) — find companion_enc_static in RAM / swap / hibernation",
-                       description="Recover companion_enc_static from volatile memory (live process, RAM/swap dump, or "
-                       "hibernation file). Live scanning of another process's memory typically needs elevated privileges.")
-    s.add_argument("--live", action="store_true", help="scan the running browser's memory on this machine")
-    s.add_argument("--memimage", help="scan a memory image file (RAM dump / swap / hibernation) instead of live RAM")
-    s.add_argument("--deep", action="store_true", help="slower, more exhaustive scan")
-    s.add_argument("--enc-static", help="verify this candidate key against on-disk ciphertext instead of scanning")
-    s.add_argument("--origin", help="Firefox web.whatsapp.com storage dir (to validate a found key)")
-    s.add_argument("--yes", action="store_true", help="skip the confirmation prompt for scanning live memory")
-    audit_args(s); s.set_defaults(fn=cmd_memory)
-    s = sub.add_parser("sqlite", help="<profile|--origin> --enc-static — export decrypted chats to Android msgstore.db + wa.db",
-                       description="Export decrypted chats to an Android-style SQLite database (msgstore.db + wa.db). "
-                       "Requires --enc-static. Firefox (--origin) and Chromium (profile) both supported.")
-    prof_args(s); s.add_argument("--enc-static", required=True, help=_ENC)
-    s.add_argument("--out", default="wa_sqlite", help="output dir for msgstore.db + wa.db (default: wa_sqlite)")
-    audit_args(s); s.set_defaults(fn=cmd_sqlite)
+
+    p.add_argument("profile", nargs="?", metavar="PROFILE",
+                   help="the browser profile folder to examine (required unless --origin is given). "
+                        "Chromium: the folder containing 'IndexedDB'. Firefox: the profile folder. "
+                        "See PROFILE LOCATIONS below. Never auto-detected.")
+    p.add_argument("--origin", metavar="DIR",
+                   help="Firefox web.whatsapp.com storage folder, instead of a profile folder")
+    p.add_argument("--out", action="append", metavar="[FORMAT:]PATH",
+                   help="where to write the results, repeatable. FORMAT is txt, json or sqlite/db; "
+                        "a plain path writes text + JSON. Default: wawf_out. See OUTPUT below for examples.")
+    p.add_argument("--enc-static", metavar="B64",
+                   help="the at-rest key (companion_enc_static, base64). Given this, the networked "
+                        "reconnect is skipped entirely.")
+    p.add_argument("--creds", metavar="FILE",
+                   help="an existing creds_in.json to reuse instead of recovering credentials again")
+
+    g = p.add_argument_group("optional actions (instead of the default decrypt job)")
+    g.add_argument("--history", action="store_true",
+                   help="pull chat history older than the browser cache from your phone. NETWORKED and "
+                        "phone-dependent; needs Node (offers to install it). Results are saved and resume.")
+    g.add_argument("--memory", action="store_true",
+                   help="recover the at-rest key from volatile memory instead of reconnecting")
+    g.add_argument("--live", action="store_true", help="with --memory: scan this machine's running browser (Linux, root)")
+    g.add_argument("--memimage", metavar="FILE", help="with --memory: scan a RAM/swap/hibernation image file")
+    g.add_argument("--deep", action="store_true", help="with --memory: slower, more exhaustive scan")
+    g.add_argument("--yes", action="store_true",
+                   help="auto-confirm prompts (installing Node for --history, scanning live memory)")
+
+    g = p.add_argument_group("chain of custody")
+    # NOTE: a plain flag, NOT nargs='?'. An optional-value option would swallow the PROFILE positional.
+    g.add_argument("--audit", action="store_true",
+                   help="record an audit database: every file touched, key derivation, network request, "
+                        "artifact (with SHA-256) and error, crash-safe. One database per case, written "
+                        "beside the output as wawf_audit.db.")
+    g.add_argument("--audit-db", metavar="DB", help="path for the --audit database (default: beside the output)")
+    g.add_argument("--audit-secrets", action="store_true",
+                   help="with --audit, also store raw key material (default: only SHA-256 fingerprints "
+                        "plus derivation parameters, so the log is not a secret store)")
+
+    g = p.add_argument_group("diagnostics")
+    g.add_argument("-v", "--verbose", action="store_true", help="DEBUG logs + full tracebacks on error")
+    g.add_argument("--log-file", metavar="FILE", help="mirror all logs (DEBUG) to this file")
+
     a = p.parse_args()
     setup_logging(a.verbose, a.log_file)
+    # Pick the action. The default IS the job: credentials -> key -> decrypt. --history and --memory are
+    # the two alternative actions; everything else is an option on the default job.
+    if a.memory or a.live or a.memimage:
+        a.cmd, action = "memory", cmd_memory
+    elif a.history:
+        a.cmd, action = "history", cmd_history
+    else:
+        a.cmd, action = "decrypt", cmd_run
     global AUDIT
     if getattr(a, "audit", False) or getattr(a, "audit_db", None):   # --audit-db alone implies --audit
         AUDIT = audit.open_db(_audit_db_path(a), record_secrets=getattr(a, "audit_secrets", False))
@@ -815,7 +900,7 @@ def main():
     t0 = time.time()
     rc, status, err, tb = 0, "ok", None, None
     try:
-        rc = a.fn(a)
+        rc = action(a)
         status = "ok" if not rc else "error"
     except SystemExit as e:
         log.error("%s", e); rc = int(e.code) if isinstance(e.code, int) else 1

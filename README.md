@@ -31,18 +31,42 @@ build your own binary for any OS with `pyinstaller wawf.spec` — see [BUILD.md]
 
 ## Use
 
-`<command>` is one of:
+**There are no sub-commands.** Point it at a browser profile and it does the whole job — recover the
+device credentials, capture the at-rest key (reconnect), and decrypt:
 
-| Command | What it does |
+```bash
+wawf <PROFILE>
+```
+
+`<PROFILE>` is the browser profile folder (Chromium: the one containing `IndexedDB`; Firefox: the profile
+folder, or `--origin` for its `web.whatsapp.com` storage folder). Nothing is auto-detected — which profile
+gets examined is always your explicit choice. `wawf -h` prints the profile locations for your machine as
+full, copy-pasteable paths.
+
+### Choosing the output — `--out [FORMAT:]PATH`
+
+Repeatable. `FORMAT` is `txt`, `json` or `sqlite`/`db`; a plain path writes text **and** JSON:
+
+```bash
+wawf <PROFILE> --out D:\case\out              # transcripts.txt AND chats.json
+wawf <PROFILE> --out txt:D:\case\out          # only transcripts.txt
+wawf <PROFILE> --out json:D:\case\out         # only chats.json
+wawf <PROFILE> --out sqlite:D:\case\db        # Android msgstore.db + wa.db
+wawf <PROFILE> --out sqlite:D:\case\db --out txt:D:\case\out    # several at once
+```
+
+A Windows drive letter is never mistaken for a `FORMAT`, so `D:\case\out` works as you'd expect.
+
+### Options
+
+| Option | What it does |
 |---|---|
-| `decrypt <profile> [--enc-static B64]` | Decrypt WhatsApp chats. Without the key: offline inventory only. |
-| `creds <profile>` | Recover reconnect credentials (Noise key + account identity). |
-| `reconnect <profile>` | Log back in (pure-Python Noise handshake) and capture `companion_enc_static`. Networked; own account only. |
-| `history <profile>` | Pull chat history older than the browser cache from WhatsApp's servers, per chat — iteratively, going deeper each pass and resuming across runs until it converges. Needs Node + `tools/reconnect`; phone-side & rate-limited. |
-| `memory (--live \| --memimage FILE)` | Find the decryption key in RAM / swap / hibernation. `--live` is Linux-only (reads `/proc`, needs root); `--memimage <file>` works anywhere. |
-| `sqlite <profile> \| --origin DIR --enc-static B64` | Export decrypted chats to a SQLite DB (Android `msgstore.db` + `wa.db`) — Firefox **and** Chromium. |
-
-Add `-v` for full logs and tracebacks, `--log-file FILE` to save them, `--out DIR` to choose the output folder.
+| `--enc-static B64` | You already have the at-rest key — use it and skip the networked reconnect. |
+| `--origin DIR` | Firefox `web.whatsapp.com` storage folder instead of a profile folder. |
+| `--history` | *Instead of decrypting:* pull chat history older than the browser cache from your phone, iteratively, resuming across runs. Needs Node (offers to install it); phone-side and rate-limited. |
+| `--memory (--live \| --memimage FILE)` | *Instead of reconnecting:* find the key in RAM / swap / hibernation. `--live` is Linux-only (reads `/proc`, needs root); `--memimage` works anywhere. |
+| `--audit` | Write a chain-of-custody database beside the output (see below). |
+| `-v`, `--log-file FILE` | Full logs and tracebacks; mirror them to a file. |
 
 ## Chain of custody — `--audit` (optional)
 
