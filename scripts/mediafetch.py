@@ -6,10 +6,10 @@ the CDN served it, plus, in each message record, the `mediaKey` needed to decryp
 recovery is a separate step from message decryption, and there are three sources, in descending
 forensic preference:
 
-  1. CACHE  (offline, no network)  The browser's HTTP cache holds the ciphertext byte-for-byte.
-     Nothing can change under us and the evidence device is not contacted. Chromium keeps these in
-     `Service Worker/CacheStorage/<origin>/<bucket>/<hash>_0` in the "simple cache" format; Firefox
-     keeps them in the origin's `cache/morgue` (export_sqlite.py already handles the Firefox side).
+  1. CACHE  (offline, no network)  The browser's cache holds the ciphertext byte-for-byte. Nothing
+     can change under us and the evidence device is not contacted. Every browser and every cache
+     layer is handled by scripts/mediacache.py (Chromium simple-cache + blockfile, Firefox
+     CacheStorage + cache2), so this works the same on Chrome, Edge, Brave, Opera and Firefox.
   2. CDN    (networked)            GET the message's `directPath` from mmg.whatsapp.net. Recovers
      media that was never cached, but touches the network and a directPath can expire.
   3. THUMBNAIL                     `jpegThumbnail` is embedded in the message record itself and is
@@ -30,117 +30,18 @@ files and, unless --no-update-db, points each message_media.file_path at its fil
 database and the media directory stay consistent.
 """
 from __future__ import annotations
-import argparse, base64, glob, hashlib, os, sqlite3, struct, sys
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+import sys as _sys
+def _force_utf8_stdio():
+    """Redirected/piped stdout defaults to the locale encoding, so a box-drawing character
+    in a summary raises UnicodeEncodeError and takes the rest of the output with it."""
+    for _s in (_sys.stdout, _sys.stderr):
+        try: _s.reconfigure(encoding='utf-8', errors='replace')
+        except Exception: pass
+_force_utf8_stdio()
+import argparse, base64, hashlib, os, sqlite3, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# WhatsApp's per-type HKDF info strings. A sticker is an image as far as the key schedule cares.
-INFO_BY_PREFIX = [("image/", b"WhatsApp Image Keys"), ("video/", b"WhatsApp Video Keys"),
-                  ("audio/", b"WhatsApp Audio Keys")]
-INFO_DEFAULT = b"WhatsApp Document Keys"
-EXT = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif",
-       "video/mp4": "mp4", "video/3gpp": "3gp", "video/quicktime": "mov",
-       "audio/ogg": "ogg", "audio/ogg; codecs=opus": "ogg", "audio/mpeg": "mp3",
-       "audio/mp4": "m4a", "audio/aac": "aac", "audio/amr": "amr",
-       "application/pdf": "pdf", "text/plain": "txt", "application/zip": "zip"}
-
-def info_for(mime: str) -> bytes:
-    m = (mime or "").lower()
-    for pre, inf in INFO_BY_PREFIX:
-        if m.startswith(pre):
-            return inf
-    return INFO_DEFAULT
-
-def ext_for(mime: str) -> str:
-    m = (mime or "").lower()
-    if m in EXT: return EXT[m]
-    base = m.split(";")[0].strip()
-    return EXT.get(base) or (base.split("/")[-1][:8] if "/" in base else "bin")
-
-def decrypt_media(ciphertext: bytes, media_key: bytes, mime: str):
-    """Return plaintext, or None if the blob is not decryptable with this key."""
-    if not ciphertext or len(ciphertext) <= 10 or not media_key:
-        return None
-    exp = HKDF(algorithm=hashes.SHA256(), length=112, salt=b"\x00" * 32,
-               info=info_for(mime)).derive(media_key)
-    iv, ckey = exp[:16], exp[16:48]
-    try:
-        pt = Cipher(algorithms.AES(ckey), modes.CBC(iv)).decryptor().update(ciphertext[:-10])
-    except Exception:
-        return None
-    if not pt:
-        return None
-    pad = pt[-1]
-    return pt[:-pad] if 1 <= pad <= 16 else pt          # PKCS#7, tolerate an unpadded tail
-
-# ---------------------------------------------------------------- Chromium simple cache ----------
-# net/disk_cache/simple/simple_entry_format.h
-SIMPLE_MAGIC = 0xFCFB6D1BA7725C30
-SIMPLE_EOF   = 0xF4FA6F45970D41D8
-EOF_STRUCT   = struct.Struct("<QIIq")                  # magic, flags, data_crc32, stream_size
-
-_CL_RE = __import__("re").compile(rb"content-length[\x00-\x20]*:?[\x00-\x20]*(\d+)", __import__("re").I)
-_BODY_PREFIX = 4        # see below
-
-def simple_cache_entry(path: str):
-    """(key, body) from one Chromium simple-cache file, or None if it is not one / is unusable.
-
-    Layout: SimpleFileHeader(20B) || key || stream1 || SimpleFileEOF(24B) || stream0 || EOF.
-    Stream 1 is the response BODY; stream 0 is the response metadata.
-
-    The EOF record's `stream_size` is 4 bytes LARGER than the response's own Content-Length: the
-    stream carries a 4-byte prefix before the body proper. Determined empirically and then confirmed
-    the only way that counts — by checking which slice reproduces an encFileSha256 that the message
-    store already knows: taking Content-Length bytes back from the EOF record matched 35 of the 36
-    cached media blobs (the 36th is simply not a message in this export), while using stream_size
-    matched none. So prefer Content-Length when the metadata gives it, and fall back to skipping the
-    prefix.
-    """
-    try:
-        with open(path, "rb") as f:
-            data = f.read()
-    except OSError:
-        return None
-    if len(data) < 44:
-        return None
-    magic, _version, key_len, _key_hash = struct.unpack_from("<QIII", data, 0)
-    if magic != SIMPLE_MAGIC or key_len <= 0 or 20 + key_len > len(data):
-        return None
-    key = data[20:20 + key_len].decode("utf-8", "replace")
-    pos = 20 + key_len
-    at = data.find(struct.pack("<Q", SIMPLE_EOF), pos)
-    if at < 0 or at + EOF_STRUCT.size > len(data):
-        return None
-    m = _CL_RE.search(data, at)                 # the headers live in stream 0, after this EOF
-    if not m:
-        m = _CL_RE.search(data)
-    if m:
-        cl = int(m.group(1))
-        if 0 < cl <= at - pos:
-            return key, data[at - cl:at]
-    return key, data[pos + _BODY_PREFIX:at]
-
-def scan_chromium_cache(profile: str, wanted: dict, verbose=False):
-    """Match cached ciphertext against the enc-hashes we are looking for. {enc_sha256_b64: body}"""
-    root = os.path.join(profile, "Service Worker", "CacheStorage")
-    found, scanned = {}, 0
-    if not os.path.isdir(root):
-        return found, scanned
-    for path in glob.iglob(os.path.join(root, "**", "*_0"), recursive=True):
-        ent = simple_cache_entry(path)
-        if not ent:
-            continue
-        scanned += 1
-        key, body = ent
-        if not body:
-            continue
-        h = base64.b64encode(hashlib.sha256(body).digest()).decode()
-        if h in wanted and h not in found:
-            found[h] = body
-            if verbose:
-                print(f"    cache hit: {key.rsplit('/', 1)[-1][:48]}  {len(body):,} B")
-    return found, scanned
+from mediacache import decrypt_media, ext_for, recover as recover_from_cache
 
 # ---------------------------------------------------------------- CDN ----------------------------
 def cdn_get(direct_path: str, timeout=30):
@@ -154,7 +55,8 @@ def cdn_get(direct_path: str, timeout=30):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--db", required=True, help="the SQLite export from `wawf --out sqlite:PATH`")
-    ap.add_argument("--profile", help="Chromium profile dir, to recover from its cache (offline)")
+    ap.add_argument("--profile", help="browser profile dir, to recover from its cache (offline)")
+    ap.add_argument("--origin", help="Firefox web.whatsapp.com storage dir (adds its cache too)")
     ap.add_argument("--cdn", action="store_true", help="also download what the cache does not have (NETWORKED)")
     ap.add_argument("--out", help="media output dir (default: <db dir>/Media/WhatsApp Web)")
     ap.add_argument("--retry-json", help="media_retry_out.json from tools/reconnect/diag_media_retry.js: "
@@ -179,11 +81,12 @@ def main():
             by_ench.setdefault(r[3], []).append(r)
     print(f"[i] {len(by_ench)} distinct encrypted-blob hashes to look for")
 
-    cached, scanned = ({}, 0)
-    if a.profile:
-        print("[1/2] scanning the browser cache (offline) ...")
-        cached, scanned = scan_chromium_cache(a.profile, by_ench, verbose=True)
-        print(f"      {scanned} cache entries parsed, {len(cached)} matched a message")
+    cached = {}
+    if a.profile or a.origin:
+        print("[1/2] scanning the browser cache (offline, all cache formats) ...")
+        cached, st = recover_from_cache(by_ench, a.profile, a.origin, verbose=True)
+        print(f"      {st['files']} cache file(s) under {st['roots']} root(s), "
+              f"{len(cached)} matched a message  {st['by_source'] or ''}")
 
     # A directPath is a capability URL that expires in DAYS (measured on a real profile: the newest
     # day serves HTTP 206, a week-old path returns 403). The mediaKey never expires, so old media is

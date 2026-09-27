@@ -414,7 +414,15 @@ def _sub(script, extra):
         cmd = [sys.executable, os.path.join(HERE, "scripts", script)] + extra
     log.info("running %s", " ".join(cmd))
     AUDIT.event("helper subprocess start", category="subprocess", detail={"script": script, "argv": cmd})
-    rc = subprocess.run(cmd, env=AUDIT.child_env()).returncode   # child appends to the same case DB
+    # Force UTF-8 stdio on the child. Its stdout is a PIPE here, so Python picks the LOCALE
+    # encoding (cp1252 on Windows) and any box-drawing character in a summary raises
+    # UnicodeEncodeError. That killed export_sqlite.py's entire summary block -- including the
+    # one line that told Chromium users why no media was written -- AFTER the database had
+    # already been written, so the failure looked like a silent omission.
+    _env = dict(AUDIT.child_env() or os.environ)
+    _env.setdefault("PYTHONIOENCODING", "utf-8")
+    _env.setdefault("PYTHONUTF8", "1")
+    rc = subprocess.run(cmd, env=_env).returncode        # child appends to the same case DB
     AUDIT.event("helper subprocess exit rc=%s" % rc, level=("INFO" if rc == 0 else "ERROR"),
                 category="subprocess", detail={"script": script, "rc": rc})
     return rc

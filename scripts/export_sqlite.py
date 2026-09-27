@@ -13,6 +13,14 @@ are exported to message_media but the browser cache isn't decoded — recover me
 
 (The Android schema is also ingestable by third-party suites such as akhil-dara/WAInsight.)
 """
+import sys as _sys
+def _force_utf8_stdio():
+    """Redirected/piped stdout defaults to the locale encoding, so a box-drawing character
+    in a summary raises UnicodeEncodeError and takes the rest of the output with it."""
+    for _s in (_sys.stdout, _sys.stderr):
+        try: _s.reconfigure(encoding='utf-8', errors='replace')
+        except Exception: pass
+_force_utf8_stdio()
 import sqlite3, sys, os, base64, json, glob, hashlib, re, argparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from snappy_pure import uncompress
@@ -459,44 +467,42 @@ for c in contacts:
 wa.commit(); wa.close()
 
 # ============ decrypt cached media into Media/ + set file_path ============
-INFOMAP = {'image':b'WhatsApp Image Keys','video':b'WhatsApp Video Keys','audio':b'WhatsApp Audio Keys','ptt':b'WhatsApp Audio Keys','document':b'WhatsApp Document Keys','sticker':b'WhatsApp Image Keys','gif':b'WhatsApp Video Keys'}
-EXT = {'image/jpeg':'jpg','image/webp':'webp','image/png':'png','video/mp4':'mp4','application/pdf':'pdf','audio/ogg; codecs=opus':'ogg'}
-def unframe(data):
-    if data[:4] != b'\xff\x06\x00\x00' or not _sn: return data
-    out = bytearray(); p = 10
-    while p+4 <= len(data):
-        ty = data[p]; ln = int.from_bytes(data[p+1:p+4],'little'); p += 4; ch = data[p:p+ln]; p += ln
-        if ty == 0x00:
-            try: out += bytes(_sn(ch[4:]))
-            except Exception: break
-        elif ty == 0x01: out += ch[4:]
-        else: break
-    return bytes(out)
-# index cached .enc blobs by sha256 (Firefox on-disk origin cache; Chromium caches media elsewhere)
-C = None if _is_chromium else f'{O}/cache/morgue'
+# Browser-agnostic: mediacache walks every cache layout we know (Chromium simple-cache +
+# blockfile, Firefox CacheStorage + cache2) under both the profile and, for Firefox, the origin.
+# This block used to be gated `C = None if _is_chromium else ...`, so on ANY Chromium profile
+# (Chrome/Edge/Brave/Opera) it silently recovered nothing while still creating an empty
+# Media/WhatsApp Web folder -- the only hint being media_decrypted_to_disk=0 in the line below.
+import mediacache
+# One blob can belong to MANY messages -- a forwarded image or a re-sent sticker shares its
+# ciphertext -- so index a LIST per hash. Keying one message per hash silently dropped the
+# file_path of every other message that shared it.
 byench = {}
 for m in messages:
-    if m['media'] and m['media'].get('enc_file_hash'): byench[m['media']['enc_file_hash']] = m
-decrypted = 0
+    if m['media'] and m['media'].get('enc_file_hash'):
+        byench.setdefault(m['media']['enc_file_hash'], []).append(m)
+decrypted = blobs = 0
+cached, _cst = mediacache.recover(byench, _args.profile, O if not _is_chromium else None)
 db = sqlite3.connect(mp)
-for f in (glob.glob(C + '/*/*.final') if C else []):
-    try: body = unframe(open(f,'rb').read())
-    except Exception: continue
-    h = base64.b64encode(hashlib.sha256(body).digest()).decode()
-    m = byench.get(h)
-    if not m: continue
-    md = m['media']
-    try:
-        exp = HKDF(algorithm=hashes.SHA256(), length=112, salt=b'\x00'*32, info=INFOMAP.get(md['type'], b'WhatsApp Image Keys')).derive(md['media_key'])
-        pt = Cipher(algorithms.AES(exp[16:48]), modes.CBC(exp[:16])).decryptor().update(body[:-10]); p = pt[-1]
-        pt = pt[:-p] if 1 <= p <= 16 else pt
-        if base64.b64encode(hashlib.sha256(pt).digest()).decode() != md['file_hash']: continue
-        rid = WEBID2ID[m['webid']]; ext = EXT.get(md['mime_type'], 'bin')
+for h, body in cached.items():
+    wrote_any = False
+    for m in byench.get(h, []):
+        md = m['media']
+        # the media TYPE (image/video/audio/document/sticker) picks the HKDF info string; fall back
+        # to the mime when the record has no type word
+        pt = mediacache.decrypt_media(body, md['media_key'], md.get('type') or md.get('mime_type'))
+        if pt is None: continue
+        if base64.b64encode(hashlib.sha256(pt).digest()).decode() != md['file_hash']: continue  # verified
+        rid = WEBID2ID[m['webid']]; ext = mediacache.ext_for(md['mime_type'])
         rel = f"Media/WhatsApp Web/{rid}.{ext}"
-        open(f'{OUT}/{rel}', 'wb').write(pt)
-        db.execute("UPDATE message_media SET file_path=? WHERE message_row_id=?", (rel, rid)); decrypted += 1
-    except Exception: continue
+        try: open(f'{OUT}/{rel}', 'wb').write(pt)
+        except OSError: continue
+        db.execute("UPDATE message_media SET file_path=? WHERE message_row_id=?", (rel, rid))
+        decrypted += 1; wrote_any = True
+    blobs += 1 if wrote_any else 0
 db.commit(); db.close()
+if byench and not decrypted:
+    print(f"  [i] media: {len(byench)} media message(s) have keys but none of their encrypted blobs are "
+          f"in this browser's cache — run scripts/mediafetch.py --cdn to download them")
 print(f"WROTE SQLite DB: {mp} + {wp}  (+ {OUT}/Media)")
 print(f"  jids={len(_jid_id)} chats={len(_chat_id)} messages={mid} mentions={ment_id} reactions={rx} receipts={rc} polls={pl}/votes={pv} media_decrypted_to_disk={decrypted}")
 A.crypto("decrypt", algorithm="AES-CBC-128", scheme="1 (final)", key=MSGKEY,
@@ -521,10 +527,16 @@ print(f'  chats       : {len(_cset)}   ({len(_cset)-_grp} direct, {_grp} groups)
 print(f'  contacts    : {len(contacts):,}   ·   groups: {len(groups):,}   ·   chats(saved): {len(chats):,}')
 print(f'  media msgs  : {_media:,}   ·   reactions: {rx:,}   ·   calls: {len(call_objs):,}')
 print('─────────────────────────────────')
-if _is_chromium:
-    print("  [i] Chromium: on-disk cached-media decryption is skipped (Firefox-only), but media keys + "
-          "metadata are in message_media — recover media with `mediarecover.py`/re-download, or export from Firefox.")
-elif _sn is None:
-    print("  [!] cramjam not installed — framed cached-media (.final) blobs were NOT decompressed; media_decrypted_to_disk may undercount. pip install cramjam")
+print(f"  media       : {decrypted:,} file(s) from {blobs:,} cached blob(s)"
+      + (f"; {len(byench):,} distinct media object(s) have keys" if byench else ""))
+if byench and decrypted < len(byench):
+    print("  [i] the rest were never cached by the browser (or the cache has since been evicted). Their "
+          "mediaKeys ARE in message_media — fetch them with:")
+    print(f"      python3 scripts/mediafetch.py --db {mp} --profile <profile> --cdn")
+    print("      NOTE a directPath expires in days, so the CDN only serves recent media; older media "
+          "needs a re-upload request (tools/reconnect/diag_media_retry.js).")
+if _sn is None:
+    print("  [!] cramjam not installed — Firefox's framed CacheStorage blobs cannot be decompressed, so "
+          "media may undercount on Firefox profiles. pip install cramjam")
 print(f"  Standard Android WhatsApp schema — open with any SQLite viewer, or ingest with a suite like WAInsight"
       f" (run_ingest.py --db-path {OUT} --extra-db wa.db={OUT}/wa.db --media-path {OUT}/Media).")
