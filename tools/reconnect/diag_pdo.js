@@ -92,8 +92,13 @@ const answered = new Set();
     const at = node.attrs || {};
     if (at.category === 'peer') {
       peerIds.add(at.id);
-      if (at.offline && at.offline !== '0') queued++; else live++;
-      console.error(`[pdo] <- peer stanza ${at.offline && at.offline !== '0' ? 'QUEUED(replay)' : 'LIVE'} offline=${at.offline || '-'} id=${String(at.id).slice(0, 4)}...`);
+      // A connect-time burst frequently carries NO `offline` attribute, so absence does not mean
+      // live -- treating it as live made a pure backlog look like the phone answering us. What
+      // actually distinguishes an answer is arriving AFTER we asked something.
+      const after = sent.size > 0;
+      if (after) live++; else queued++;
+      console.error(`[pdo] <- peer stanza ${after ? 'AFTER-REQUEST (a real candidate reply)' : 'pre-request (backlog)'}`
+        + ` offline=${at.offline || '-'} id=${String(at.id).slice(0, 4)}...`);
     }
   });
 
@@ -200,7 +205,7 @@ const answered = new Set();
     setTimeout(() => {
       console.error('[pdo] ==== RESULT ====');
       for (const [id, v] of sent) console.error(`   ${answered.has(id) ? 'ANSWERED' : 'silent  '}  ${v.variant}  ${redact(v.chat)}`);
-      console.error(`[pdo] peer stanzas seen: ${live} LIVE, ${queued} queued replay | acked ${acked} | upserts delivered ${upserts} | ev.isBuffering=${sock.ev.isBuffering && sock.ev.isBuffering()}`);
+      console.error(`[pdo] peer stanzas: ${live} after our requests, ${queued} before them (backlog) | acked ${acked} | upserts delivered ${upserts} | ev.isBuffering=${sock.ev.isBuffering && sock.ev.isBuffering()}`);
       process.exit(0);
     }, WAIT);
   });

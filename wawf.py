@@ -700,6 +700,11 @@ def cmd_history(a):
                 "to the output — treat it as key material). The browser's stored session for this linked "
                 "device therefore goes stale; WhatsApp Web re-establishes it by itself the next time you "
                 "open it. Nothing on the phone or in the profile is modified.")
+    log.warning("KEEP signal_runtime.json (and its .bak) WITH THE CASE — it is NOT a cache. It holds the "
+                "only copy of the prekeys this tool published to WhatsApp's servers, which peers then "
+                "encrypt to, and of ratchet state the phone has already moved past. Delete it and "
+                "anything encrypted to those keys is permanently unreadable, even from the same profile. "
+                "Every run also advances that shared state, so run deliberately, not repeatedly.")
     env = dict(os.environ, TOP="100000", COUNT="50", MAXPAGES="100000")   # every chat, page until exhausted
     anchors_path = os.path.join(work, "anchors.json")
     pass_out = os.path.join(work, "history_recovered.json")   # human-facing final output (full accumulated set)

@@ -94,9 +94,22 @@ function open({ signalState, creds, statePath, bufferJSON }) {
 
   let mem = {};                       // "<type>-<id>" -> value ; shadows the recovered state
   let carried = 0, reason = 'no previous state';
-  if (statePath && fs.existsSync(statePath)) {
+  // This file is NOT a cache. It holds the only copy of every key this tool has minted -- prekeys we
+  // published to the server that peers are now encrypting to, and ratchet state the phone has
+  // already moved past. Lose it and those payloads become permanently unreadable: observed directly,
+  // moving it aside produced "Invalid PreKey ID" on 8 inbound PreKeyWhisperMessages that decrypted
+  // again the moment it was restored. So keep a rolling backup and fall back to it.
+  const bakPath = statePath ? statePath + '.bak' : null;
+  let readFrom = null;
+  if (statePath && fs.existsSync(statePath)) readFrom = statePath;
+  else if (bakPath && fs.existsSync(bakPath)) {
+    readFrom = bakPath;
+    console.error('[!] ' + statePath + ' is missing; falling back to the .bak copy. That file is KEY '
+      + 'MATERIAL, not a cache -- losing both makes anything encrypted to its keys unrecoverable.');
+  }
+  if (readFrom) {
     try {
-      const saved = JSON.parse(fs.readFileSync(statePath, 'utf8'), bufferJSON && bufferJSON.reviver);
+      const saved = JSON.parse(fs.readFileSync(readFrom, 'utf8'), bufferJSON && bufferJSON.reviver);
       const sameDevice = saved.registrationId === creds.registrationId
         && saved.meId === (creds.me && creds.me.id);
       if (saved.version !== RUNTIME_VERSION) reason = `state file version ${saved.version} != ${RUNTIME_VERSION}`;
@@ -115,7 +128,7 @@ function open({ signalState, creds, statePath, bufferJSON }) {
     if (reason !== 'loaded') console.error(`[!] runtime state ignored: ${reason} -- starting from the profile copy`);
   }
 
-  let timer = null, dirty = false;
+  let timer = null, dirty = false, rotated = false;
   function flush() {
     if (!statePath || !dirty) return;
     dirty = false;
@@ -125,6 +138,10 @@ function open({ signalState, creds, statePath, bufferJSON }) {
       bufferJSON && bufferJSON.replacer);
     const tmp = statePath + '.tmp';
     try {
+      if (!rotated) {                       // keep the state this run STARTED from, once per run
+        rotated = true;
+        try { if (fs.existsSync(statePath)) fs.copyFileSync(statePath, bakPath); } catch (e) {}
+      }
       fs.writeFileSync(tmp, body);
       fs.renameSync(tmp, statePath);        // atomic: a crash mid-write cannot truncate the state
     } catch (e) {

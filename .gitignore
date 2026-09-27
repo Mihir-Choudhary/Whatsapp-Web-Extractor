@@ -20,6 +20,7 @@ companion_enc_static.txt
 signal_state.json
 signal_runtime.json
 signal_runtime.json.tmp
+signal_runtime.json.bak
 anchors.json
 notifs.json
 history_*.json
