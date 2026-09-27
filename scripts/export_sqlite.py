@@ -533,8 +533,10 @@ if byench and decrypted < len(byench):
     print("  [i] the rest were never cached by the browser (or the cache has since been evicted). Their "
           "mediaKeys ARE in message_media — fetch them with:")
     print(f"      python3 scripts/mediafetch.py --db {mp} --profile <profile> --cdn")
-    print("      NOTE a directPath expires in days, so the CDN only serves recent media; older media "
-          "needs a re-upload request (tools/reconnect/diag_media_retry.js).")
+    print("      NOTE each media url carries a SIGNATURE with its own expiry (the oe= parameter). While "
+          "it is valid the CDN serves the object — about a month on a typical profile; once it lapses "
+          "every request is 403 and only a re-upload request can refresh it "
+          "(tools/reconnect/diag_media_retry.js).")
 if _sn is None:
     print("  [!] cramjam not installed — Firefox's framed CacheStorage blobs cannot be decompressed, so "
           "media may undercount on Firefox profiles. pip install cramjam")
