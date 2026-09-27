@@ -45,9 +45,16 @@ INFO_BY_TYPE = {"image": b"WhatsApp Image Keys", "sticker": b"WhatsApp Image Key
                 "audio": b"WhatsApp Audio Keys", "ptt": b"WhatsApp Audio Keys",
                 "document": b"WhatsApp Document Keys"}
 EXT = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif",
-       "video/mp4": "mp4", "video/3gpp": "3gp", "video/quicktime": "mov",
+       "video/mp4": "mp4", "video/3gpp": "3gp", "video/quicktime": "mov", "video/webm": "webm",
        "audio/ogg": "ogg", "audio/mpeg": "mp3", "audio/mp4": "m4a", "audio/aac": "aac",
-       "audio/amr": "amr", "application/pdf": "pdf", "text/plain": "txt", "application/zip": "zip"}
+       "audio/amr": "amr", "audio/wav": "wav",
+       "application/pdf": "pdf", "text/plain": "txt", "application/zip": "zip",
+       "text/markdown": "md", "text/html": "html", "text/csv": "csv", "application/json": "json",
+       "application/vnd.android.package-archive": "apk",
+       "application/msword": "doc", "application/vnd.ms-excel": "xls",
+       "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+       "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx"}
 
 def info_for(mime_or_type) -> bytes:
     s = (mime_or_type or "").lower()
@@ -59,10 +66,17 @@ def info_for(mime_or_type) -> bytes:
     return INFO_DEFAULT
 
 def ext_for(mime: str) -> str:
+    """A file extension a viewer will dispatch on. The fallback is sanitised: a subtype like
+    `vnd.android.package-archive` must not become a filename with dots in it, because then the real
+    extension is whatever follows the last one."""
     m = (mime or "").lower()
     if m in EXT: return EXT[m]
     base = m.split(";")[0].strip()
-    return EXT.get(base) or (base.split("/")[-1][:8] if "/" in base else "bin")
+    if base in EXT: return EXT[base]
+    sub = base.split("/")[-1] if "/" in base else ""
+    sub = sub.rsplit(".", 1)[-1]                      # vnd.android.package-archive -> package-archive
+    sub = "".join(ch for ch in sub if ch.isalnum())[:8]
+    return sub or "bin"
 
 def decrypt_media(ciphertext: bytes, media_key: bytes, mime_or_type) -> bytes | None:
     """AES-256-CBC body with a 10-byte truncated HMAC appended. None if it cannot be opened."""
