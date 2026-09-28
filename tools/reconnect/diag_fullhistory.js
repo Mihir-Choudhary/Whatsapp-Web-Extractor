@@ -22,6 +22,8 @@
 //   node diag_fullhistory.js      [DAYS=3650] [WAIT=180]
 'use strict';
 const B = require('@whiskeysockets/baileys'); const makeWASocket = B.default;
+const { patched } = require('./proto_patch').patch(B);
+console.error('[fh] proto patched:', patched.join(', ') || '(nothing)');
 const fs = require('fs'), path = require('path');
 
 const findFile = n => { for (const c of [path.resolve(process.cwd(), n), path.join(__dirname, n)]) if (fs.existsSync(c)) return c; return null; };
@@ -121,6 +123,12 @@ let notifs = 0, setEvents = 0, msgs = 0;
     const req = {
       fullHistorySyncOnDemandRequest: {
         requestMetadata: { requestId: 'wawf-' + Date.now() },
+        // field 3 -- says WHICH history to fetch. The first attempt omitted it entirely, so the
+        // request carried no window at all.
+        fullHistorySyncOnDemandConfig: {
+          historyFromTimestamp: 0,
+          historyDurationDays: DAYS,
+        },
         historySyncConfig: {
           fullSyncDaysLimit: DAYS,
           fullSyncSizeMbLimit: 2048,

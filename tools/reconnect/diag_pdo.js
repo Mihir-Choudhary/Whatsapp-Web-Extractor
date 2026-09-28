@@ -18,6 +18,10 @@
 //   node diag_pdo.js            [CHATS=3]  [WAIT=150]
 'use strict';
 const B = require('@whiskeysockets/baileys'); const makeWASocket = B.default;
+// Baileys' proto is behind the live client; add the fields WA Web actually sends, with the field
+// numbers taken from WA Web's own internalSpec rather than guessed.
+const { patched } = require('./proto_patch').patch(B);
+console.error('[pdo] proto patched:', patched.join(', ') || '(nothing)');
 const fs = require('fs'), path = require('path');
 
 const findFile = n => { for (const c of [path.resolve(process.cwd(), n), path.join(__dirname, n)]) if (fs.existsSync(c)) return c; return null; };
@@ -219,6 +223,10 @@ const answered = new Set();
       await ask('B-pn-accountLid', 'pn',  a, r => { if (accountLid) r.accountLid = accountLid; });
       await ask('C-LID-route',     'lid', a, () => {});
       await ask('D-LID+accountLid','lid', a, r => { if (accountLid) r.accountLid = accountLid; });
+      // field 7, BOOL -- the real client always sets this; we never have
+      await ask('F-LID+inlineResp','lid', a, r => { r.supportInlineResponse = true; });
+      await ask('G-LID+lid+inline','lid', a, r => { if (accountLid) r.accountLid = accountLid;
+                                                    r.supportInlineResponse = true; });
     }
     // and one group, to see whether chat type is what decides it
     const g = A.anchors.find(a => String(a.chat).endsWith('@g.us'));
