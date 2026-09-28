@@ -18,6 +18,7 @@ __pycache__/
 creds_in.json
 companion_enc_static.txt
 signal_state.json
+appstate_keys.json
 signal_runtime.json
 signal_runtime.json.tmp
 signal_runtime.json.bak

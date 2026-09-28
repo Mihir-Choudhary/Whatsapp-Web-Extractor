@@ -76,8 +76,16 @@ const IDENTITY_FIELDS = new Set([
  *   statePath    where the runtime overlay lives; omit to run without persistence
  *   bufferJSON   Baileys' BufferJSON { replacer, reviver } (Buffers do not survive plain JSON)
  */
-function open({ signalState, creds, statePath, bufferJSON }) {
+function open({ signalState, creds, statePath, bufferJSON, appStateKeys }) {
   const S = signalState || {};
+  // App-state sync keys, recovered by scripts/export_appstate_keys.py. Without these Baileys cannot
+  // resyncAppState, which is the SyncD handshake a live WhatsApp Web session performs on EVERY
+  // connect. Skipping it is why on-demand history only worked while the browser's own sync was
+  // still fresh: the primary stopped treating this companion as in sync, and stopped serving.
+  const appKeys = {};
+  for (const [kid, v] of Object.entries(appStateKeys || {})) {
+    appKeys[kid] = { keyData: bb(v.keyData), fingerprint: v.fingerprint, timestamp: v.timestamp };
+  }
   const preKeys = S.preKeys || {};
   const sessions = S.sessions || {};
   const senderKeys = decodeSenderKeys(S.senderKeys);
@@ -172,6 +180,9 @@ function open({ signalState, creds, statePath, bufferJSON }) {
         } else if (t === 'sender-key') {
           const s = senderKeys[id];
           if (s) d[id] = s;
+        } else if (t === 'app-state-sync-key') {
+          const k = appKeys[id];
+          if (k) d[id] = k;
         }
       }
       return d;
@@ -188,6 +199,7 @@ function open({ signalState, creds, statePath, bufferJSON }) {
       sessions: Object.keys(sessions).length,
       senderKeys: Object.keys(senderKeys).length,
       preKeys: Object.keys(preKeys).length,
+      appStateKeys: Object.keys(appKeys).length,
       carried,                                 // key records restored from the previous run
       state: reason,
     },

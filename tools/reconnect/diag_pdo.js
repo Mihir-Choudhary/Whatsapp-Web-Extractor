@@ -50,7 +50,9 @@ creds.account = { details: bb(inp.account.details), accountSignatureKey: bb(inp.
 creds.registered = true; creds.platform = 'web';
 
 const signalStore = require('./signal_store');
-const rt = signalStore.open({ signalState: S, creds,
+const askPath = findFile('appstate_keys.json');
+const appStateKeys = askPath ? JSON.parse(fs.readFileSync(askPath, 'utf8')) : {};
+const rt = signalStore.open({ signalState: S, creds, appStateKeys,
   statePath: signalStore.defaultStatePath(path.dirname(findFile('signal_state.json'))), bufferJSON: B.BufferJSON });
 
 // request id -> {variant, chat} ; filled as we send, ticked off as replies arrive
@@ -61,7 +63,7 @@ const answered = new Set();
   let version = [2, 3000, 1023223821];
   try { version = (await B.fetchLatestBaileysVersion()).version; } catch (e) {}
   const accountLid = inp.lid ? B.jidNormalizedUser(inp.lid) : undefined;
-  console.error(`[pdo] WA ${version.join('.')} | accountLid = ${redact(accountLid)} | sessions ${rt.stats.sessions}, carried ${rt.stats.carried}`);
+  console.error(`[pdo] WA ${version.join('.')} | accountLid = ${redact(accountLid)} | sessions ${rt.stats.sessions}, carried ${rt.stats.carried}, appStateKeys ${rt.stats.appStateKeys}`);
 
   // A PDO response is one-shot: across every run tonight the phone has never re-encrypted one on
   // retry (0 of ~100). But Baileys only sends the delivery receipt when a message DECRYPTS -- on
@@ -187,6 +189,21 @@ const answered = new Set();
     if (pump.unref) pump.unref();
     await new Promise(r => setTimeout(r, 10000));
     try { await sock.assertSessions([...new Set([inp.lid, inp.me_id].filter(Boolean).map(B.jidNormalizedUser))], true); } catch (e) {}
+
+    // THE experiment: do what a live WhatsApp Web session does on every connect. Without the
+    // app-state keys this was impossible, so we never refreshed the primary's view of this
+    // companion and it stopped serving on-demand history once the browser's sync went stale.
+    if (Object.keys(appStateKeys).length) {
+      const t0 = Date.now();
+      try {
+        await sock.resyncAppState(B.ALL_WA_PATCH_NAMES, true);
+        console.error(`[pdo] resyncAppState COMPLETED in ${Date.now() - t0} ms using ${Object.keys(appStateKeys).length} app-state key(s)`);
+      } catch (e) {
+        console.error('[pdo] resyncAppState FAILED after', Date.now() - t0, 'ms:', e && e.message);
+      }
+    } else {
+      console.error('[pdo] no appstate_keys.json -- skipping resyncAppState (the old behaviour)');
+    }
 
     // one-to-one chats only: the browser click that is known to work was a 1:1 conversation, and a
     // group may well be served by a different (or no) path
