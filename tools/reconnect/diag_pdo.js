@@ -32,11 +32,16 @@ const mk = lvl => ({ level: lvl, child: () => mk(lvl),
   trace: () => {}, debug: (...a) => log('DEBUG', a), info: (...a) => log('INFO', a),
   warn: (...a) => log('WARN', a), error: (...a) => log('ERROR', a), fatal: (...a) => log('FATAL', a) });
 const KEEP = /pdo|peer|history|sync|notification|fail|error|retry|decrypt/i;
+// RAW=1 keeps EVERY log line. The filter is convenient but it hid the lines that matter when the
+// question is "did our request actually go out with a payload" -- e.g. Baileys' own
+// "sending message to N devices", and the server's acks. A peer stanza built with 0 participants
+// carries no enc node at all and the server drops it without a word.
+const RAW = process.env.RAW === '1';
 function log(lvl, args) {
   const rep = (k, v) => (v instanceof Error ? { name: v.name, message: v.message } : v);
   let s = args.map(a => { try { return typeof a === 'string' ? a : JSON.stringify(a, rep); } catch (e) { return String(a); } }).join(' ');
-  if (s.length > 600) s = s.slice(0, 600) + '...';
-  if (lvl === 'ERROR' || lvl === 'WARN' || KEEP.test(s)) console.error(`[${lvl}] ${redact(s)}`);
+  if (s.length > (RAW ? 2000 : 600)) s = s.slice(0, RAW ? 2000 : 600) + '...';
+  if (RAW || lvl === 'ERROR' || lvl === 'WARN' || KEEP.test(s)) console.error(`[${lvl}] ${redact(s)}`);
 }
 
 const bb = b => Buffer.from(b, 'base64');
