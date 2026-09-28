@@ -4,6 +4,11 @@
 // in-process. Merges with the on-disk id set and writes recovered (not-on-disk) messages.
 // Own account only. Env: TOP (chats, default 5), COUNT (per page, 50), MAXPAGES (per chat, 10).
 const B = require('@whiskeysockets/baileys'); const makeWASocket = B.default;
+// Baileys' generated proto is behind the live client. proto_patch adds the fields WA Web actually
+// sends, with the field numbers read from WA Web's own internalSpec (not guessed).
+try{ const {patched}=require('./proto_patch').patch(B);
+     if(patched.length) console.error('[i] proto patched:', patched.join(', ')); }
+catch(e){ console.error('[!] proto patch skipped:', e&&e.message); }
 const fs = require('fs'), path = require('path'), crypto = require('crypto'), https = require('https'), zlib = require('zlib');
 let P=null; try{P=require('pino');}catch(e){}
 const TOP=+(process.env.TOP||5), COUNT=+(process.env.COUNT||50), MAXPAGES=+(process.env.MAXPAGES||10);
@@ -57,7 +62,9 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   // learned on earlier runs. Without these every inbound payload fails to decrypt (SessionError)
   // and is dropped, including the phone's history reply.
   const signalStore=require('./signal_store');
-  const rt=signalStore.open({signalState:S,creds,
+  const _askPath=findFile('appstate_keys.json');
+  const appStateKeys=_askPath?JSON.parse(fs.readFileSync(_askPath,'utf8')):{};
+  const rt=signalStore.open({signalState:S,creds,appStateKeys,
     statePath:signalStore.defaultStatePath(path.dirname(mustFind('signal_state.json'))),
     bufferJSON:B.BufferJSON});
   const store=rt.keys;
@@ -177,6 +184,7 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     const req={chatJid:key.remoteJid, oldestMsgId:key.id, oldestMsgFromMe:!!key.fromMe,
       oldestMsgTimestampMs:tsMs, onDemandMsgCount:count};
     if(selfLid) req.accountLid=selfLid;
+    req.supportInlineResponse=true;        // field 7; the real client always sets it
     const pdo={historySyncOnDemandRequest:req, peerDataOperationRequestType:B.proto.Message.PeerDataOperationRequestType.HISTORY_SYNC_ON_DEMAND};
     if(!selfLid) return sock.sendPeerDataOperationMessage(pdo);        // no LID known: old behaviour
     return sock.relayMessage(selfLid, {protocolMessage:{peerDataOperationRequestMessage:pdo, type:PDO_TYPE}},
@@ -236,6 +244,11 @@ function histNotif(message){ // dig through device/ephemeral wrappers
         const selfJids=[...new Set([inp.lid,inp.me_id].filter(Boolean).map(B.jidNormalizedUser))];
         await sock.assertSessions(selfJids,true);
         console.error('[i] rebuilt the Signal session with our own device(s) before requesting history');
+        if(Object.keys(appStateKeys).length){
+          try{ await sock.resyncAppState(B.ALL_WA_PATCH_NAMES,true);
+               console.error(`[i] resyncAppState done (${Object.keys(appStateKeys).length} app-state key(s)) — what a live WhatsApp Web session does on every connect`); }
+          catch(e){ console.error('[!] resyncAppState failed:', e&&e.message); }
+        }
       }catch(e){ console.error('[!] could not rebuild the self session:', e&&e.message, '-- replies may not decrypt'); }
       for(const a of targets){
         let key={remoteJid:a.chat,id:a.oldest_id,fromMe:!!a.oldest_fromMe}, ts=a.oldest_ts, got=0;

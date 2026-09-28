@@ -136,7 +136,7 @@ function open({ signalState, creds, statePath, bufferJSON, appStateKeys }) {
     if (reason !== 'loaded') console.error(`[!] runtime state ignored: ${reason} -- starting from the profile copy`);
   }
 
-  let timer = null, dirty = false, rotated = false;
+  let timer = null, dirty = false, rotated = false, warnedReHandshake = false;
   function flush() {
     if (!statePath || !dirty) return;
     dirty = false;
@@ -165,18 +165,57 @@ function open({ signalState, creds, statePath, bufferJSON, appStateKeys }) {
   }
   if (statePath) process.on('exit', flush);
 
+  // Our overlay is normally NEWER than the profile: we advance the ratchet as we run, so it must
+  // win. But it must NOT win when WhatsApp Web has since re-handshaked the session -- a new
+  // `aliceBaseKey` the overlay has never seen means the profile is ahead of us, and serving our
+  // stale copy makes the phone unreadable and unreachable. Observed exactly that: after WA Web
+  // rebuilt the session with the primary (new rootKey, new aliceBaseKey, 40 sessions archived,
+  // 29 of our prekeys consumed), history only worked once the overlay was taken out of the way.
+  // So merge both records and decide which entry stays OPEN by whether the profile has one we do
+  // not know about. Closed entries are kept either way, so older ratchets still decrypt.
+  function mergeSession(fromProfile, fromOverlay) {
+    if (!fromProfile) return fromOverlay;
+    if (!fromOverlay) return fromProfile;
+    const pe = fromProfile._sessions || {}, oe = fromOverlay._sessions || {};
+    const profileHasNewHandshake = Object.entries(pe)
+      .some(([bk, e]) => e && e.indexInfo && e.indexInfo.closed === -1 && !(bk in oe));
+    const merged = {};
+    const close = (e) => {
+      if (!e || !e.indexInfo || e.indexInfo.closed !== -1) return e;
+      return { ...e, indexInfo: { ...e.indexInfo, closed: Date.now() - 1000 } };
+    };
+    if (profileHasNewHandshake) {
+      for (const [bk, e] of Object.entries(oe)) merged[bk] = close(e);   // ours becomes history
+      for (const [bk, e] of Object.entries(pe)) merged[bk] = e;          // the profile's is current
+    } else {
+      for (const [bk, e] of Object.entries(pe)) merged[bk] = close(e);
+      for (const [bk, e] of Object.entries(oe)) merged[bk] = e;
+    }
+    if (profileHasNewHandshake && !warnedReHandshake) {
+      warnedReHandshake = true;
+      console.error('[i] the browser profile carries a NEWER Signal session than our saved state '
+        + '(WhatsApp Web re-handshaked since our last run): using the profile copy, keeping ours as closed');
+    }
+    return { _sessions: merged, version: fromProfile.version || fromOverlay.version || 'v1' };
+  }
+
   const keys = {
     get: (t, ids) => {
       const d = {};
       for (const id of ids) {
         const k = mem[`${t}-${id}`];
-        if (k !== undefined) { if (k !== null) d[id] = k; continue; }
+        if (k !== undefined) {
+          if (k === null) continue;
+          // sessions are merged with the profile rather than blindly preferred
+          d[id] = (t === 'session') ? mergeSession(sessions[id], k) : k;
+          continue;
+        }
         if (t === 'pre-key') {
           const p = preKeys[String(id)];
           if (p) d[id] = { private: bb(p.private), public: bb(p.public) };
         } else if (t === 'session') {
-          const s = sessions[id];
-          if (s) d[id] = s;                  // deserialize() copies into Buffers; not mutated
+          const s = mergeSession(sessions[id], undefined);
+          if (s) d[id] = s;
         } else if (t === 'sender-key') {
           const s = senderKeys[id];
           if (s) d[id] = s;
