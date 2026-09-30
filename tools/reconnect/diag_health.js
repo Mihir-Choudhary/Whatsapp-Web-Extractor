@@ -1,0 +1,140 @@
+// diag_health.js -- is this linked device ACTUALLY able to fetch history, right now?
+//
+// Written because the debugging loop was costing a day per iteration: run a 4-hour history job,
+// get silence, guess at a cause, wait 24h, repeat. This answers the same question in ~60 seconds
+// and distinguishes the cases that were previously indistinguishable.
+//
+// Three checks, in order, because each one makes the next interpretable:
+//
+//   1. CONNECT. Baileys reports `open` purely on the Noise/transport handshake succeeding. A
+//      REVOKED companion still gets `open` -- that is precisely why device :43 looked healthy for
+//      two days while the phone ignored everything it said. So "connected" proves nothing on its own.
+//
+//   2. REGISTERED? Ask the server, via a USync device query against our own account, for the list
+//      of device slots on this account. If our own slot is absent, the registration is gone and
+//      NOTHING will work until the browser re-pairs. This is the check the tool never had, and it is
+//      definitive rather than inferential.
+//
+//   3. SERVED? Send exactly ONE on-demand history request and wait. Registered but unanswered is a
+//      different fault from unregistered, and needs a different response.
+//
+// Deliberately tiny footprint: one connection, one USync, one PDO, no retries, no renegotiation, no
+// pagination. Safe to run repeatedly -- which is the point, since mapping how a device decays needs
+// frequent cheap samples, not another four-hour job.
+//
+//   node diag_health.js        [WAIT=45]
+'use strict';
+const B = require('@whiskeysockets/baileys'); const makeWASocket = B.default;
+const fs = require('fs'), path = require('path');
+
+const findFile = n => { for (const c of [path.resolve(process.cwd(), n), path.join(__dirname, n)]) if (fs.existsSync(c)) return c; return null; };
+const need = n => { const p = findFile(n); if (!p) { console.error('[health] missing ' + n); process.exit(4); } return p; };
+const inp = JSON.parse(fs.readFileSync(need('creds_in.json')));
+const S   = JSON.parse(fs.readFileSync(need('signal_state.json')));
+const A   = JSON.parse(fs.readFileSync(need('anchors.json')));
+const WAIT = Number(process.env.WAIT || 45) * 1000;
+
+const redact = s => String(s).replace(/\d{5,}/g, m => m.slice(0, 4) + '*'.repeat(m.length - 4));
+const bb = b => Buffer.from(b, 'base64');
+const quiet = { level: 'silent', child: () => quiet, trace(){}, debug(){}, info(){}, warn(){}, error(){}, fatal(){} };
+
+const creds = B.initAuthCreds();
+creds.noiseKey = { private: bb(inp.noise_priv), public: bb(inp.noise_pub) };
+creds.signedIdentityKey = { private: bb(S.signedIdentityKey.private), public: bb(S.signedIdentityKey.public) };
+creds.registrationId = S.registrationId;
+creds.signedPreKey = { keyId: S.signedPreKey.keyId, keyPair: { private: bb(S.signedPreKey.private), public: bb(S.signedPreKey.public) }, signature: S.signedPreKey.signature ? bb(S.signedPreKey.signature) : Buffer.alloc(0) };
+creds.me = { id: inp.me_id, lid: inp.lid };
+creds.account = { details: bb(inp.account.details), accountSignatureKey: bb(inp.account.accountSignatureKey), accountSignature: bb(inp.account.accountSignature), deviceSignature: bb(inp.account.deviceSignature) };
+creds.registered = true; creds.platform = 'web';
+
+const signalStore = require('./signal_store');
+const askPath = findFile('appstate_keys.json');
+const rt = signalStore.open({ signalState: S, creds,
+  appStateKeys: askPath ? JSON.parse(fs.readFileSync(askPath, 'utf8')) : {},
+  statePath: signalStore.defaultStatePath(path.dirname(need('signal_state.json'))), bufferJSON: B.BufferJSON });
+
+const ourDevice = (() => {                       // ":44" out of "1234:44@s.whatsapp.net"
+  const u = String(inp.me_id || '').split('@')[0];
+  return u.includes(':') ? Number(u.split(':')[1]) : 0;
+})();
+
+let answered = false, verdict = 'UNKNOWN';
+(async () => {
+  let version = [2, 3000, 1023223821];
+  try { version = (await B.fetchLatestBaileysVersion()).version; } catch (e) {}
+  console.error(`[health] device slot :${ourDevice}  registrationId ${creds.registrationId}  WA ${version.join('.')}`);
+
+  const sock = makeWASocket({ version, auth: { creds, keys: rt.keys }, logger: quiet,
+    printQRInTerminal: false, markOnlineOnConnect: true, syncFullHistory: false,
+    shouldSyncHistoryMessage: () => false, getMessage: async () => undefined,
+    browser: ['Forensic', 'Recovery', '1.0'] });
+
+  sock.ev.on('messages.upsert', u => { for (const m of (u.messages || [])) {
+    let x = m.message;
+    for (let i = 0; i < 4 && x; i++) {
+      if (x.protocolMessage && x.protocolMessage.historySyncNotification) { answered = true; return; }
+      x = x.deviceSentMessage?.message || x.ephemeralMessage?.message || x.viewOnceMessage?.message;
+    }
+  } });
+  sock.ev.on('messaging-history.set', d => { if ((d && d.messages || []).length) answered = true; });
+
+  sock.ev.on('connection.update', async u => {
+    if (u.qr) { console.error('[health] 1. CONNECT   FAIL — server asked for a QR: these credentials are no longer accepted'); process.exit(2); }
+    if (u.connection === 'close') {
+      const e = u.lastDisconnect && u.lastDisconnect.error;
+      const code = e && e.output && e.output.statusCode;
+      console.error(`[health] 1. CONNECT   FAIL — closed (${code}) ${e && e.message}`);
+      if (code === 401 || code === 403) console.error('           that status means this device is LOGGED OUT server-side.');
+      process.exit(3);
+    }
+    if (u.connection !== 'open') return;
+    console.error('[health] 1. CONNECT   ok — but note this only proves the Noise handshake; a REVOKED device also reaches "open"');
+
+    // --- 2. is this device still registered on the account? -------------------------------------
+    let registered = null, slots = [];
+    try {
+      const q = new B.USyncQuery().withDeviceProtocol();
+      q.withUser(new B.USyncUser().withId(B.jidNormalizedUser(inp.me_id)));
+      const res = await sock.executeUSyncQuery(q);
+      const list = (res && res.list) || [];
+      for (const u2 of list) for (const d of (u2.devices || [])) slots.push(d.id);
+      registered = slots.includes(ourDevice);
+      console.error(`[health] 2. REGISTERED ${registered ? 'ok' : 'FAIL'} — account device slots: [${slots.join(', ')}]`
+        + (registered ? `, ours (:${ourDevice}) present` : `, ours (:${ourDevice}) IS ABSENT`));
+    } catch (e) {
+      console.error('[health] 2. REGISTERED unknown — USync device query failed:', e && e.message);
+    }
+
+    if (registered === false) {
+      verdict = 'REVOKED';
+      console.error('\n[health] VERDICT: this linked device has been REVOKED. History cannot work and will not '
+        + 'work until WhatsApp Web is opened and re-paired. Nothing in the profile can restore it.');
+      process.exit(0);
+    }
+
+    // --- 3. will the phone actually serve us? ---------------------------------------------------
+    const a = (A.anchors || []).find(x => !String(x.chat).endsWith('@g.us')) || (A.anchors || [])[0];
+    if (!a) { console.error('[health] 3. SERVED    skipped — no anchors'); process.exit(0); }
+    const tsMs = a.oldest_ts > 1e12 ? a.oldest_ts : a.oldest_ts * 1000;
+    try {
+      const id = await sock.sendPeerDataOperationMessage({
+        historySyncOnDemandRequest: { chatJid: a.chat, oldestMsgId: a.oldest_id,
+          oldestMsgFromMe: !!a.oldest_fromMe, oldestMsgTimestampMs: tsMs, onDemandMsgCount: 10 },
+        peerDataOperationRequestType: B.proto.Message.PeerDataOperationRequestType.HISTORY_SYNC_ON_DEMAND });
+      console.error(`[health] 3. SERVED    asked ${redact(a.chat)} for 10 messages (req ${id}); waiting ${WAIT / 1000}s ...`);
+    } catch (e) { console.error('[health] 3. SERVED    FAIL — could not send:', e && e.message); process.exit(5); }
+
+    setTimeout(() => {
+      if (answered) {
+        verdict = 'HEALTHY';
+        console.error('\n[health] 3. SERVED    ok — the phone answered\n[health] VERDICT: HEALTHY. History will work.');
+      } else {
+        verdict = 'REGISTERED_BUT_SILENT';
+        console.error('\n[health] 3. SERVED    FAIL — no answer\n[health] VERDICT: the device is still REGISTERED but the '
+          + 'phone is not serving it. That is a different fault from revocation: the registration is intact, so '
+          + 'something else (session state, throttling, or the phone itself) is refusing.');
+      }
+      process.exit(0);
+    }, WAIT);
+  });
+})().catch(e => { console.error('[health] FATAL', e); process.exit(9); });
