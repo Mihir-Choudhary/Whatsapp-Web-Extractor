@@ -61,6 +61,25 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   // Signal sessions + sender keys recovered from the browser profile, plus whatever this tool
   // learned on earlier runs. Without these every inbound payload fails to decrypt (SessionError)
   // and is dropped, including the phone's history reply.
+  // If this tool has been paired as its OWN device (tools/reconnect/pair.js), use that instead of
+  // anything derived from the browser profile. That severs the dependency that caused every failure
+  // in this project: our own registration, our own Signal identity and prekeys, our own session to
+  // repair -- so history works however long it has been since WhatsApp Web last ran, and nothing we
+  // do can degrade the subject's linked device.
+  const DEVICE_DIR=path.join(__dirname,'wawf_device');
+  let ownDevice=null;
+  if(fs.existsSync(path.join(DEVICE_DIR,'creds.json'))){
+    try{
+      const st=await B.useMultiFileAuthState(DEVICE_DIR);
+      if(st.state&&st.state.creds&&st.state.creds.registered&&st.state.creds.me){ ownDevice=st; }
+    }catch(e){ console.error('[!] could not load the paired device state:', e&&e.message); }
+  }
+  if(ownDevice){
+    const red=x=>String(x||'').replace(/\d{5,}/g,m=>m.slice(0,4)+'*'.repeat(m.length-4));
+    console.error(`[i] using THIS TOOL'S OWN linked device (${red(ownDevice.state.creds.me.id)}) — `
+      +`independent of the browser profile`);
+  }
+
   const signalStore=require('./signal_store');
   const _askPath=findFile('appstate_keys.json');
   const appStateKeys=_askPath?JSON.parse(fs.readFileSync(_askPath,'utf8')):{};
@@ -92,7 +111,8 @@ function histNotif(message){ // dig through device/ephemeral wrappers
       // seed from the PERSISTED count so Baileys' maxMsgRetryCount caps across runs, not per-process
       return v===undefined ? Math.max(1, rt.retryCount(id)) : v; },
     set:(k,v)=>retryCounters.set(k,v), del:k=>retryCounters.delete(k) };
-  const sock=makeWASocket({version,auth:{creds,keys:store},logger:P?P({level:'silent'}):undefined,msgRetryCounterCache,
+  const authState = ownDevice ? ownDevice.state : {creds,keys:store};
+  const sock=makeWASocket({version,auth:authState,logger:P?P({level:'silent'}):undefined,msgRetryCounterCache,
     printQRInTerminal:false,markOnlineOnConnect:true,syncFullHistory:false,
     // CRITICAL: accept ON_DEMAND history only, and decline the INITIAL (RECENT/bootstrap) sync.
     // On connect Baileys calls ev.buffer() and holds every event. If this predicate says yes to the
@@ -126,7 +146,7 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     console.error(`  [${what}] unmatched reply (session ${sid}) and no outstanding request -- ignored`);
     return null;
   };
-  sock.ev.on('creds.update', ()=>rt.save());   // persist rotated prekeys / app-state ids
+  sock.ev.on('creds.update', ()=>{ if(ownDevice) ownDevice.saveCreds(); else rt.save(); });   // persist rotated prekeys / app-state ids
   // Note which stanzas are peer messages before Baileys' async decrypt reaches its retry decision.
   sock.ws.on('CB:message', node=>{ const at=node.attrs||{}; if(at.category==='peer') peerIds.add(at.id); });
   // Raising the retry floor above skips the placeholder-resend request Baileys makes on retry #1,
@@ -206,7 +226,8 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   // request on that same session, so the phone re-keys it and the answer is readable.
   // Measured, same chat and anchor in one run: PN-routed -> silent, LID-routed -> 50 messages.
   const PDO_TYPE=B.proto.Message.ProtocolMessage.Type.PEER_DATA_OPERATION_REQUEST_MESSAGE;
-  const selfLid=inp.lid?B.jidNormalizedUser(inp.lid):null;
+  const selfLid=(()=>{ const l=ownDevice?ownDevice.state.creds.me&&ownDevice.state.creds.me.lid:inp.lid;
+                       return l?B.jidNormalizedUser(l):null; })();
   const askHistory=(count,key,tsMs)=>{
     const req={chatJid:key.remoteJid, oldestMsgId:key.id, oldestMsgFromMe:!!key.fromMe,
       oldestMsgTimestampMs:tsMs, onDemandMsgCount:count};
@@ -268,7 +289,8 @@ function histNotif(message){ // dig through device/ephemeral wrappers
       // cannot read something we sent), and a renegotiation costs one of its one-time prekeys,
       // which is far cheaper than a whole pass that returns nothing because the reply was dropped.
       try{
-        const selfJids=[...new Set([inp.lid,inp.me_id].filter(Boolean).map(B.jidNormalizedUser))];
+        const _me = ownDevice ? ownDevice.state.creds.me : {id:inp.me_id,lid:inp.lid};
+        const selfJids=[...new Set([_me.lid,_me.id].filter(Boolean).map(B.jidNormalizedUser))];
         // force=false: only fetch a prekey bundle if we genuinely have no session. Forcing a fresh
         // handshake on EVERY connect (~56 times over three days) burns one of the peer's one-time
         // prekeys each time and makes us look like a client that cannot hold a session.
