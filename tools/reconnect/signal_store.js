@@ -101,6 +101,14 @@ function open({ signalState, creds, statePath, bufferJSON, appStateKeys }) {
   }
 
   let mem = {};                       // "<type>-<id>" -> value ; shadows the recovered state
+  // Per-message decrypt-retry counts, PERSISTED. Baileys keeps this in a per-process cache, so its
+  // maxMsgRetryCount cap never trips across runs: every run restarts the count and fires a fresh
+  // round of retry receipts at the primary for messages that can never decrypt (their message key
+  // was consumed on an earlier run and libsignal deletes it after use). Those messages are then
+  // never acknowledged either, because Baileys sends a retry INSTEAD of a delivery receipt, so they
+  // stay in the offline queue and are redelivered forever. Persisting the count makes the cap real
+  // and lets the caller give up and acknowledge, which is what drains the queue.
+  let retries = {};
   let carried = 0, reason = 'no previous state';
   // This file is NOT a cache. It holds the only copy of every key this tool has minted -- prekeys we
   // published to the server that peers are now encrypting to, and ratchet state the phone has
@@ -124,6 +132,7 @@ function open({ signalState, creds, statePath, bufferJSON, appStateKeys }) {
       else if (!sameDevice) reason = 'state file belongs to a different device (re-paired?)';
       else {
         mem = saved.keys || {};
+        retries = saved.retries || {};
         carried = Object.keys(mem).length;
         for (const [k, v] of Object.entries(saved.creds || {})) {
           if (!IDENTITY_FIELDS.has(k)) creds[k] = v;     // keep identity from the profile
@@ -142,7 +151,7 @@ function open({ signalState, creds, statePath, bufferJSON, appStateKeys }) {
     dirty = false;
     const body = JSON.stringify(
       { version: RUNTIME_VERSION, registrationId: creds.registrationId, meId: creds.me && creds.me.id,
-        savedUtc: new Date().toISOString(), creds, keys: mem },
+        savedUtc: new Date().toISOString(), creds, keys: mem, retries },
       bufferJSON && bufferJSON.replacer);
     const tmp = statePath + '.tmp';
     try {
@@ -232,13 +241,20 @@ function open({ signalState, creds, statePath, bufferJSON, appStateKeys }) {
     },
   };
 
+  // A message that has already been retried `max` times across ALL runs is not going to decrypt.
+  // bump() reports the running count so the caller can stop retrying and acknowledge it instead.
+  function bumpRetry(id) { const n = (retries[id] || 0) + 1; retries[id] = n; save(); return n; }
+  function retryCount(id) { return retries[id] || 0; }
+  function forgetRetry(id) { if (retries[id] !== undefined) { delete retries[id]; save(); } }
+
   return {
-    keys, creds, save, flush,
+    keys, creds, save, flush, bumpRetry, retryCount, forgetRetry,
     stats: {
       sessions: Object.keys(sessions).length,
       senderKeys: Object.keys(senderKeys).length,
       preKeys: Object.keys(preKeys).length,
       appStateKeys: Object.keys(appKeys).length,
+      retriesTracked: Object.keys(retries).length,
       carried,                                 // key records restored from the previous run
       state: reason,
     },

@@ -86,8 +86,11 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   // which makes Baileys skip the retry, and we acknowledge them instead.
   const peerIds=new Set();
   const retryCounters=new Map();
-  const msgRetryCounterCache={ get:k=>{ if(peerIds.has(String(k).split(':')[0])) return 1e6;
-      const v=retryCounters.get(k); return v===undefined?1:v; },
+  const msgRetryCounterCache={ get:k=>{ const id=String(k).split(':')[0];
+      if(peerIds.has(id)) return 1e6;                 // peer replies are one-shot: never retry
+      const v=retryCounters.get(k);
+      // seed from the PERSISTED count so Baileys' maxMsgRetryCount caps across runs, not per-process
+      return v===undefined ? Math.max(1, rt.retryCount(id)) : v; },
     set:(k,v)=>retryCounters.set(k,v), del:k=>retryCounters.delete(k) };
   const sock=makeWASocket({version,auth:{creds,keys:store},logger:P?P({level:'silent'}):undefined,msgRetryCounterCache,
     printQRInTerminal:false,markOnlineOnConnect:true,syncFullHistory:false,
@@ -131,10 +134,34 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   // sender our keys so it CAN re-encrypt; the placeholder request asks the phone to actually
   // resend the specific message it could not deliver readably. Peer messages get neither -- they
   // get acknowledged, because an unacked message stays in the offline queue forever.
+  // An undecryptable message must not be retried forever. Baileys sends a retry INSTEAD of a
+  // delivery receipt, so such a message is never acknowledged, stays in the offline queue, is
+  // redelivered on every connect and earns another retry -- observed: 53 stanzas producing 1,677
+  // decrypt attempts, 1,637 of them "Bad MAC" and 27 "Key used already or never filled". The latter
+  // are provably messages we ALREADY decrypted on an earlier run (libsignal deletes each message key
+  // after use), so they can never succeed no matter how often the primary resends them.
+  // After MAX_DECRYPT_ATTEMPTS across ALL runs we stop: no more retries, and no acknowledgement
+  // either. Record it as unrecoverable and move on.
+  const MAX_DECRYPT_ATTEMPTS=Number(process.env.MAX_DECRYPT_ATTEMPTS||3);
+  const unrecoverable=[]; const reportedUndecryptable=new Set();
   sock.ev.on('messages.upsert',u=>{ for(const m of (u.messages||[])){
     if(m.messageStubType!==B.proto.WebMessageInfo.StubType.CIPHERTEXT||!m.key) continue;
-    if(peerIds.has(m.key.id)) Promise.resolve(sock.sendReceipt(m.key.remoteJid,undefined,[m.key.id],'peer_msg')).catch(()=>{});
-    else Promise.resolve(sock.requestPlaceholderResend(m.key)).catch(()=>{}); } });
+    if(peerIds.has(m.key.id)){
+      Promise.resolve(sock.sendReceipt(m.key.remoteJid,undefined,[m.key.id],'peer_msg')).catch(()=>{});
+      continue;
+    }
+    const n=rt.bumpRetry(m.key.id);
+    if(n>MAX_DECRYPT_ATTEMPTS){
+      // Give up QUIETLY. Do not acknowledge it -- an ack says "received and processed", and saying
+      // that about a payload we could not read is a lie to the server. Do not keep retrying either:
+      // 974 retry receipts across runs is what a broken or hostile companion looks like, and device
+      // :43 was revoked after exactly that. Record it and move on.
+      if(!reportedUndecryptable.has(m.key.id)){ reportedUndecryptable.add(m.key.id);
+        unrecoverable.push({id:m.key.id,chat:m.key.remoteJid,attempts:n}); }
+    } else {
+      Promise.resolve(sock.requestPlaceholderResend(m.key)).catch(()=>{});
+    }
+  } });
   sock.ev.on('messages.upsert', async u=>{ for(const m of (u.messages||[])){
     const hn=histNotif(m.message); if(!hn) continue;
     const sid=hn.peerDataRequestSessionId; const r=resolveFor(sid,'upsert');
@@ -242,19 +269,29 @@ function histNotif(message){ // dig through device/ephemeral wrappers
       // which is far cheaper than a whole pass that returns nothing because the reply was dropped.
       try{
         const selfJids=[...new Set([inp.lid,inp.me_id].filter(Boolean).map(B.jidNormalizedUser))];
-        await sock.assertSessions(selfJids,true);
-        console.error('[i] rebuilt the Signal session with our own device(s) before requesting history');
+        // force=false: only fetch a prekey bundle if we genuinely have no session. Forcing a fresh
+        // handshake on EVERY connect (~56 times over three days) burns one of the peer's one-time
+        // prekeys each time and makes us look like a client that cannot hold a session.
+        const fetched=await sock.assertSessions(selfJids,false);
+        console.error(fetched?'[i] no session with our own device — negotiated one'
+                             :'[i] reusing the existing Signal session with our own device');
         if(Object.keys(appStateKeys).length){
           try{ await sock.resyncAppState(B.ALL_WA_PATCH_NAMES,true);
                console.error(`[i] resyncAppState done (${Object.keys(appStateKeys).length} app-state key(s)) — what a live WhatsApp Web session does on every connect`); }
           catch(e){ console.error('[!] resyncAppState failed:', e&&e.message); }
         }
       }catch(e){ console.error('[!] could not rebuild the self session:', e&&e.message, '-- replies may not decrypt'); }
+      // If the first few chats all go unanswered, the phone is not serving this device at all --
+      // most likely its companion registration is no longer valid. Say so in seconds rather than
+      // grinding through every chat at 45s a time and reporting a mystery hours later.
+      const PROBE=Number(process.env.PROBE_CHATS||4); let probeSilent=0, probed=0;
       for(const a of targets){
         let key={remoteJid:a.chat,id:a.oldest_id,fromMe:!!a.oldest_fromMe}, ts=a.oldest_ts, got=0;
         for(let pg=0; pg<MAXPAGES; pg++){
           const msgs=await requestPage(key, ts);
-          if(msgs===null){ console.error(`  ${a.chat.slice(0,22)} page${pg}: no response`); break; }
+          if(msgs===null){ console.error(`  ${a.chat.slice(0,22)} page${pg}: no response`);
+            if(pg===0){ probeSilent++; }
+            break; }
           if(!msgs.length){ console.error(`  ${a.chat.slice(0,22)} page${pg}: empty (start reached)`); break; }
           for(const m of msgs) all.set(m.id,m);
           got+=msgs.length; msgs.sort((x,y)=>x.ts-y.ts); const o=msgs[0];
@@ -265,6 +302,17 @@ function histNotif(message){ // dig through device/ephemeral wrappers
           if(msgs.length<COUNT) { console.error(`  ${a.chat.slice(0,22)}: short page -> done (${got} total)`); break; }
           await sleep(500);
         }
+        probed++;
+        if(probed>=PROBE && probeSilent>=PROBE){
+          console.error(`
+[!] the first ${PROBE} chats returned NOTHING. The phone is not serving this `
+            +`device: its companion registration is most likely no longer valid (WhatsApp revokes a `
+            +`linked device that looks broken). Open WhatsApp Web once and check it is still linked, `
+            +`re-link if not, then run again. Stopping rather than grinding through `
+            +`${targets.length} chats.`);
+          break;
+        }
+        await sleep(Number(process.env.CHAT_DELAY_MS||400));   // be a polite client between chats
       }
       console.error('[*] pagination complete'); finish(0);
     }
