@@ -461,20 +461,43 @@ def cmd_reconnect(a):
 
 def _deepen_anchors(anchors_path, master):
     """Re-anchor each chat on the OLDEST message recovered so far and add all recovered ids to the
-    on-disk set, so the next history pass continues further back instead of re-pulling the same window."""
+    on-disk set, so the next history pass continues further back instead of re-pulling the same window.
+
+    Anchors are UPDATED IN PLACE rather than rebuilt. An anchor carries more than a timestamp: `chat`
+    is the jid WhatsApp Web actually addresses (the historyChatId in its wire `@s.whatsapp.net` form,
+    which is NOT the chat id), `chat_id` is the local chat id, and `more_on_primary` records whether
+    the chat's endOfHistoryTransferType says the primary still holds older messages. Rebuilding an
+    anchor from a recovered message threw all three away: it replaced the wire-form `chat` with
+    whatever form the phone happened to return, so chats went back to being asked for by a jid the
+    reference client never sends; it dropped `more_on_primary`, so chats build_anchors had excluded as
+    unanswerable came back from pass 2 onward; and because the dict was keyed on that form, a chat
+    whose returned jid differed from its anchor's got a SECOND anchor appended instead of being
+    deepened -- re-requesting the window it had just finished.
+    """
     a = json.load(open(anchors_path, encoding="utf-8"))
-    ondisk = set(a["ondisk_ids"]); by = {x["chat"]: x for x in a["anchors"]}
-    oldest = {}
+    ondisk = set(a["ondisk_ids"]); anchors = list(a["anchors"])
+    # Index every jid form an anchor is known by, so a recovered message maps back to ITS anchor
+    # whichever form the phone used to label it.
+    idx = {}
+    for x in anchors:
+        for k in (x.get("chat"), x.get("chat_id")):
+            if k: idx.setdefault(str(k), x)
+    deepest = {}                                           # id(anchor) -> (anchor, ts, msg_id, fromMe)
     for m in master.values():
         if m.get("id"): ondisk.add(m["id"])
         c = m.get("chat"); ts = m.get("ts", 0)
         if not c or not m.get("id") or ts <= 0: continue   # ts<=0 (stubs) can't anchor fetchMessageHistory
-        cur = oldest.get(c)
-        if cur is None or ts < cur["oldest_ts"]:
-            oldest[c] = {"chat": c, "oldest_id": m["id"], "oldest_ts": ts, "oldest_fromMe": bool(m.get("fromMe"))}
-    for c, x in oldest.items(): by[c] = x
+        x = idx.get(str(c))
+        if x is None:                                      # a chat with no anchor: adopt it as-is
+            x = {"chat": c, "chat_id": c, "more_on_primary": True}
+            anchors.append(x); idx[str(c)] = x
+        cur = deepest.get(id(x))
+        if cur is None or ts < cur[1]:
+            deepest[id(x)] = (x, ts, m["id"], bool(m.get("fromMe")))
+    for x, ts, mid, fromme in deepest.values():            # mutate: every other field is preserved
+        x["oldest_id"], x["oldest_ts"], x["oldest_fromMe"] = mid, ts, fromme
     # continue the chats we just went deeper on first, then the rest
-    newanchors = list(oldest.values()) + [x for c, x in by.items() if c not in oldest]
+    newanchors = [x for x in anchors if id(x) in deepest] + [x for x in anchors if id(x) not in deepest]
     tmp = anchors_path + ".tmp"                            # atomic write: a failed/interrupted write must not
     with open(tmp, "w", encoding="utf-8") as f: json.dump({"anchors": newanchors, "ondisk_ids": sorted(ondisk)}, f)  # corrupt
     os.replace(tmp, anchors_path)                          # the anchors.json the node client reads next pass
