@@ -59,6 +59,38 @@ def _iter_chats(profile, origin):
             except Exception: continue
 
 
+def _to_jid(wid):
+    """Wid.toJid() -- read out of WhatsApp Web's own Wid class:
+
+        toString(t) { var r = (t.legacy && this.server === "c.us") ? "s.whatsapp.net" : this.server; ... }
+        toJid()     { return this.toString({legacy: true}); }
+
+    so a wid whose server is `c.us` serialises to `<user>@s.whatsapp.net` on the wire, and every
+    other server passes through unchanged. `historyChatId` is stored in the `@c.us` form but the
+    request carries `createWid(historyChatId).toJid()`, i.e. the `@s.whatsapp.net` form. Sending the
+    stored `@c.us` form names a jid WhatsApp Web never sends.
+
+    Confirmed independently against `history_initial_sync_boundry`, which WhatsApp Web keys with the
+    same expression: of 132 chats carrying a historyChatId, the `@s.whatsapp.net` form matched a
+    boundary key 132/132 and the raw `@c.us` form 0/132.
+    """
+    w = str(wid)
+    return w.rsplit('@', 1)[0] + '@s.whatsapp.net' if w.endswith('@c.us') else w
+
+
+# endOfHistoryTransferType -> does the primary still hold older messages for this chat?
+# WAWebChatConstants.ConversationEndOfHistoryTransferModelPropType, and the truth table of
+# WAWebHistorySyncUtils.primaryHasMoreMessagesReadyToLoad():
+_MORE_ON_PRIMARY = {
+    0: True,    # COMPLETE_BUT_MORE_MESSAGES_REMAIN_ON_PRIMARY
+    1: False,   # COMPLETE_AND_NO_MORE_MESSAGE_REMAIN_ON_PRIMARY
+    2: False,   # INCOMPLETE
+    3: True,    # NOT_INCLUDED_IN_HIST_SYNC
+    4: True,    # COMPLETE_ON_DEMAND_SYNC_BUT_MORE_MSG_REMAIN_ON_PRIMARY
+    5: True,    # COMPLETE_ON_DEMAND_SYNC_WITH_MORE_MSG_ON_PRIMARY_BUT_NO_ACCESS
+}
+
+
 def _history_jid_map(profile, origin):
     """chat id -> the jid WhatsApp Web actually puts in HistorySyncOnDemandRequest.chatJid.
 
@@ -74,12 +106,15 @@ def _history_jid_map(profile, origin):
     chats had a historyChatId and it differed from the chat id in every single case (all @lid -> @c.us).
     Group chats have none, which is why groups behaved differently from one-to-one chats throughout.
     """
-    out = {}
+    out, more = {}, {}
     for c in _iter_chats(profile, origin):
         cid, hid = c.get('id'), c.get('historyChatId')
-        if cid and hid and str(hid) != str(cid):
-            out[str(cid)] = str(hid)
-    return out
+        if not cid:
+            continue
+        if hid and _to_jid(hid) != str(cid):
+            out[str(cid)] = _to_jid(hid)         # the wire form, not the stored @c.us form
+        more[str(cid)] = _MORE_ON_PRIMARY.get(c.get('endOfHistoryTransferType'), True)
+    return out, more
 
 
 def main():
@@ -87,9 +122,12 @@ def main():
     ap.add_argument('--profile', help='Chromium profile dir (Chrome/Edge/Brave .../Default)')
     ap.add_argument('--origin', help='Firefox web.whatsapp.com storage dir')
     ap.add_argument('--out', default='anchors.json')
+    ap.add_argument('--all-chats', action='store_true',
+                    help="also page chats whose endOfHistoryTransferType says the primary holds "
+                         "nothing older (WhatsApp Web would not ask for these)")
     a = ap.parse_args()
 
-    histjid = _history_jid_map(a.profile, a.origin)
+    histjid, more_on_primary = _history_jid_map(a.profile, a.origin)
 
     per = {}          # chat id -> {chat, chat_id, oldest_id, oldest_ts, oldest_fromMe}
     ondisk = set()    # all on-disk message key-ids (parts[2] of the WA id)
@@ -110,14 +148,21 @@ def main():
         if cur is None or t < cur['oldest_ts']:
             per[chat] = {'chat': histjid.get(chat, chat),   # what to ASK for
                          'chat_id': chat,                   # the local chat id, for reference
-                         'oldest_id': keyid, 'oldest_ts': t, 'oldest_fromMe': from_me}
+                         'oldest_id': keyid, 'oldest_ts': t, 'oldest_fromMe': from_me,
+                         'more_on_primary': more_on_primary.get(chat, True)}
 
     anchors = sorted(per.values(), key=lambda x: -cnt.get(x['chat_id'], 0))   # busiest chats first
+    futile = [x for x in anchors if not x['more_on_primary']]
+    if not a.all_chats:
+        anchors = [x for x in anchors if x['more_on_primary']]
     json.dump({'anchors': anchors, 'ondisk_ids': sorted(ondisk)}, open(a.out, 'w', encoding='utf-8'))
     remapped = sum(1 for x in anchors if x['chat'] != x['chat_id'])
     print(f"[+] anchors.json: {len(anchors)} chats, {len(ondisk)} on-disk message ids -> {a.out}")
-    print(f"    {remapped} chat(s) asked for by their historyChatId rather than their chat id "
-          f"(this is what WhatsApp Web sends; asking by chat id goes unanswered)")
+    print(f"    {remapped} chat(s) asked for by historyChatId in its wire form (@s.whatsapp.net) "
+          f"rather than by chat id -- this is what WhatsApp Web sends")
+    print(f"    {len(futile)} chat(s) {'kept (--all-chats)' if a.all_chats else 'dropped'}: the chat's "
+          f"endOfHistoryTransferType says the primary holds nothing older, so a request for them "
+          f"cannot be answered")
 
 
 if __name__ == '__main__':

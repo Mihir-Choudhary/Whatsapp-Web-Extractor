@@ -83,13 +83,25 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   const signalStore=require('./signal_store');
   const _askPath=findFile('appstate_keys.json');
   const appStateKeys=_askPath?JSON.parse(fs.readFileSync(_askPath,'utf8')):{};
-  const rt=signalStore.open({signalState:S,creds,appStateKeys,
-    statePath:signalStore.defaultStatePath(path.dirname(mustFind('signal_state.json'))),
-    bufferJSON:B.BufferJSON});
+  // Which device does the runtime overlay belong to? With our own paired device, NOT the profile's:
+  // its sessions and prekeys live in wawf_device/ (useMultiFileAuthState) and the profile's Signal
+  // material is for a different registration. Opening the overlay against the profile anyway meant
+  // the persisted decrypt-retry counters -- the one part of it own-device mode actually uses -- were
+  // keyed to the wrong registration, and signal_store's own sameDevice check compared creds that had
+  // nothing to do with the socket's. So own-device mode gets its own overlay beside its credentials.
+  const rt=ownDevice
+    ? signalStore.open({signalState:{},creds:ownDevice.state.creds,appStateKeys,
+        statePath:signalStore.defaultStatePath(DEVICE_DIR), bufferJSON:B.BufferJSON})
+    : signalStore.open({signalState:S,creds,appStateKeys,
+        statePath:signalStore.defaultStatePath(path.dirname(mustFind('signal_state.json'))),
+        bufferJSON:B.BufferJSON});
   const store=rt.keys;
-  console.error(`[i] signal state: ${rt.stats.sessions} session(s), ${rt.stats.senderKeys} sender key(s), `
+  console.error(`[i] signal state (${ownDevice?'own paired device':'browser profile'}): `
+    +`${rt.stats.sessions} session(s), ${rt.stats.senderKeys} sender key(s), `
     +`${rt.stats.preKeys} prekey(s) | runtime overlay: ${rt.stats.state}, ${rt.stats.carried} record(s) carried over`);
-  if(!rt.stats.sessions&&!rt.stats.carried) console.error('[!] no Signal sessions recovered -- inbound messages will NOT decrypt; re-run the credential export against the browser profile');
+  // Only meaningful when riding the browser profile's registration. With our own paired device the
+  // profile's session count is irrelevant -- ownDevice.state carries its own keys.
+  if(!ownDevice&&!rt.stats.sessions&&!rt.stats.carried) console.error('[!] no Signal sessions recovered -- inbound messages will NOT decrypt; re-run the credential export against the browser profile');
   let version=[2,3000,1023223821]; try{version=(await B.fetchLatestBaileysVersion()).version;}catch(e){}
   // Make the FIRST retry receipt carry a fresh prekey bundle. When a payload cannot be decrypted
   // (inevitable here: the session in the profile is a snapshot of a live ratchet that has moved on)
@@ -117,9 +129,10 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     // CRITICAL: accept ON_DEMAND history only, and decline the INITIAL (RECENT/bootstrap) sync.
     // On connect Baileys calls ev.buffer() and holds every event. If this predicate says yes to the
     // initial sync it waits for that notification, enters 'Syncing', and only flushes after
-    // resyncAppState() finishes -- which needs app-state-sync keys we deliberately do not restore (we
-    // recover identity + prekeys only). resyncAppState then never completes, ev.flush() never runs, and
-    // the on-demand replies sit in the buffer forever, looking exactly like "the phone never answered".
+    // resyncAppState() finishes. (We DO restore app-state-sync keys now -- export_appstate_keys.py
+    // recovers them from the profile and resyncAppState is driven explicitly after connect -- but
+    // tying the event flush to it is still the wrong dependency: one failed patch fetch would strand
+    // every on-demand reply in the buffer, looking exactly like "the phone never answered".)
     // Declining here takes the 'History sync is disabled by config' branch -> Online + immediate flush,
     // while ON_DEMAND notifications are still processed (ON_DEMAND is in PROCESSABLE_HISTORY_TYPES).
     shouldSyncHistoryMessage:h=>{ try{ return !!h && h.syncType===B.proto.Message.HistorySyncNotification.HistorySyncType.ON_DEMAND; }catch(e){ return false; } },
@@ -229,18 +242,29 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   const selfLid=(()=>{ const l=ownDevice?ownDevice.state.creds.me&&ownDevice.state.creds.me.lid:inp.lid;
                        return l?B.jidNormalizedUser(l):null; })();
   const askHistory=(count,key,tsMs)=>{
+    // EXACTLY the field set WhatsApp Web sends, no more. Its own request builder is:
+    //   return {chatJid:r, oldestMsgId:a?.id.id, oldestMsgFromMe:a?.id.fromMe,
+    //           onDemandMsgCount:i, oldestMsgTimestampMs:a?.t*1e3, supportInlineResponse:!0}
+    // `accountLid` exists in the proto (field 6) and we used to populate it, but the reference
+    // client never sets it on THIS request -- 0 of its 88 `accountLid` references sit in a
+    // history-on-demand path. Sending a field the real client omits is gratuitous divergence on the
+    // one request whose shape we cannot observe being accepted, so we stop sending it. LID *routing*
+    // below is unrelated: that is the envelope's destination, not a field inside the request.
     const req={chatJid:key.remoteJid, oldestMsgId:key.id, oldestMsgFromMe:!!key.fromMe,
-      oldestMsgTimestampMs:tsMs, onDemandMsgCount:count};
-    if(selfLid) req.accountLid=selfLid;
-    req.supportInlineResponse=true;        // field 7; the real client always sets it
+      onDemandMsgCount:count, oldestMsgTimestampMs:tsMs, supportInlineResponse:true};
     const pdo={historySyncOnDemandRequest:req, peerDataOperationRequestType:B.proto.Message.PeerDataOperationRequestType.HISTORY_SYNC_ON_DEMAND};
     if(!selfLid) return sock.sendPeerDataOperationMessage(pdo);        // no LID known: old behaviour
     return sock.relayMessage(selfLid, {protocolMessage:{peerDataOperationRequestMessage:pdo, type:PDO_TYPE}},
       {additionalAttributes:{category:'peer', push_priority:'high_force'}});
   };
 
+  // WhatsApp Web's own per-request deadline is the AB prop `history_sync_on_demand_timeout_ms`,
+  // whose value is 10000: it declares a request FAILED after 10s and feeds that into the failure
+  // record below. We waited 45s, which is not more robust -- it just means a pass over ~250 chats
+  // spends 4.5x as long waiting for answers the reference client would already have given up on.
+  const REQ_TIMEOUT=Number(process.env.REQ_TIMEOUT_MS||10000);
   const requestPage=(key,tsSec)=>new Promise(res=>{
-    let id=null; const timer=setTimeout(()=>{ if(id!=null) pending.delete(id); res(null); }, 45000);
+    let id=null; const timer=setTimeout(()=>{ if(id!=null) pending.delete(id); res(null); }, REQ_TIMEOUT);
     askHistory(COUNT, key, toMs(tsSec))
       .then(rid=>{ id=rid; lastRequestId=rid; pending.set(rid, msgs=>{ clearTimeout(timer); res(msgs); }); })
       .catch(e=>{ clearTimeout(timer); console.error('  fetch err', e.message); res(null); }); });
@@ -307,13 +331,30 @@ function histNotif(message){ // dig through device/ephemeral wrappers
       // most likely its companion registration is no longer valid. Say so in seconds rather than
       // grinding through every chat at 45s a time and reporting a mystery hours later.
       const PROBE=Number(process.env.PROBE_CHATS||4); let probeSilent=0, probed=0;
+      // WhatsApp Web's own circuit breaker, which this tool did not have. Its failure record is:
+      //   on success -> reset {failureCount:0, firstFailureRequestTimeStampSec:undefined}
+      //   on failure -> failureCount+=1; firstFailure ??= now;
+      //                 if (failureCount >= history_sync_on_demand_failure_limit /*10*/ &&
+      //                     now - firstFailure < history_sync_on_demand_cooldown_sec /*7200*/)
+      //                        disableRequestSending = true, re-enabled after the cooldown
+      // A real client stops asking after 10 unanswered requests in a 2-hour window and then stays
+      // quiet for two hours. Ours kept asking for every chat no matter what came back, which is
+      // both the slow path and exactly the behaviour that makes a companion look broken.
+      const FAIL_LIMIT=Number(process.env.FAIL_LIMIT||10), COOLDOWN=Number(process.env.COOLDOWN_SEC||7200);
+      let failCount=0, firstFailSec=null, tripped=false;
+      const noteFailure=()=>{ const now=Math.floor(Date.now()/1000);
+        if(firstFailSec===null) firstFailSec=now;
+        if(++failCount>=FAIL_LIMIT && now-firstFailSec<COOLDOWN) tripped=true; };
+      const noteSuccess=()=>{ failCount=0; firstFailSec=null; };
       for(const a of targets){
         let key={remoteJid:a.chat,id:a.oldest_id,fromMe:!!a.oldest_fromMe}, ts=a.oldest_ts, got=0;
         for(let pg=0; pg<MAXPAGES; pg++){
           const msgs=await requestPage(key, ts);
           if(msgs===null){ console.error(`  ${a.chat.slice(0,22)} page${pg}: no response`);
             if(pg===0){ probeSilent++; }
+            noteFailure();
             break; }
+          noteSuccess();
           if(!msgs.length){ console.error(`  ${a.chat.slice(0,22)} page${pg}: empty (start reached)`); break; }
           for(const m of msgs) all.set(m.id,m);
           got+=msgs.length; msgs.sort((x,y)=>x.ts-y.ts); const o=msgs[0];
@@ -325,13 +366,24 @@ function histNotif(message){ // dig through device/ephemeral wrappers
           await sleep(500);
         }
         probed++;
-        if(probed>=PROBE && probeSilent>=PROBE){
+        if(tripped){
           console.error(`
-[!] the first ${PROBE} chats returned NOTHING. The phone is not serving this `
-            +`device: its companion registration is most likely no longer valid (WhatsApp revokes a `
-            +`linked device that looks broken). Open WhatsApp Web once and check it is still linked, `
-            +`re-link if not, then run again. Stopping rather than grinding through `
-            +`${targets.length} chats.`);
+[!] ${failCount} unanswered requests inside the ${COOLDOWN}s window. WhatsApp Web itself stops `
+            +`here (history_sync_on_demand_failure_limit=${FAIL_LIMIT}) and goes quiet for the `
+            +`cooldown, so we do the same rather than keep asking. Run `
+            +`tools/reconnect/diag_health.js to tell the causes apart: it asks the server whether `
+            +`this device slot is still registered, which is definitive.`);
+          break;
+        }
+        if(probed>=PROBE && probeSilent>=PROBE){
+          // Deliberately does NOT claim the registration is dead. Silence has more than one cause
+          // and this tool repeatedly mis-attributed it; diag_health.js settles it with a USync
+          // device query instead of inferring from silence.
+          console.error(`
+[!] the first ${PROBE} chats returned NOTHING -- stopping rather than grinding through `
+            +`${targets.length} chats. This does not by itself mean the device was revoked. Run `
+            +`tools/reconnect/diag_health.js: it reports CONNECT / REGISTERED / SERVED separately, `
+            +`and only a REGISTERED failure means the linked device is gone.`);
           break;
         }
         await sleep(Number(process.env.CHAT_DELAY_MS||400));   // be a polite client between chats

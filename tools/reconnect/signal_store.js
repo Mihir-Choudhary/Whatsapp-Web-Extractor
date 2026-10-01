@@ -80,8 +80,14 @@ function open({ signalState, creds, statePath, bufferJSON, appStateKeys }) {
   const S = signalState || {};
   // App-state sync keys, recovered by scripts/export_appstate_keys.py. Without these Baileys cannot
   // resyncAppState, which is the SyncD handshake a live WhatsApp Web session performs on EVERY
-  // connect. Skipping it is why on-demand history only worked while the browser's own sync was
-  // still fresh: the primary stopped treating this companion as in sync, and stopped serving.
+  // connect, so restoring them makes us behave like a real companion in a way we previously did not.
+  //
+  // HYPOTHESIS, NOT ESTABLISHED: that skipping the app-state resync is *why* on-demand history only
+  // worked while the browser's own sync was fresh. It is plausible and it is why these keys are
+  // restored, but it has never been isolated -- the observations it rests on were collected from a
+  // device that was also being degraded by retry storms and forced renegotiations, and which was
+  // ultimately revoked. What IS established: WhatsApp Web performs this resync on every connect, and
+  // we did not. Do not quote this comment as a root cause.
   const appKeys = {};
   for (const [kid, v] of Object.entries(appStateKeys || {})) {
     appKeys[kid] = { keyData: bb(v.keyData), fingerprint: v.fingerprint, timestamp: v.timestamp };
@@ -186,19 +192,36 @@ function open({ signalState, creds, statePath, bufferJSON, appStateKeys }) {
     if (!fromProfile) return fromOverlay;
     if (!fromOverlay) return fromProfile;
     const pe = fromProfile._sessions || {}, oe = fromOverlay._sessions || {};
-    const profileHasNewHandshake = Object.entries(pe)
-      .some(([bk, e]) => e && e.indexInfo && e.indexInfo.closed === -1 && !(bk in oe));
-    const merged = {};
     const close = (e) => {
       if (!e || !e.indexInfo || e.indexInfo.closed !== -1) return e;
       return { ...e, indexInfo: { ...e.indexInfo, closed: Date.now() - 1000 } };
     };
-    if (profileHasNewHandshake) {
-      for (const [bk, e] of Object.entries(oe)) merged[bk] = close(e);   // ours becomes history
-      for (const [bk, e] of Object.entries(pe)) merged[bk] = e;          // the profile's is current
-    } else {
-      for (const [bk, e] of Object.entries(pe)) merged[bk] = close(e);
-      for (const [bk, e] of Object.entries(oe)) merged[bk] = e;
+    const openKeys = o => Object.entries(o)
+      .filter(([, e]) => e && e.indexInfo && e.indexInfo.closed === -1).map(([bk]) => bk);
+    // A baseKey that is OPEN in the profile and that our overlay has never seen means WhatsApp Web
+    // re-handshaked after our last run, so the profile is ahead of us.
+    const newHandshake = openKeys(pe).filter(bk => !(bk in oe));
+    const profileHasNewHandshake = newHandshake.length > 0;
+    // Whichever side is authoritative wins outright; the other side's records are still kept, so
+    // older ratchets continue to decrypt.
+    const primary = profileHasNewHandshake ? pe : oe;
+    const secondary = profileHasNewHandshake ? oe : pe;
+    const merged = {};
+    for (const [bk, e] of Object.entries(secondary)) merged[bk] = e;
+    for (const [bk, e] of Object.entries(primary)) merged[bk] = e;
+    // libsignal identifies the CURRENT ratchet as the one entry with indexInfo.closed === -1, and
+    // getOpenSession() takes whichever it finds first. Leaving two entries open therefore makes which
+    // ratchet gets used depend on key order -- an intermittent "the reply would not decrypt" that is
+    // near-impossible to attribute. It is the normal case here, not an edge case: the overlay is
+    // SEEDED from the profile, so the same baseKey is usually present on both sides, and the previous
+    // code closed the overlay's copy and then let the profile's copy re-open it. So collapse to
+    // exactly one open entry -- the authoritative side's -- and close every other. Nothing is ever
+    // force-opened: if the authoritative side has no open entry, the result has none either.
+    const keepOpen = profileHasNewHandshake
+      ? newHandshake[newHandshake.length - 1]
+      : (openKeys(oe).pop() || openKeys(pe).pop());
+    for (const [bk, e] of Object.entries(merged)) {
+      if (bk !== keepOpen) merged[bk] = close(e);
     }
     if (profileHasNewHandshake && !warnedReHandshake) {
       warnedReHandshake = true;
