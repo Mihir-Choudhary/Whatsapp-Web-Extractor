@@ -701,6 +701,17 @@ def cmd_history(a):
         return 3
     log.info("[2/4] recovering Signal state (identity, prekeys, sessions, sender keys) ...")
     if _sub("export_signal_state.py", eng + ["--out", os.path.join(work, "signal_state.json")]): return 3
+    # Verify what we just exported actually describes the device this profile is on. This should
+    # always pass here -- we exported it a line ago -- so a failure means the export path is broken,
+    # which is worth stopping for. The check matters far more for the diag_*.js tools, which read
+    # whatever happens to be on disk: when WhatsApp Web re-pairs (what "reconnecting" does, and what
+    # happens by itself when a device is revoked) the account gets a new registrationId and a new
+    # Signal identity, and a stale snapshot then authenticates as a device that no longer exists.
+    # That connects, asks every chat, receives nothing, and is indistinguishable from throttling.
+    if _sub("check_identity.py", eng + ["--dir", work, "--quiet"]):
+        log.error("the credentials just exported do not match the profile — refusing to run with them. "
+                  "Run scripts/check_identity.py --profile <profile> --dir %s for the details.", work)
+        return 3
     log.info("[3/4] building anchors from on-disk messages ...")
     if _sub("build_anchors.py", eng + ["--out", os.path.join(work, "anchors.json")]): return 3
     log.warning("[4/4] NETWORKED iterative history sync — logs in as your linked device and asks your phone, "

@@ -58,6 +58,18 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   creds.me={id:inp.me_id,lid:inp.lid};
   creds.account={details:bb(inp.account.details),accountSignatureKey:bb(inp.account.accountSignatureKey),accountSignature:bb(inp.account.accountSignature),deviceSignature:bb(inp.account.deviceSignature)};
   creds.registered=true; creds.platform='web';
+  // creds_in.json and signal_state.json are exported SEPARATELY, and `creds` is assembled from both
+  // (me/account/noise from the first, registrationId/identity/prekeys from the second). Refresh one
+  // and not the other and you get a chimera: the old device's identity with the new device's
+  // registration, which authenticates as nothing in particular and is then impossible to diagnose
+  // from the symptom, because the symptom is silence. They both carry registrationId, so compare it.
+  if(inp.registrationId!=null && S.registrationId!=null && Number(inp.registrationId)!==Number(S.registrationId)){
+    console.error(`[x] creds_in.json (regId ${inp.registrationId}, device :${inp.device}) and `
+      +`signal_state.json (regId ${S.registrationId}) describe DIFFERENT registrations -- one of them is `
+      +`stale. Re-export BOTH from the same profile: \`wawf history\` does this itself, or run `
+      +`scripts/export_signal_state.py and the creds export together.`);
+    process.exit(5);
+  }
   // Signal sessions + sender keys recovered from the browser profile, plus whatever this tool
   // learned on earlier runs. Without these every inbound payload fails to decrypt (SessionError)
   // and is dropped, including the phone's history reply.
@@ -312,8 +324,10 @@ function histNotif(message){ // dig through device/ephemeral wrappers
       // Unconditionally, every run: the phone may have re-keyed since (it does so whenever it
       // cannot read something we sent), and a renegotiation costs one of its one-time prekeys,
       // which is far cheaper than a whole pass that returns nothing because the reply was dropped.
+      // Hoisted out of the try below: the registration check further down needs it too, and a
+      // const inside that block would be a ReferenceError there rather than a syntax error.
+      const _me = ownDevice ? ownDevice.state.creds.me : {id:inp.me_id,lid:inp.lid};
       try{
-        const _me = ownDevice ? ownDevice.state.creds.me : {id:inp.me_id,lid:inp.lid};
         const selfJids=[...new Set([_me.lid,_me.id].filter(Boolean).map(B.jidNormalizedUser))];
         // force=false: only fetch a prekey bundle if we genuinely have no session. Forcing a fresh
         // handshake on EVERY connect (~56 times over three days) burns one of the peer's one-time
@@ -327,6 +341,41 @@ function histNotif(message){ // dig through device/ephemeral wrappers
           catch(e){ console.error('[!] resyncAppState failed:', e&&e.message); }
         }
       }catch(e){ console.error('[!] could not rebuild the self session:', e&&e.message, '-- replies may not decrypt'); }
+
+      // IS THIS DEVICE STILL REGISTERED? Ask the server, before spending a pass finding out.
+      //
+      // This is the check whose absence produced the whole "history works, then stops working, then
+      // works again after I reopen WhatsApp Web" loop. A REVOKED companion still completes the Noise
+      // handshake and still reaches Baileys' `open`, so connecting proves nothing. Worse, the
+      // credentials on disk are a SNAPSHOT: when the browser re-pairs -- which is exactly what
+      // "reconnecting WhatsApp Web" does -- the account gets a new device slot with a brand-new
+      // registrationId and a brand-new Signal identity, and the exported files silently describe a
+      // device that no longer exists. Measured on this profile: stored regId 10115 / device :43
+      // against a live profile on regId 11966 / device :44, with a different signedIdentityKey.
+      // Running anyway authenticates as the dead device, asks every chat, receives nothing, and looks
+      // identical to throttling or to a phone that is simply refusing.
+      //
+      // A USync device query against our own account settles it in one round trip: if our slot is not
+      // in the account's device list, the registration is gone and no amount of retrying will help --
+      // the fix is to re-export from the profile, which `wawf history` does on every run.
+      try{
+        const q=new B.USyncQuery().withDeviceProtocol();
+        q.withUser(new B.USyncUser().withId(B.jidNormalizedUser(_me.id)));
+        const res=await sock.executeUSyncQuery(q);
+        const slots=[]; for(const u2 of ((res&&res.list)||[])) for(const d of (u2.devices||[])) slots.push(d.id);
+        const ours=(()=>{ const u=String(_me.id||'').split('@')[0]; return u.includes(':')?Number(u.split(':')[1]):0; })();
+        if(slots.length && !slots.includes(ours)){
+          console.error(`\n[x] this device (:${ours}) is NOT on the account any more -- account device slots: `
+            +`[${slots.join(', ')}]. The registration has been revoked or superseded, which is what happens `
+            +`when WhatsApp Web re-pairs. History cannot work with these credentials and retrying will not `
+            +`change that.\n    FIX: re-export creds + Signal state from the browser profile (\`wawf history\` `
+            +`does it automatically every run) so they describe the device the profile is actually on.`);
+          return finish(6);
+        }
+        console.error(`[i] registration confirmed: device :${ours} is on the account (slots [${slots.join(', ')}])`);
+      }catch(e){ console.error('[!] could not verify the registration (USync failed:', e&&e.message,
+        ') -- continuing, but a silent pass may just mean this device is no longer registered'); }
+
       // If the first few chats all go unanswered, the phone is not serving this device at all --
       // most likely its companion registration is no longer valid. Say so in seconds rather than
       // grinding through every chat at 45s a time and reporting a mystery hours later.
