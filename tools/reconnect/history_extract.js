@@ -362,7 +362,15 @@ function histNotif(message){ // dig through device/ephemeral wrappers
         const q=new B.USyncQuery().withDeviceProtocol();
         q.withUser(new B.USyncUser().withId(B.jidNormalizedUser(_me.id)));
         const res=await sock.executeUSyncQuery(q);
-        const slots=[]; for(const u2 of ((res&&res.list)||[])) for(const d of (u2.devices||[])) slots.push(d.id);
+        // The device protocol's parser returns { deviceList, keyIndex }, and executeUSyncQuery puts
+        // it on each list entry under the protocol's name ('devices'), so the slots live at
+        // entry.devices.deviceList. Iterating entry.devices itself throws "object is not iterable",
+        // which the catch below would turn into a warning -- leaving this check silently dead.
+        const slots=[];
+        for(const u2 of ((res&&res.list)||[])){
+          const dl=(u2&&u2.devices&&(u2.devices.deviceList||u2.devices))||[];
+          if(Array.isArray(dl)) for(const d of dl) slots.push(d.id);
+        }
         const ours=(()=>{ const u=String(_me.id||'').split('@')[0]; return u.includes(':')?Number(u.split(':')[1]):0; })();
         if(slots.length && !slots.includes(ours)){
           console.error(`\n[x] this device (:${ours}) is NOT on the account any more -- account device slots: `

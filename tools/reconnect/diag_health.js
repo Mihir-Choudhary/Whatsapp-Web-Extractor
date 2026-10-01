@@ -97,7 +97,14 @@ let answered = false, verdict = 'UNKNOWN';
       q.withUser(new B.USyncUser().withId(B.jidNormalizedUser(inp.me_id)));
       const res = await sock.executeUSyncQuery(q);
       const list = (res && res.list) || [];
-      for (const u2 of list) for (const d of (u2.devices || [])) slots.push(d.id);
+      // The device protocol's parser returns { deviceList, keyIndex }, and executeUSyncQuery puts it
+      // on each list entry under the protocol's name ('devices'). So the slots are at
+      // entry.devices.deviceList -- iterating entry.devices itself throws "object is not iterable",
+      // which the catch below turns into a warning, leaving the check silently non-functional.
+      for (const u2 of list) {
+        const dl = (u2 && u2.devices && (u2.devices.deviceList || u2.devices)) || [];
+        if (Array.isArray(dl)) for (const d of dl) slots.push(d.id);
+      }
       registered = slots.includes(ourDevice);
       console.error(`[health] 2. REGISTERED ${registered ? 'ok' : 'FAIL'} — account device slots: [${slots.join(', ')}]`
         + (registered ? `, ours (:${ourDevice}) present` : `, ours (:${ourDevice}) IS ABSENT`));
@@ -116,12 +123,28 @@ let answered = false, verdict = 'UNKNOWN';
     const a = (A.anchors || []).find(x => !String(x.chat).endsWith('@g.us')) || (A.anchors || [])[0];
     if (!a) { console.error('[health] 3. SERVED    skipped — no anchors'); process.exit(0); }
     const tsMs = a.oldest_ts > 1e12 ? a.oldest_ts : a.oldest_ts * 1000;
+    // Send EXACTLY what history_extract.js sends, or a SERVED failure means nothing. Two details
+    // matter and both were missing here: supportInlineResponse (field 7, which the reference client
+    // always sets, added by proto_patch) and LID routing. Baileys' sendPeerDataOperationMessage
+    // always addresses the PN jid, whereas WhatsApp Web addresses
+    // getMyPrimaryForOutgoingPeerMessage() = device 0 of the LID jid when peer_message_lid_migration_
+    // outgoing is on -- and it ships a validator that logs an error for a peer message sent to a PN
+    // in that mode. A probe that asks differently from the real run cannot clear or convict it.
+    try { require('./proto_patch').patch(B); } catch (e) {}
+    const selfLid = creds.me && creds.me.lid ? B.jidNormalizedUser(creds.me.lid) : null;
     try {
-      const id = await sock.sendPeerDataOperationMessage({
-        historySyncOnDemandRequest: { chatJid: a.chat, oldestMsgId: a.oldest_id,
-          oldestMsgFromMe: !!a.oldest_fromMe, oldestMsgTimestampMs: tsMs, onDemandMsgCount: 10 },
-        peerDataOperationRequestType: B.proto.Message.PeerDataOperationRequestType.HISTORY_SYNC_ON_DEMAND });
-      console.error(`[health] 3. SERVED    asked ${redact(a.chat)} for 10 messages (req ${id}); waiting ${WAIT / 1000}s ...`);
+      const req = { chatJid: a.chat, oldestMsgId: a.oldest_id, oldestMsgFromMe: !!a.oldest_fromMe,
+        onDemandMsgCount: 10, oldestMsgTimestampMs: tsMs, supportInlineResponse: true };
+      const pdo = { historySyncOnDemandRequest: req,
+        peerDataOperationRequestType: B.proto.Message.PeerDataOperationRequestType.HISTORY_SYNC_ON_DEMAND };
+      const id = selfLid
+        ? await sock.relayMessage(selfLid,
+            { protocolMessage: { peerDataOperationRequestMessage: pdo,
+                type: B.proto.Message.ProtocolMessage.Type.PEER_DATA_OPERATION_REQUEST_MESSAGE } },
+            { additionalAttributes: { category: 'peer', push_priority: 'high_force' } })
+        : await sock.sendPeerDataOperationMessage(pdo);
+      console.error(`[health] 3. SERVED    asked ${redact(a.chat)} for 10 messages via `
+        + `${selfLid ? 'LID' : 'PN'} routing (req ${id}); waiting ${WAIT / 1000}s ...`);
     } catch (e) { console.error('[health] 3. SERVED    FAIL — could not send:', e && e.message); process.exit(5); }
 
     setTimeout(() => {
