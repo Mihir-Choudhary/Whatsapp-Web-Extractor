@@ -18,13 +18,47 @@ const mustFind=(name)=>{ const p=findFile(name); if(!p){ console.error('[!] '+na
 const OUT=path.resolve(process.cwd(),'history_recovered.json');
 
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-function fetchBlobOnce(directPath){ return new Promise((res,rej)=>{
-  const req=https.get("https://mmg.whatsapp.net"+directPath,{headers:{'User-Agent':'WhatsApp/2.3000.0','Origin':'https://web.whatsapp.com'}},
+
+// Headers copied verbatim from a NetLog capture of WhatsApp Web fetching a real history chunk. They
+// are not cosmetic: static.whatsapp.net already returned HTTP 400 to this project for a request whose
+// only fault was a bare `Accept: */*`, so these endpoints do inspect the header set. The captured GET
+// carried no credential of any kind -- the `oh=` signature in the URL IS the authorization.
+const CDN_HEADERS={
+  'accept':'*/*',
+  'accept-language':'en-US,en;q=0.9',
+  'origin':'https://web.whatsapp.com',
+  'referer':'https://web.whatsapp.com/',
+  'sec-fetch-site':'cross-site',
+  'sec-fetch-mode':'cors',
+  'sec-fetch-dest':'empty',
+  'user-agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
+              +'Chrome/154.0.0.0 Safari/537.36',
+};
+
+// PREFER THE SIGNED URL the notification gives us. The same capture shows the real client fetching
+//   https://media-<pop>.cdn.whatsapp.net/v/t62.31111-24/<name>.enc?ccb=11-4&oh=<sig>&oe=<expiry>
+//     &_nc_sid=..&hash=<fileEncSha256>&mms-type=md-msg-hist
+// i.e. a SIGNED object on a per-PoP CDN host, in the history bucket t62.31111-24. Rebuilding
+// "https://mmg.whatsapp.net"+directPath throws the signature away. That is the same mistake that
+// previously capped media recovery at roughly one day: an unsigned path is served only briefly.
+// History chunks survive it today because the phone uploaded them seconds earlier, which makes this
+// a latent failure rather than a visible one -- exactly the kind that reappears as "the phone stopped
+// answering". Baileys has the same flaw and cannot be relied on here: its guard is
+//   isValidMediaUrl = url?.startsWith('https://mmg.whatsapp.net/')
+// so it REJECTS the signed media-*.cdn.whatsapp.net URL as invalid and falls back to the unsigned
+// rebuild. We take the signed one when the notification carries it.
+function fetchBlobOnce(ref){ return new Promise((res,rej)=>{
+  const direct=typeof ref==='string'?ref:(ref&&ref.directPath);
+  const signed =typeof ref==='string'?null:(ref&&ref.url);
+  // a signed absolute URL on any whatsapp.net CDN host wins; otherwise the unsigned reconstruction
+  const target=(signed&&/^https:\/\/[^/]*\.whatsapp\.net\//.test(signed)&&/[?&]oh=/.test(signed))
+    ? signed : ("https://mmg.whatsapp.net"+direct);
+  const req=https.get(target,{headers:CDN_HEADERS},
     r=>{ if(r.statusCode!==200){ r.resume(); return rej(new Error('HTTP '+r.statusCode)); } const c=[]; r.on('data',d=>c.push(d)); r.on('end',()=>res(Buffer.concat(c))); });
   req.on('error',rej);
   req.setTimeout(20000, ()=>req.destroy(new Error('socket timeout')));   // don't let a stalled CDN socket hang forever
 }); }
-async function fetchBlob(directPath){ let e; for(let i=0;i<3;i++){ try{ return await fetchBlobOnce(directPath); }catch(err){ e=err; await sleep(800); } } throw e; }
+async function fetchBlob(ref){ let e; for(let i=0;i<3;i++){ try{ return await fetchBlobOnce(ref); }catch(err){ e=err; await sleep(800); } } throw e; }
 function decryptHistory(blob, mediaKey){
   const exp=Buffer.from(crypto.hkdfSync('sha256', mediaKey, Buffer.alloc(32), Buffer.from('WhatsApp History Keys'), 112));
   const iv=exp.subarray(0,16), ck=exp.subarray(16,48);
@@ -212,7 +246,7 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     const sid=hn.peerDataRequestSessionId; const r=resolveFor(sid,'upsert');
     if(!r) continue;
     let msgs=null;                  // null = download/decode error (distinct from [] = genuine empty page)
-    try{ const blob=await fetchBlob(hn.directPath); const inf=decryptHistory(blob, Buffer.from(hn.mediaKey));
+    try{ const blob=await fetchBlob(hn); const inf=decryptHistory(blob, Buffer.from(hn.mediaKey));
          msgs=flatten(B.proto.HistorySync.decode(inf)); }
     catch(e){ console.error('  blob err', e.message); }
     r(msgs); } });

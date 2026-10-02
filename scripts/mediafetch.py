@@ -53,6 +53,24 @@ def signature_expiry(url):
     m = re.search(r"[?&]oe=([0-9A-Fa-f]+)", url or "")
     return int(m.group(1), 16) if m else None
 
+# Copied verbatim from a NetLog capture of WhatsApp Web fetching a real media/history object. Header
+# fidelity is not cosmetic on these endpoints: static.whatsapp.net returned HTTP 400 to this project
+# for a request whose only fault was a bare `Accept: */*`. The captured GET carried no credential of
+# any kind -- the `oh=` signature in the URL is the whole authorization -- so matching the browser's
+# header set is the only thing that distinguishes an accepted request from a rejected one.
+CDN_HEADERS = {
+    "accept": "*/*",
+    "accept-language": "en-US,en;q=0.9",
+    "origin": "https://web.whatsapp.com",
+    "referer": "https://web.whatsapp.com/",
+    "sec-fetch-site": "cross-site",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-dest": "empty",
+    "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/154.0.0.0 Safari/537.36"),
+}
+
+
 def cdn_get(url_or_path: str, timeout=30):
     """Fetch a media object. `url_or_path` is either a COMPLETE signed CDN url or a bare directPath.
 
@@ -66,7 +84,7 @@ def cdn_get(url_or_path: str, timeout=30):
     """
     import urllib.request
     url = url_or_path if str(url_or_path).startswith("http") else CDN_HOST + url_or_path
-    req = urllib.request.Request(url, headers={"User-Agent": "WhatsApp/2.2412.54 W"})
+    req = urllib.request.Request(url, headers=CDN_HEADERS)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
 
@@ -169,9 +187,22 @@ def main():
         print(f"[i] CDN: {dl} download(s) attempted, {dl_bytes/1048576:.1f} MiB pulled"
               + (f"; skipped {expired} with an already-expired url signature" if expired else "")
               + (f"; refused: {gone}" if gone else ""))
+        # 403 vs 410 are different problems and only one of them is about the URL. Confirmed against
+        # the live CDN using signed urls captured from WhatsApp Web itself: a request whose oe= has
+        # passed returns 403 (so the expiry IS strictly enforced, and skipping those above is right),
+        # while a url whose signature is still valid but whose object WhatsApp has already collected
+        # returns 410. Media fetched successfully by the browser was answering 410 two days later,
+        # whereas history-sync chunks from the same session were still being served -- message media
+        # is purged well before its signature expires, so for a 410 the bytes are gone server-side and
+        # no amount of url or signature work recovers them.
+        if gone.get(403):
+            print(f"[i] {gone[403]} object(s) answered 403 Forbidden — the url signature (oe=) had"
+                  " expired. The object may well still exist; a fresh signed path from a re-upload"
+                  " request would reach it.")
         if gone.get(410):
-            print(f"[i] {gone[410]} object(s) answered 410 Gone — WhatsApp has purged them from the CDN;"
-                  " only a re-upload request could bring those back")
+            print(f"[i] {gone[410]} object(s) answered 410 Gone — the signature was still valid but"
+                  " WhatsApp has purged the object itself. Nothing in the url can recover those;"
+                  " only a re-upload could, and the re-upload key problem is still open.")
     if failed:  print(f"[!] {failed} blob(s) found but failed verification (not written)")
     if nocache: print(f"[i] {nocache} media message(s) had no cached blob"
                       + ("" if a.cdn else " — re-run with --cdn to download them"))
