@@ -19,9 +19,13 @@ creds_in.json
 companion_enc_static.txt
 signal_state.json
 appstate_keys.json
-signal_runtime.json
-signal_runtime.json.tmp
-signal_runtime.json.bak
+# Un-anchored AND wildcarded: the overlay is key material, and archived/renamed copies of it
+# (signal_runtime.json.dev43, .bak.dev43, .2026-10-01 ...) must not slip past this the way an
+# exact-name list lets them.
+signal_runtime.json*
+signal_state.json*
+appstate_keys.json*
+creds_in.json*
 anchors.json
 notifs.json
 history_*.json
