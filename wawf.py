@@ -327,6 +327,73 @@ def cmd_decrypt(a):
     AUDIT.artifact(f"{a.out}/transcripts.txt", kind="decrypted transcripts (text)", records=ok)
     return 0
 
+def _edge_routing(profile, origin):
+    """The `ED=` query parameter WhatsApp Web puts on its own WebSocket url.
+
+    Observed in a NetLog capture of a real session:
+
+        wss://web.whatsapp.com/ws/chat?ED=CBIIDQgC
+        wss://web.whatsapp.com:5222/ws/chat?ED=CBIIDQgC      (both raced in parallel)
+
+    and `CBIIDQgC` is exactly `WARoutingInfo.edgeRouting` as stored in the profile's
+    model-storage/user-prefs ({"domain": "fb", "edgeRouting": "CBIIDQgC"}). It is WhatsApp's edge
+    routing hint: the client persists it and replays it so reconnects land on the same edge. Baileys
+    defaults to a bare wss://web.whatsapp.com/ws/chat with no ED at all.
+
+    DO NOT REPLAY THIS VALUE ON OUR OWN SOCKET. Measured on a live account, alternating runs of
+    diag_health.js against the same device and anchor:
+
+        bare wss://web.whatsapp.com/ws/chat            -> SERVED ok   2 of 2
+        the same url with ?ED=<the profile's value>    -> SERVED FAIL 0 of 2
+
+    CONNECT and REGISTERED passed in all four runs, so the socket opens and the device is accepted
+    either way; what changes is whether the phone's answer comes back. The value is evidently bound to
+    the browser's own connection context rather than to the account, so replaying it routes us to an
+    edge that will not serve us. This is a case where copying the reference client exactly is the wrong
+    move, which is why the field is exported for the record and deliberately NOT used.
+
+    Exported purely as an artefact: it is part of the profile's state and worth having in the case file,
+    and it documents the measurement above. On any failure the field is simply omitted.
+    """
+    try:
+        import json as _json
+        recs = None
+        if profile and os.path.isdir(os.path.join(profile, "IndexedDB")):
+            sys.path.insert(0, os.path.join(HERE, "scripts"))
+            import chromium_reader as _cr
+            recs = _cr.load_source(profile)["idb"].get("model-storage", {}).get("user-prefs", [])
+        elif origin:
+            import glob as _glob, sqlite3 as _sq
+            sys.path.insert(0, os.path.join(HERE, "scripts"))
+            from snappy_pure import uncompress as _unc
+            from idbutil import store_id as _sidf
+            import sclone as _sc
+            mm = _glob.glob(f"{origin}/idb/*meogdaerlo*.sqlite")
+            if not mm:
+                return None
+            con = _sq.connect(f"file:{mm[0]}?mode=ro&immutable=1", uri=True)
+            sid = _sidf(con, "user-prefs")
+            if sid is None:
+                return None
+            recs = []
+            for (row,) in con.execute("SELECT data FROM object_data WHERE object_store_id=?", (sid,)):
+                try:
+                    recs.append(_sc.loads(_unc(row)))
+                except Exception:
+                    continue
+        for r in recs or []:
+            if isinstance(r, dict) and str(r.get("key")) == "WARoutingInfo":
+                v = r.get("value")
+                if isinstance(v, str):
+                    v = _json.loads(v)
+                if isinstance(v, dict):
+                    er = v.get("edgeRouting")
+                    return er if isinstance(er, str) and er else None
+    except Exception as e:
+        log.debug("edge routing unavailable: %s", e)
+    return None
+
+
 def cmd_creds(a):
     from cryptography.hazmat.primitives.kdf.hkdf import HKDF
     from cryptography.hazmat.primitives import hashes
@@ -388,6 +455,9 @@ def cmd_creds(a):
     out = {"noise_priv": base64.b64encode(priv).decode(), "noise_pub": base64.b64encode(pub).decode(),
            "registrationId": int(regid) if regid is not None else None, "user": user, "device": int(dev),
            "me_id": f"{user}:{dev}@s.whatsapp.net", "lid": lid, "account": adv, "cert_chain": cert}
+    _er = _edge_routing(a.profile, a.origin)        # the ED= the real client puts on its socket url
+    if _er:
+        out["edge_routing"] = _er
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     json.dump(out, open(a.out, "w", encoding="utf-8"), indent=1)
     abs_out = os.path.abspath(a.out)
