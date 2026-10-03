@@ -838,16 +838,28 @@ def cmd_history(a):
                 "chat by chat, for messages older than the cache, re-anchoring deeper each pass until the "
                 "phone's retained history is drained. Own account / authorized use only; this can take many "
                 "minutes and repeated passes.")
-    log.warning("HOW THIS WORKS / WHAT TO EXPECT: the messages come from your PHONE, not from WhatsApp's "
-                "servers — the servers only relay the request. So this is NOT guaranteed to return anything: "
-                "the phone often answers partially, and sometimes answers nothing at all EVEN WHEN it is "
-                "online and connected. WhatsApp throttles these requests and the exact conditions under "
-                "which a phone declines are still being researched, so an empty result is a known outcome, "
-                "not necessarily a failure of this tool.")
-    log.warning("FOR THE BEST CHANCE: open WhatsApp on your phone and leave it on-screen, keep it on a "
-                "stable network, and close every web.whatsapp.com tab (a live web session competes with "
-                "this one for the same linked device). Progress is saved after every pass, so re-running "
-                "later simply continues deeper — an empty pass loses nothing.")
+    log.warning("HOW THIS WORKS: the messages come from your PHONE. The servers only relay the "
+                "request, so each chat costs one round trip to the phone and back. Measured on a "
+                "healthy device: the server acknowledges the request in about 0.3s and a chunk of up "
+                "to 50 messages arrives about 3s later.")
+    log.warning("WHY IT IS SLOW: WhatsApp rate-limits this, which is confirmed server-side "
+                "(wa_web_history_sync_dynamic_throttling). The limit counts FAILURES rather than "
+                "requests -- its counter resets on every success -- so roughly ten UNANSWERED "
+                "requests inside two hours puts the account quiet for two hours. This tool therefore "
+                "paces itself, doubles its delay each time an answer does not arrive, eases off again "
+                "once they do, and when it does hit the limit it waits the cooldown out and resumes "
+                "instead of giving up. None of that can be rushed: it is the server's rate, not ours.")
+    log.warning("SO EXPECT IT TO TAKE A WHILE. A first pass over a few hundred chats is typically "
+                "tens of minutes. Draining a long history runs for hours and will sit idle for two "
+                "hours at a time when the limit trips. Progress is checkpointed after every page, so "
+                "stopping it costs nothing and re-running simply continues deeper. An empty pass is a "
+                "known outcome, not a failure.")
+    log.warning("FOR THE BEST CHANCE: keep WhatsApp open on your phone with a stable network, and "
+                "CLOSE every web.whatsapp.com tab -- a live web session competes for the same linked "
+                "device. If a run comes back empty, do not immediately retry: that burns the failure "
+                "budget and extends the quiet window. Run tools/reconnect/diag_onehistory.js instead, "
+                "which sends ONE request and reports whether the server acknowledged it, so a throttle "
+                "is distinguishable from a refusal.")
     log.warning("SIDE EFFECT ON THE DEVICE: your phone's replies are end-to-end encrypted to a Signal "
                 "session, and the copy in the browser profile is a snapshot of a ratchet that keeps moving, "
                 "so this renegotiates that session and then keeps its own copy (signal_runtime.json, next "

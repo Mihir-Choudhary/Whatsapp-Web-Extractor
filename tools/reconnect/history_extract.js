@@ -223,6 +223,13 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   // so a late/duplicate notification can't resolve a different chat's page. Only matched notifications
   // are downloaded. The resolver is bound to its own promise, so a late completion after timeout is a no-op.
   const pending=new Map();          // requestId -> resolver
+  // We listen on BOTH messages.upsert and messaging-history.set because either can carry a chunk
+  // depending on the Baileys version. That means the SAME chunk routinely arrives twice: the first
+  // delivery resolves the request, the second finds no waiter. Without this set the second one looks
+  // exactly like a genuinely late arrival, and the salvage path then shouted "arrived after its
+  // request had timed out" on essentially every chat -- which would bury the real thing it exists to
+  // catch. Remembering what we resolved separates a duplicate from a late answer.
+  const resolved=new Set();
   let lastRequestId=null;           // fallback target when a reply's session id doesn't match (see resolveFor)
   // Never DISCARD a history blob we were sent. If the reply's peerDataRequestSessionId doesn't match a
   // pending id (id schemes can differ by WhatsApp/Baileys version), fall back to the outstanding request
@@ -230,14 +237,16 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   // "the phone never answered", which is exactly the failure that is hardest to diagnose.
   const resolveFor=(sid,what)=>{
     let r=sid!=null && pending.get(sid);
-    if(r){ pending.delete(sid); return r; }
+    if(r){ pending.delete(sid); if(sid!=null) resolved.add(sid); return r; }
+    if(sid!=null && resolved.has(sid)) return 'duplicate';   // the other listener, same chunk
     if(pending.size===1){ const [k,v]=pending.entries().next().value;
       console.error(`  [${what}] session id ${sid} did not match; attributing to the single outstanding request ${k}`);
       pending.delete(k); return v; }
     if(lastRequestId!=null && pending.has(lastRequestId)){ const v=pending.get(lastRequestId);
       console.error(`  [${what}] session id ${sid} did not match; attributing to the most recent request ${lastRequestId}`);
       pending.delete(lastRequestId); return v; }
-    console.error(`  [${what}] unmatched reply (session ${sid}) and no outstanding request -- ignored`);
+    console.error(`  [${what}] reply for session ${sid} has no outstanding request -- `
+      +`banking it rather than discarding it`);
     return null;
   };
   sock.ev.on('creds.update', ()=>{ if(ownDevice) ownDevice.saveCreds(); else rt.save(); });   // persist rotated prekeys / app-state ids
@@ -306,6 +315,7 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     try{ const blob=await fetchBlob(hn); const inf=decryptHistory(blob, Buffer.from(hn.mediaKey));
          msgs=flatten(B.proto.HistorySync.decode(inf)); }
     catch(e){ console.error('  blob err', e.message); }
+    if(r==='duplicate') continue;             // same chunk via the other listener; already banked
     if(!r){
       if(msgs&&msgs.length){
         let fresh=0; for(const mm of msgs){ if(!all.has(mm.id)) fresh++; all.set(mm.id,mm); }
@@ -326,6 +336,7 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     const sid=d.peerDataRequestSessionId; const r=resolveFor(sid,'messaging-history.set');
     // Same salvage as above: Baileys has already downloaded and decrypted this one itself, so a late
     // arrival costs nothing to keep and dropping it would lose recovered messages outright.
+    if(r==='duplicate') return;               // same chunk via the other listener; already banked
     if(!r){
       const late=(d.messages||[]).map(w=>({ chat:w.key&&w.key.remoteJid, id:w.key&&w.key.id,
         fromMe:!!(w.key&&w.key.fromMe), ts:Number(w.messageTimestamp)||0, text:txt(w.message),
@@ -502,18 +513,40 @@ function histNotif(message){ // dig through device/ephemeral wrappers
       // both the slow path and exactly the behaviour that makes a companion look broken.
       const FAIL_LIMIT=Number(process.env.FAIL_LIMIT||10), COOLDOWN=Number(process.env.COOLDOWN_SEC||7200);
       let failCount=0, firstFailSec=null, tripped=false;
+      // ADAPTIVE PACING. WhatsApp's limit counts FAILURES, not requests: its own failure record
+      // resets on every success, which is why this project once pulled 44,224 messages in a session
+      // and separately locked out after about ten unanswered requests. So pacing hard on successful
+      // requests would only make the tool slow; what needs to back off is the response to failure.
+      // `wa_web_history_sync_dynamic_throttling` is confirmed true on the server side, so the limit
+      // is adaptive rather than a fixed number, and a fixed delay is the wrong shape to meet it.
+      // Delay doubles on each failure and decays back toward the base on each success.
+      const BASE_DELAY=Number(process.env.CHAT_DELAY_MS||800);
+      const MAX_DELAY=Number(process.env.CHAT_DELAY_MAX_MS||30000);
+      let delay=BASE_DELAY;
       const noteFailure=()=>{ const now=Math.floor(Date.now()/1000);
         if(firstFailSec===null) firstFailSec=now;
+        delay=Math.min(MAX_DELAY, Math.max(BASE_DELAY, delay*2));
         if(++failCount>=FAIL_LIMIT && now-firstFailSec<COOLDOWN) tripped=true; };
-      const noteSuccess=()=>{ failCount=0; firstFailSec=null; };
+      const noteSuccess=()=>{ failCount=0; firstFailSec=null;
+        delay=Math.max(BASE_DELAY, Math.floor(delay/2)); };
+      // Progress, because a paced sweep of a few hundred chats is long enough that silence from the
+      // tool is indistinguishable from the tool being stuck.
+      const runStart=Date.now(); let served=0, silent=0;
+      const progress=(i,total)=>{
+        const el=(Date.now()-runStart)/1000, per=el/Math.max(1,i);
+        const left=Math.round(per*(total-i));
+        const eta=left>90 ? `${Math.round(left/60)}m` : `${left}s`;
+        console.error(`  [${i}/${total}] served=${served} silent=${silent} `
+          +`pace=${delay}ms elapsed=${Math.round(el)}s eta~${eta}`); };
       for(const a of targets){
         let key={remoteJid:a.chat,id:a.oldest_id,fromMe:!!a.oldest_fromMe}, ts=a.oldest_ts, got=0;
         for(let pg=0; pg<MAXPAGES; pg++){
           const msgs=await requestPage(key, ts);
           if(msgs===null){ console.error(`  ${a.chat.slice(0,22)} page${pg}: no response`);
-            if(pg===0){ probeSilent++; }
+            if(pg===0){ probeSilent++; silent++; }
             noteFailure();
             break; }
+          if(pg===0) served++;
           noteSuccess();
           if(!msgs.length){ console.error(`  ${a.chat.slice(0,22)} page${pg}: empty (start reached)`); break; }
           for(const m of msgs) all.set(m.id,m);
@@ -547,7 +580,8 @@ function histNotif(message){ // dig through device/ephemeral wrappers
             +`and only a REGISTERED failure means the linked device is gone.`);
           break;
         }
-        await sleep(Number(process.env.CHAT_DELAY_MS||400));   // be a polite client between chats
+        if(probed%10===0 || probed===targets.length) progress(probed, targets.length);
+        await sleep(delay);                      // adaptive: see noteFailure/noteSuccess above
       }
       // Exit 7 means "stopped by the cooldown breaker, not finished". The caller can then wait out
       // WhatsApp's cooldown and resume from the checkpoint rather than treating the pass as a failure;
