@@ -29,6 +29,13 @@ creds_in.json*
 anchors.json
 notifs.json
 history_*.json
+# Any file holding RECOVERED MESSAGES is evidence, whatever it is called. The list above names
+# outputs one by one, so each new diagnostic that writes recovered data needs a new line and the
+# next one gets forgotten -- onehistory_recovered.json was committable for exactly that reason.
+# Match on the naming instead of the filename.
+*recovered*.json
+*_recovered.json
+onehistory_recovered.json
 
 # Akhil Dara's WAInsight is a SEPARATE MIT repo — do NOT bundle it
 WAInsight/
