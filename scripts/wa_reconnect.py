@@ -287,7 +287,7 @@ def fetch_version():
 import audit                                    # appends to the case DB from --audit (no-op otherwise)
 A = audit.NoAudit()                             # replaced in main()
 
-def run(creds, out_path, timeout=30, log=lambda *a: None):
+def run(creds, out_path, timeout=30, log=lambda *a: None, print_key=False):
     import websocket   # websocket-client; imported here so import errors are actionable
     noise_priv = base64.b64decode(creds["noise_priv"])
     noise_pub  = base64.b64decode(creds["noise_pub"])
@@ -397,7 +397,13 @@ def run(creds, out_path, timeout=30, log=lambda *a: None):
         if captured:
             with open(out_path, "w") as f: f.write(captured)
             A.artifact(out_path, kind="companion_enc_static (at-rest key captured from the server)")
-            print(captured)                                    # stdout = just the key (scriptable)
+            # The key is NOT printed by default. It used to go to stdout unconditionally as a
+            # scripting contract ("stdout = just the key"), which meant the one secret the browser
+            # never writes to disk landed in the terminal, in scrollback and in anything capturing
+            # output -- and wawf does not need it, because it reads the key back from the file above.
+            # --print-key restores the old behaviour for anyone who was piping it.
+            if print_key:
+                print(captured)
             print("[+] companion_enc_static -> %s" % os.path.abspath(out_path), file=sys.stderr)
             return 0
         print("[!] connected but no companion_enc_static seen (timeout/closed)", file=sys.stderr)
@@ -412,6 +418,10 @@ def main():
     ap.add_argument("--creds", default="creds_in.json", help="creds_in.json from `wawf creds` (default: ./creds_in.json)")
     ap.add_argument("--out", default="companion_enc_static.txt", help="write the captured key here")
     ap.add_argument("--timeout", type=int, default=30)
+    ap.add_argument("--print-key", action="store_true",
+                    help="also write the captured key to stdout. Off by default: the key is the one "
+                         "secret the browser never stores, and stdout ends up in scrollback and logs. "
+                         "The key is always written to --out regardless.")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
     global A
@@ -428,7 +438,7 @@ def main():
         print("[!] the 'websocket-client' package is required (pip install websocket-client)", file=sys.stderr)
         A.end_run(6, status="error", error=RuntimeError("websocket-client not installed")); return 6
     try:
-        rc = run(creds, a.out, a.timeout, log)
+        rc = run(creds, a.out, a.timeout, log, print_key=a.print_key)
     except Exception as e:
         import traceback as _tb
         A.end_run(1, status="error", error=e, tb=_tb.format_exc()); raise
