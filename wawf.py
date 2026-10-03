@@ -28,7 +28,7 @@ Examples:
   wawf <PROFILE> --key companion_enc_static.txt --out json:D:\\case --audit
 """
 from __future__ import annotations
-import argparse, sys, os, json, base64, logging, collections, datetime as dt, subprocess, time
+import argparse, sys, os, re, json, base64, logging, collections, datetime as dt, subprocess, time
 
 HERE = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))  # _MEIPASS when frozen (.exe)
 sys.path.insert(0, os.path.join(HERE, "scripts")); sys.path.insert(0, HERE)
@@ -126,7 +126,7 @@ def _example_profile():
         return os.path.join(home, "Library", "Application Support", "Google", "Chrome", "Default")
     return os.path.join(home, ".config", "google-chrome", "Default")
 
-_OUT_FORMATS = ("txt", "json", "sqlite", "db")
+_OUT_FORMATS = ("txt", "json", "sqlite", "db", "raw")
 
 def _parse_out(spec):
     """'--out FORMAT:PATH' -> (format, path); a bare path -> (None, path) meaning 'all text formats'.
@@ -256,6 +256,8 @@ def cmd_run(a):
         for fmt, path in outs:
             if fmt == "sqlite":
                 rc = cmd_sqlite(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=k, out=path))
+            elif fmt == "raw":
+                rc = cmd_raw(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=k, out=path))
             else:
                 rc = cmd_decrypt(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=k,
                                                     out=path, only=fmt))
@@ -284,6 +286,8 @@ def cmd_run(a):
     for fmt, path in outs:
         if fmt == "sqlite":
             rc = cmd_sqlite(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=key, out=path))
+        elif fmt == "raw":
+            rc = cmd_raw(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=key, out=path))
         else:
             rc = cmd_decrypt(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=key,
                                                 out=path, only=fmt))
@@ -351,6 +355,222 @@ def _find_key(a, workdir, outs):
                          "run can stay OFFLINE", os.path.abspath(cand))
                 return k
     return None
+
+
+def _pb_tree(buf, depth=0):
+    """Decode a protobuf into a field tree WITHOUT a schema.
+
+    The decrypted payload is protobuf: field 1 holds the Message, whose field 1 is `conversation`,
+    the text. Keeping it as a tree of (field number, wire type, value) preserves everything the
+    bytes say while needing none of WhatsApp's .proto definitions -- so it cannot silently go stale
+    when they add a field, and an examiner can see which field a string actually came from instead
+    of trusting that it was the message body.
+    """
+    out, i, n = [], 0, len(buf)
+
+    def varint(j):
+        v, sh = 0, 0
+        while j < n:
+            b = buf[j]; j += 1
+            v |= (b & 0x7F) << sh; sh += 7
+            if not b & 0x80:
+                break
+        return v, j
+
+    while i < n:
+        try:
+            tag, i = varint(i)
+            fnum, wt = tag >> 3, tag & 7
+            if fnum == 0:
+                break
+            if wt == 0:
+                v, i = varint(i); out.append({"field": fnum, "type": "varint", "value": v})
+            elif wt == 5:
+                out.append({"field": fnum, "type": "fixed32", "value": buf[i:i + 4].hex()}); i += 4
+            elif wt == 1:
+                out.append({"field": fnum, "type": "fixed64", "value": buf[i:i + 8].hex()}); i += 8
+            elif wt == 2:
+                ln, i = varint(i)
+                seg = buf[i:i + ln]; i += ln
+                try:
+                    t = seg.decode("utf-8")
+                    if t and all(c.isprintable() or c in "\n\r\t" for c in t):
+                        out.append({"field": fnum, "type": "string", "value": t}); continue
+                except UnicodeDecodeError:
+                    pass
+                sub = _pb_tree(seg, depth + 1) if (seg and depth < 6) else None
+                if sub:
+                    out.append({"field": fnum, "type": "message", "value": sub})
+                else:
+                    out.append({"field": fnum, "type": "bytes", "b64": base64.b64encode(seg).decode()})
+            else:
+                break
+        except Exception:
+            break
+    return out
+
+
+def _jsonable(o, depth=0):
+    """Make a structured-clone record JSON-serialisable WITHOUT reshaping it.
+
+    Field names, ordering and the literal "<Undefined>" markers are all left exactly as the browser
+    stored them -- that fidelity is the entire point of this format. Only things JSON cannot express
+    are converted: bytes become {"__bytes__": <base64>, "len": n} so they stay verifiable, and an
+    object that is neither of those is rendered as its repr rather than dropped.
+    """
+    from idbutil import as_bytes as _ab
+    if o is None or isinstance(o, (bool, int, float, str)):
+        return o
+    if isinstance(o, (bytes, bytearray, memoryview)):
+        b = bytes(o)
+        return {"__bytes__": base64.b64encode(b).decode(), "len": len(b)}
+    if isinstance(o, dict):
+        return {str(k): _jsonable(v, depth + 1) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_jsonable(v, depth + 1) for v in o]
+    b = None
+    try:
+        b = _ab(o)
+    except Exception:
+        b = None
+    if b:
+        return {"__bytes__": base64.b64encode(bytes(b)).decode(), "len": len(bytes(b))}
+    return {"__repr__": repr(o)[:400]}
+
+
+# Stores holding key material rather than evidence. A raw dump is meant to travel with a case, and
+# these would turn it into a copy of the account's Signal keys and the at-rest root key.
+_RAW_SKIP_DBS = ("signal-storage", "wawc_db_enc")
+
+
+def cmd_raw(a):
+    """--out raw:DIR -- decrypt, and change NOTHING else.
+
+    Every other output reshapes: the text writer scrapes strings out of the decrypted protobuf with a
+    heuristic walker, dedupes them and truncates at 2000 characters, so field identity and every
+    non-string field are lost. This one emits each record as the browser stored it -- a JavaScript
+    object, same field names, same "<Undefined>" markers, nothing renamed or dropped -- and ADDS the
+    decrypted payload beside the original rather than in place of it:
+
+        _wawf_plaintext_b64     the decrypted bytes verbatim, so the decryption can be re-checked
+        _wawf_plaintext_fields  the same bytes as a schema-free protobuf field tree
+
+    The encrypted msgRowOpaqueData stays exactly where it was, so the file remains a faithful image of
+    the store plus a decryption, and never a substitute for it. One JSONL file per object store.
+    """
+    _require_source(a, "raw")
+    key = None
+    if a.enc_static:
+        import wa_decrypt as WD
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    if a.profile and os.path.isdir(os.path.join(a.profile, "IndexedDB")):
+        sys.path.insert(0, os.path.join(HERE, "scripts"))
+        import chromium_reader as cr
+        idb = cr.load_source(a.profile)["idb"]
+        ls = cr.load_source(a.profile)["localStorage"]
+    else:
+        log.error("raw output currently supports Chromium profiles only (the Firefox reader returns "
+                  "one store at a time); use --out json:DIR for Firefox.")
+        return 2
+
+    root = None
+    ck = idb.get("wawc_db_enc", {}).get("keys", [])
+    if ck and isinstance(ck[0], dict) and hasattr(ck[0].get("key"), "key_data"):
+        root = ck[0]["key"].key_data
+
+    cipher_key = None
+    if a.enc_static and root and ls.get("WAWebEncKeySalt"):
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+        from cryptography.hazmat.primitives import hashes
+        cipher_key = HKDF(algorithm=hashes.SHA256(), length=16,
+                          salt=base64.b64decode(a.enc_static),
+                          info=base64.b64decode(json.loads(ls["WAWebEncKeySalt"]))).derive(root)
+    if cipher_key is None:
+        log.warning("no at-rest key available: the raw dump will carry the records as stored, with "
+                    "msgRowOpaqueData still encrypted.")
+
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from idbutil import as_bytes as ab
+
+    def decrypt(op):
+        """(plaintext, reason) -- reason is None on success, else why it was not decrypted."""
+        if cipher_key is None:
+            return None, "no key available"
+        data, iv = ab(op.get("_data")), ab(op.get("iv"))
+        if not data or not iv:
+            return None, "no _data/iv on the record"
+        if op.get("_scheme") != 1:
+            return None, f"scheme {op.get('_scheme')} (this key derives scheme 1 only)"
+        try:
+            pt = Cipher(algorithms.AES(cipher_key), modes.CBC(bytes(iv))).decryptor().update(bytes(data))
+        except Exception as e:
+            return None, f"cipher error: {e}"
+        if not pt or not (1 <= pt[-1] <= 16) or pt[-pt[-1]:] != bytes([pt[-1]]) * pt[-1]:
+            return None, "padding check failed (wrong key for this record)"
+        return pt[:-pt[-1]], None
+
+    os.makedirs(a.out, exist_ok=True)
+    totals = {"stores": 0, "records": 0, "encrypted": 0, "decrypted": 0}
+    skipped = collections.Counter()      # encrypted bodies we could NOT decrypt, by reason
+    excluded = {}                        # whole stores deliberately not dumped, by database
+    manifest = []
+    for db in sorted(idb):
+        if db in _RAW_SKIP_DBS and not getattr(a, "raw_include_keys", False):
+            excluded[db] = sum(len(v) for v in idb[db].values())
+            continue
+        for st in sorted(idb[db]):
+            recs = idb[db][st]
+            if not recs:
+                continue
+            safe = re.sub(r"[^A-Za-z0-9._-]", "_", f"{db}__{st}")
+            path = os.path.join(a.out, safe + ".jsonl")
+            n = enc = dec = 0
+            with open(path, "w", encoding="utf-8") as f:
+                for r in recs:
+                    rec = _jsonable(r)
+                    if isinstance(r, dict) and isinstance(r.get("msgRowOpaqueData"), dict):
+                        enc += 1
+                        pt, why = decrypt(r["msgRowOpaqueData"])
+                        if pt is not None:
+                            dec += 1
+                            rec["_wawf_plaintext_b64"] = base64.b64encode(pt).decode()
+                            rec["_wawf_plaintext_fields"] = _pb_tree(pt)
+                        else:
+                            rec["_wawf_plaintext_error"] = why
+                            skipped[why] += 1
+                    f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+                    n += 1
+            totals["stores"] += 1; totals["records"] += n
+            totals["encrypted"] += enc; totals["decrypted"] += dec
+            manifest.append({"database": db, "store": st, "file": safe + ".jsonl",
+                             "records": n, "encrypted": enc, "decrypted": dec})
+            AUDIT.artifact(path, kind=f"raw store dump ({db}/{st})", records=n)
+    json.dump({"format": "wawf-raw/1", "generated": dt.datetime.now(dt.timezone.utc).isoformat(),
+               "profile": os.path.abspath(a.profile) if a.profile else None,
+               "decryption": "AES-CBC-128, HKDF(root, salt=companion_enc_static, info=WAWebEncKeySalt)",
+               "note": "records are verbatim as stored; _wawf_plaintext_* fields are ADDED, "
+                       "msgRowOpaqueData is left untouched",
+               "totals": totals, "not_decrypted": dict(skipped),
+               "excluded_databases": {"reason": "holds key material, not evidence; pass "
+                                                "--raw-include-keys to override",
+                                      "records_not_dumped": excluded},
+               "stores": manifest},
+              open(os.path.join(a.out, "_manifest.json"), "w", encoding="utf-8"), indent=1)
+    log.info("raw: %d store(s), %d record(s) -> %s", totals["stores"], totals["records"],
+             os.path.abspath(a.out))
+    log.info("raw: %d record(s) carried an encrypted body, %d decrypted%s",
+             totals["encrypted"], totals["decrypted"],
+             "" if totals["encrypted"] == totals["decrypted"]
+             else f" ({totals['encrypted'] - totals['decrypted']} not -- see _manifest.json)")
+    for why, cnt in skipped.most_common():
+        log.info("raw:   %d not decrypted: %s", cnt, why)
+    if excluded:
+        log.info("raw: excluded %d record(s) in %s -- key material, not evidence",
+                 sum(excluded.values()), ", ".join(sorted(excluded)))
+    return 0
 
 
 def cmd_decrypt(a):
