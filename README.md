@@ -13,14 +13,21 @@ from the profile.
 Download **`wawf-windows-x64.exe`** from the [latest release](../../releases/latest), then run it from a terminal:
 
 ```powershell
-wawf-windows-x64.exe <command> [options]
+wawf-windows-x64.exe <PROFILE> [options]
 ```
+
+The binary is unsigned. On a machine with **Smart App Control** enabled, Windows may refuse to run it
+with *"An Application Control policy has blocked this file"*. That block is reputation-based rather
+than signature-based — it applies to a binary Windows has not seen before, and can clear by itself
+after a while. Smart App Control **cannot be re-enabled once turned off**, so disabling it is a
+one-way decision about the whole machine, not a workaround; running from Python instead avoids the
+question entirely. See [BUILD.md](BUILD.md).
 
 ### Linux / macOS — run with Python
 
 ```bash
 pip install -r requirements.txt          # cryptography, cramjam, websocket-client, ccl_chromium_reader
-python3 wawf.py <command> [options]
+python3 wawf.py <PROFILE> [options]
 ```
 
 <sub>(or install them by hand: `pip install cryptography cramjam websocket-client` and
@@ -45,15 +52,40 @@ full, copy-pasteable paths.
 
 ### Choosing the output — `--out [FORMAT:]PATH`
 
-Repeatable. `FORMAT` is `txt`, `json` or `sqlite`/`db`; a plain path writes text **and** JSON:
+Repeatable. `FORMAT` is `txt`, `json`, `sqlite`/`db` or `raw`; a plain path writes text **and** JSON:
 
 ```bash
 wawf <PROFILE> --out D:\case\out              # transcripts.txt AND chats.json
 wawf <PROFILE> --out txt:D:\case\out          # only transcripts.txt
 wawf <PROFILE> --out json:D:\case\out         # only chats.json
 wawf <PROFILE> --out sqlite:D:\case\db        # Android msgstore.db + wa.db
-wawf <PROFILE> --out sqlite:D:\case\db --out txt:D:\case\out    # several at once
+wawf <PROFILE> --out raw:D:\case\raw          # every store verbatim, decrypted in place
+wawf <PROFILE> --out sqlite:D:\case\db --out raw:D:\case\raw    # several at once
 ```
+
+#### `raw` — decrypt, and change nothing else
+
+The other formats summarise. The text writer runs the decrypted payload through a heuristic string
+scraper, which drops field identity, every non-string field and anything past 2000 characters.
+
+`raw` writes one JSONL file per object store — typically **48 stores and ~70,000 records** — with each
+record exactly as the browser stored it: same field names, same ordering, JavaScript `undefined`
+preserved as a distinct marker (it is not the same as `null`). The decryption is **added beside** the
+ciphertext rather than replacing it, so the file stays a faithful image of the store *plus* a
+decryption:
+
+| added field | what it holds |
+|---|---|
+| `_wawf_plaintext_b64` | the decrypted bytes verbatim, so the decryption can be re-verified independently |
+| `_wawf_plaintext_fields` | the same bytes as a schema-free protobuf field tree, so you can see *which* field a string came from |
+
+A `_manifest.json` records per-store counts, the derivation used, and what every marker means. The key
+is validated against 40 reference bodies before anything is written, so a wrong or stale key produces
+a clear refusal instead of a complete-looking dump with nothing decrypted in it.
+
+`signal-storage` and `wawc_db_enc` are **excluded by default** — they hold the account's Signal
+sessions, prekeys and the at-rest root key, and a dump meant to travel with a case should not be key
+material. `--raw-include-keys` overrides that.
 
 A Windows drive letter is never mistaken for a `FORMAT`, so `D:\case\out` works as you'd expect.
 
@@ -61,9 +93,10 @@ A Windows drive letter is never mistaken for a `FORMAT`, so `D:\case\out` works 
 
 | Option | What it does |
 |---|---|
-| `--enc-static B64` | You already have the at-rest key — use it and skip the networked reconnect. |
+| `--key FILE` | A `companion_enc_static.txt` captured earlier — decrypt without touching the network. Usually unnecessary: a copy left beside the output is found automatically. A **file**, never the key itself, so no secret reaches your shell history, process list or command auditing. |
 | `--origin DIR` | Firefox `web.whatsapp.com` storage folder instead of a profile folder. |
-| `--history` | *Instead of decrypting:* pull chat history older than the browser cache from your phone, iteratively, resuming across runs. Needs Node (offers to install it); phone-side and rate-limited. |
+| `--raw-include-keys` | With `--out raw:` — also dump `signal-storage` and `wawc_db_enc`. Those are key material; a dump including them must not travel with a case. |
+| `--history` | *Instead of decrypting:* pull chat history older than the browser cache from your phone, iteratively, resuming across runs. Needs Node (offers to install it). Phone-side and rate-limited — see below. |
 | `--memory (--live \| --memimage FILE)` | *Instead of reconnecting:* find the key in RAM / swap / hibernation. `--live` is Linux-only (reads `/proc`, needs root); `--memimage` works anywhere. |
 | `--audit` | Write a chain-of-custody database beside the output (see below). |
 | `-v`, `--log-file FILE` | Full logs and tracebacks; mirror them to a file. |
@@ -74,13 +107,13 @@ Add `--audit` to any command and the tool records everything it did into a SQLit
 into the output directory (one DB per case — never a single global log):
 
 ```bash
-wawf decrypt <profile> --enc-static <b64> --out out/ --audit     # -> out/wawf_audit.db
-wawf sqlite  <profile> --enc-static <b64> --out db/  --audit     # appends to db/wawf_audit.db
-wawf decrypt <profile> --audit /cases/acme/custody.db            # or name the DB yourself
+wawf <PROFILE> --out out/ --audit                       # -> out/wawf_audit.db
+wawf <PROFILE> --out sqlite:db/ --audit                # appends to db/wawf_audit.db
+wawf <PROFILE> --out out/ --audit-db /cases/acme/custody.db     # or name the DB yourself
 ```
 
-Re-running **appends** a new `run` row, so a whole workflow (`creds` → `reconnect` → `decrypt` → `sqlite`)
-accumulates in one case history. Helper subprocesses and the Node history client write into the *same* DB.
+Re-running **appends** a new `run` row, so repeated passes over the same case — a decrypt, then a
+`--history` sweep, then another output format — accumulate in one case history. Helper subprocesses and the Node history client write into the *same* DB.
 
 | Table | What it records |
 |---|---|
@@ -102,63 +135,70 @@ source, info, lengths, scheme) — enough to prove which key produced which plai
 hold, without turning the audit log into a secret store. Pass `--audit-secrets` if your process genuinely
 requires the raw values. Message *content* is not duplicated into the DB; artifacts are referenced by hash.
 
-## Workflow
+## Where the key comes from
 
-Message **text** needs the `companion_enc_static` key (`--enc-static`), and that key is **never stored on
-disk** — so the flow is always: *get the key, then decrypt.* `memory` and `reconnect` **produce** the key;
-`decrypt` and `sqlite` **consume** it. Pick the path that matches your acquisition:
+Message **text** is encrypted with a key derived from `companion_enc_static`, and that value is issued
+by WhatsApp's servers and **never written to disk** by the browser. Two of the three inputs to the key
+are in the profile; this one is not. So the question is always *where does the key come from* — and in
+normal use you do not have to answer it, because `wawf <PROFILE>` captures it for you.
 
-**A. You have memory** (live machine, RAM dump, swap, or hibernation file):
-
-```bash
-wawf memory --live                                  # Linux + root; on Windows/macOS use --memimage instead:
-# wawf memory --memimage dump.raw --origin <web.whatsapp.com dir>
-# -> prints companion_enc_static, then:
-wawf decrypt <profile> --enc-static <b64> --out out/
-```
-
-**B. Disk only, but you can reach the network** (your own account / authorized investigation):
+**A. Default — let it capture the key.** One command does credentials, key capture and decryption:
 
 ```bash
-wawf reconnect <profile>                             # logs back in, writes companion_enc_static.txt
-#   ^ networked: logs in as your linked device, registers activity — own account only
-wawf decrypt <profile> --enc-static "$(cat companion_enc_static.txt)" --out out/
+wawf <PROFILE> --out D:\case\out
 ```
 
-`reconnect` does the WhatsApp Noise handshake in **pure Python** — no Node required, and it runs from the
-standalone `.exe`. (A Node/Baileys client under `tools/reconnect/` performs the same capture *plus* on-demand
-history sync beyond the browser cache; it needs `npm install` and lives only in the source tree, not the `.exe`.)
+The key capture is **networked**: it logs in as your linked device and registers activity on the
+account. Own account or authorised investigation only. The captured key is written as
+`companion_enc_static.txt` beside the output, and a later run finds it there and skips the network.
 
-**C. Disk only, no key** (never touch the account):
+**B. Decrypt offline with a key you already hold.** Useful when you must not contact the account at
+all, and it keeps working after the device has been revoked, because decryption is purely local:
 
 ```bash
-wawf decrypt <profile>          # offline inventory only: metadata + media keys, NO message text
+wawf <PROFILE> --key companion_enc_static.txt --out D:\case\out
 ```
 
-Once you have the key, you can also export a full database instead of transcripts:
+**C. Take the key from memory** instead of the network — RAM dump, swap, or hibernation file:
 
 ```bash
-wawf sqlite <profile> --enc-static <b64> --out db/                        # Chromium: Chrome/Edge/Brave profile dir
-wawf sqlite --origin <web.whatsapp.com dir> --enc-static <b64> --out db/   # Firefox: origin storage dir (+ cached Media/)
+wawf <PROFILE> --memimage dump.raw --out D:\case\out     # any OS
+wawf <PROFILE> --memory --out D:\case\out                # this machine's live browser (Linux, root)
 ```
 
-`memory` is the offline route to the key; `reconnect` is the networked route. `creds` just recovers the
-reconnect credentials (it's implied by `reconnect`, or use it to feed the Node history client).
+**D. No key at all.** Still useful: metadata, contacts, timestamps, media keys — everything except
+message text.
 
-**Recovering history older than the cache.** A browser only ever holds the recent window WhatsApp
-synced to it (e.g. tens of thousands of messages) — *not* your whole history. `wawf history <profile>`
+```bash
+wawf <PROFILE> --out D:\case\out
+#   ^ if key capture fails, it says so and writes the offline inventory
+```
+
+The key capture does the WhatsApp Noise handshake in **pure Python**, so it works from the standalone
+binary with no Node required. The key is never printed and never passed to a subprocess on the command
+line — it travels by file and by environment variable, because a secret in argv is readable from the
+process list.
+
+A wrong or stale key is **detected, not acted on**: every writer trial-decrypts reference ciphertext
+first and refuses rather than producing garbage. If the key was one the tool found by itself, it
+discards it and captures a fresh one; if you named it with `--key`, it reports the problem and stops
+rather than silently reaching for the network.
+
+## Recovering history older than the cache
+
+A browser only ever holds the recent window WhatsApp synced to it (e.g. tens of thousands of messages) — *not* your whole history. `wawf <PROFILE> --history`
 logs back in and asks your phone, per chat, for messages **older** than what's on disk, paging backward
 toward each chat's start:
 
 ```bash
-wawf history <profile>                               # every chat, busiest first; needs Node + tools/reconnect
+wawf <PROFILE> --history                             # every chat, busiest first; needs Node + tools/reconnect
 ```
 
 It runs **iteratively**: each pass re-anchors every chat on the oldest message recovered so far and pulls
 deeper, accumulating (deduped) until a pass stops finding meaningfully more. Progress is checkpointed to
 `tools/reconnect/history_all.json` after every pass, so it is **crash-safe and resumable** — re-running
-`wawf history` continues from where the last run left off (older than everything already recovered) rather
-than re-pulling the same window.
+`wawf <PROFILE> --history` continues from where the last run left off (older than everything already
+recovered) rather than re-pulling the same window.
 
 **What has to be recovered for this to work.** The phone's answer comes back as a normal end-to-end
 encrypted message, so authenticating as the linked device is not enough — the Signal state has to come
@@ -177,20 +217,64 @@ from the live ratchet instead of the stale snapshot. That file is key material �
 credentials. Your browser's own stored session for this linked device goes stale as a result; WhatsApp
 Web re-establishes it by itself the next time you open it. The profile and the phone are not modified.
 
-There is **no fixed 50K ceiling** — the limit is what your phone still retains. On-demand serving is
-**phone-side and rate-limited**: your phone must be online/active and WhatsApp throttles it, so a pass may
-return little while a later run (when the phone is more responsive) returns more — just run it again. It
-needs Node + `cd tools/reconnect && npm install` (the Signal/E2E stack isn't ported to Python, so `history`
-is **not** in the `.exe`).
+There is **no fixed 50K ceiling** — the limit is what your phone still retains.
+
+**How the rate limit works, and why you should not just retry.** WhatsApp throttles this, which the
+server confirms (`wa_web_history_sync_dynamic_throttling`). The limit counts **failures, not
+requests** — its counter resets on every success — so roughly ten *unanswered* requests inside two
+hours puts the account quiet for two hours. The tool therefore paces itself: the delay doubles on each
+unanswered request and eases back on each answered one, and when it does hit the limit it waits the
+cooldown out and resumes from its checkpoint instead of giving up.
+
+So **an empty pass is not a reason to run it again immediately** — that spends the failure budget and
+extends the quiet window. Diagnose instead:
+
+```bash
+node tools/reconnect/diag_onehistory.js      # ONE request, every inbound stanza logged
+```
+
+It separates causes that otherwise look identical: no ack means the stanza was never accepted (not a
+cooldown), an explicit error means refused with a readable reason, an ack then silence means throttled
+or declined by the phone, and an ack then a notification means served.
+
+**What to expect.** On a healthy device the server acks in ~0.3s and a chunk of up to 50 messages
+arrives ~3s later. A first pass over a few hundred chats takes tens of minutes; draining a long
+history runs for hours and will sit idle for two hours at a time when the limit trips. Progress is
+checkpointed after every page, so stopping it costs nothing.
+
+Needs Node + `cd tools/reconnect && npm install` — the Signal/E2E stack isn't ported to Python, so
+`--history` is **not** in the standalone binary.
+
+### Other diagnostics
+
+```bash
+node tools/reconnect/diag_health.js    # 60s: CONNECT / REGISTERED / SERVED, reported separately
+node tools/reconnect/diag_abprops.js   # which features the server has enabled for this client
+python3 scripts/check_identity.py --profile <PROFILE> --dir tools/reconnect
+```
+
+`diag_health` matters because a **revoked** companion still completes the handshake and still reaches
+"connected" — so connecting proves nothing. Its registration check is a USync device query against the
+account, which is definitive rather than inferred from silence. Only a `REGISTERED` failure means the
+device is gone.
+
+`check_identity` answers a different question: when WhatsApp Web re-pairs, the account gets a new
+device slot, registration id and Signal identity, and credentials exported before that describe a
+device that no longer exists. `wawf <PROFILE>` re-exports every run and so self-heals; the `diag_*.js`
+tools read whatever is on disk, so check first if you have been using them.
 
 **Examples** (Windows: swap `python3 wawf.py` for `wawf-windows-x64.exe`)
 
 ```bash
-# Decrypt WhatsApp Web chats (needs companion_enc_static, from `memory` or a reconnect)
-python3 wawf.py decrypt ~/.config/google-chrome/Default --enc-static <b64> --out out/ -v
+# The whole job: recover credentials, capture the at-rest key, decrypt
+python3 wawf.py ~/.config/google-chrome/Default --out out/ -v
 
 # Firefox: point straight at the origin dir instead of a profile
-python3 wawf.py decrypt --origin .../storage/default/https+++web.whatsapp.com --enc-static <b64>
+python3 wawf.py --origin .../storage/default/https+++web.whatsapp.com --out out/
+
+# Offline, with a key captured earlier, and a faithful dump plus a database
+python3 wawf.py ~/.config/google-chrome/Default --key companion_enc_static.txt \
+    --out raw:case/raw --out sqlite:case/db --audit
 ```
 
 `<profile>` is a browser profile directory:
@@ -199,5 +283,13 @@ python3 wawf.py decrypt --origin .../storage/default/https+++web.whatsapp.com --
 - **Chromium** — `~/.config/google-chrome/Default`, `~/.config/microsoft-edge/Default`, etc.
   (Windows: `%LOCALAPPDATA%\Google\Chrome\User Data\Default`)
 
-`decrypt` validates the key against on-disk ciphertext and refuses to write garbage if it's wrong.
+Every writer validates the key against on-disk ciphertext and refuses to write garbage if it is wrong.
 Exit codes: `0` ok · `1` error · `2` bad usage · `3` wrong key · `4` file not found.
+
+**Media.** Message media is recovered from the browser's own cache (Chromium simple-cache and
+blockfile, Firefox CacheStorage and `cache2` — all four layouts verified byte-identical) and verified
+against each message's `fileSha256`. Anything the browser never cached, or has since evicted, is not
+on disk: those `mediaKey`s *are* exported in `message_media`, and `scripts/mediafetch.py --cdn` will
+try the CDN. Note that a CDN url carries its own expiry — once it lapses every request is `403`, and
+WhatsApp purges the object itself well before that, after which it returns `410` and the bytes are
+gone server-side.
