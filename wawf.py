@@ -25,7 +25,7 @@ Two alternative actions replace the default job:
 Examples:
   wawf "C:\\Users\\<you>\\AppData\\Local\\Microsoft\\Edge\\User Data\\Default"
   wawf <PROFILE> --out sqlite:D:\\case\\db --out txt:D:\\case\\out
-  wawf <PROFILE> --enc-static <b64> --out json:D:\\case --audit
+  wawf <PROFILE> --key companion_enc_static.txt --out json:D:\\case --audit
 """
 from __future__ import annotations
 import argparse, sys, os, json, base64, logging, collections, datetime as dt, subprocess, time
@@ -228,19 +228,57 @@ def cmd_run(a):
     if cmd_creds(argparse.Namespace(profile=a.profile, origin=a.origin, out=creds_path, _internal=True)):
         return 3
 
-    key = a.enc_static
-    if key:
-        log.info("[2/3] using the companion_enc_static given with --enc-static (no reconnect needed)")
-    else:
-        log.info("[2/3] reconnecting as the linked device to capture companion_enc_static (NETWORKED) ...")
-        keyfile = os.path.join(workdir, "companion_enc_static.txt")
+    key = _find_key(a, workdir, outs)
+    if not key:
+        log.info("[2/3] reconnecting as the linked device to capture the at-rest key (NETWORKED) ...")
+        keyfile = os.path.join(workdir, KEY_FILENAME)
         rc = cmd_reconnect(argparse.Namespace(profile=a.profile, origin=a.origin, creds=creds_path,
                                               out=keyfile, verbose=a.verbose))
         if rc:
             log.error("could not capture the at-rest key, so there is nothing to decrypt with. "
-                      "Supply one with --enc-static, or recover it from memory with --memory.")
+                      "Point --key at a companion_enc_static.txt captured earlier, or recover the key from "
+                      "memory with --memory.")
             return rc
-        key = open(keyfile, encoding="utf-8").read().strip()
+        key = _read_key_file(keyfile)
+        if not key:
+            return 3
+
+    # An auto-detected key can be STALE, and silently trusting it is the exact mistake that cost this
+    # project days with creds_in.json: the at-rest key changes when the browser re-pairs, just as the
+    # Signal identity does, so a companion_enc_static.txt left over from a previous device decrypts
+    # nothing. Measured on this very profile after a re-pair: 0 of 60 reference messages validated.
+    # cmd_decrypt already refuses a wrong key rather than writing garbage (it returns 3), so when the
+    # key was one we GUESSED at, treat that as "guess was wrong" and go capture a real one. An
+    # explicit --key is different: the user named that file, so a failure is reported, not papered over.
+    guessed = key is not None and not getattr(a, "key", None)
+
+    def _decrypt_all(k):
+        for fmt, path in outs:
+            if fmt == "sqlite":
+                rc = cmd_sqlite(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=k, out=path))
+            else:
+                rc = cmd_decrypt(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=k,
+                                                    out=path, only=fmt))
+            if rc:
+                return rc
+        return 0
+
+    if guessed:
+        log.info("[3/3] decrypting to %d output(s) ...", len(outs))
+        rc = _decrypt_all(key)
+        if rc != 3:
+            return rc
+        log.warning("that key does not match this profile -- it is almost certainly left over from "
+                    "before the browser last re-paired. Discarding it and capturing a fresh one.")
+        keyfile = os.path.join(workdir, KEY_FILENAME)
+        rc = cmd_reconnect(argparse.Namespace(profile=a.profile, origin=a.origin, creds=creds_path,
+                                              out=keyfile, verbose=a.verbose))
+        if rc:
+            log.error("could not capture a fresh at-rest key, so there is nothing to decrypt with.")
+            return rc
+        key = _read_key_file(keyfile)
+        if not key:
+            return 3
 
     log.info("[3/3] decrypting to %d output(s) ...", len(outs))
     for fmt, path in outs:
@@ -251,6 +289,69 @@ def cmd_run(a):
                                                 out=path, only=fmt))
         if rc: return rc
     return 0
+
+KEY_FILENAME = "companion_enc_static.txt"
+
+
+def _read_key_file(path):
+    """Read a companion_enc_static.txt and sanity-check it before it is trusted as a key.
+
+    The file holds base64 of a 32-byte secret. Checking that here turns "it decrypted nothing and I
+    cannot tell why" into one clear sentence, for the cost of a single decode.
+    """
+    try:
+        raw = open(path, encoding="utf-8").read().strip()
+    except OSError as e:
+        log.error("could not read the key file %s (%s)", path, e)
+        return None
+    if not raw:
+        log.error("the key file %s is empty", path)
+        return None
+    try:
+        if len(base64.b64decode(raw, validate=True)) != 32:
+            log.error("%s does not look like companion_enc_static: expected base64 of 32 bytes", path)
+            return None
+    except Exception:
+        log.error("%s is not valid base64, so it is not a companion_enc_static file", path)
+        return None
+    return raw
+
+
+def _find_key(a, workdir, outs):
+    """Locate the at-rest key WITHOUT asking the user to type it.
+
+    `companion_enc_static` is issued by WhatsApp's servers and never written to disk by the browser,
+    so it has to come from somewhere: the networked reconnect, a memory scan, or a copy this tool
+    captured earlier. It used to be passed in as base64 on the command line, which is the one thing a
+    tool handling someone else's key material should not invite -- an inline secret lands in shell
+    history, in process listings and in anything that audits commands. So it is read from a FILE, and
+    in the normal case found with no flag at all: this tool writes it beside its own work, so a re-run
+    picks it up and skips the network entirely.
+
+    Returns the base64 key, or None meaning "go and capture one".
+    """
+    if getattr(a, "key", None):                      # an explicit --key FILE wins
+        if not os.path.isfile(a.key):
+            log.error("--key: no such file: %s", a.key)
+            return None
+        k = _read_key_file(a.key)
+        if k:
+            log.info("[2/3] using the at-rest key from %s (no reconnect needed)", os.path.abspath(a.key))
+        return k
+    seen = []
+    for d in [workdir, os.getcwd()] + [path for _fmt, path in outs]:
+        if not d or d in seen:
+            continue
+        seen.append(d)
+        cand = os.path.join(d, KEY_FILENAME)
+        if os.path.isfile(cand):
+            k = _read_key_file(cand)
+            if k:
+                log.info("[2/3] found a previously captured at-rest key at %s -- trying it, so this "
+                         "run can stay OFFLINE", os.path.abspath(cand))
+                return k
+    return None
+
 
 def cmd_decrypt(a):
     from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -263,7 +364,7 @@ def cmd_decrypt(a):
     sch = collections.Counter(m["scheme"] for m in msgs if m["data"])
     log.info("message schemes: %s", dict(sch))
     if not a.enc_static:
-        log.info("no --enc-static: offline inventory only. Message TEXT needs companion_enc_static "
+        log.info("no at-rest key available: offline inventory only. Message TEXT needs companion_enc_static "
                  "(memory or reconnect). Media keys/metadata are already on disk.")
         return 0
     enc_static = base64.b64decode(a.enc_static)
@@ -272,7 +373,7 @@ def cmd_decrypt(a):
     # companion_enc_static as HKDF salt + WAWebEncKeySalt as info -> AES-CBC-128
     AUDIT.crypto("derive", algorithm="AES-CBC-128", kdf="HKDF-SHA256 len=16", scheme="1 (final)",
                  key=key, key_source="HKDF(root, salt=companion_enc_static, info=WAWebEncKeySalt)",
-                 salt=enc_static, salt_source="companion_enc_static (--enc-static; server-issued, never on disk)",
+                 salt=enc_static, salt_source="companion_enc_static (server-issued, never written to disk by the browser)",
                  info="WAWebEncKeySalt (localStorage)", input_desc="msgRowOpaqueData._data (scheme 1)",
                  detail={"root_fp": audit.fp(root), "root_len": len(root), "salt_len": len(enc_static)})
     def strict(b): return bool(b) and len(b) % 16 == 0 and 1 <= b[-1] <= 16 and b[-b[-1]:] == bytes([b[-1]])*b[-1]
@@ -574,9 +675,11 @@ def cmd_reconnect(a):
     if a.verbose: extra.append("-v")
     rc = _sub("wa_reconnect.py", extra)
     if rc == 0 and os.path.exists(a.out):
-        key = open(a.out, encoding="utf-8").read().strip()
-        log.info("companion_enc_static captured (%d chars) -> %s", len(key), os.path.abspath(a.out))
-        log.info("next:  wawf decrypt <profile> --enc-static %s --out out/", key)
+        # The key itself is deliberately NOT logged. It used to be, to spell out the next command
+        # back when reconnect and decrypt were separate steps -- but logs get mirrored to disk and
+        # travel with cases, and this is the one secret the browser never stored anywhere. The path
+        # is the part worth recording.
+        log.info("at-rest key captured -> %s", os.path.abspath(a.out))
     return rc
 
 def _deepen_anchors(anchors_path, master):
@@ -1035,7 +1138,7 @@ def main():
         "   A drive letter is never mistaken for a format, so D:\\case\\out works as you'd expect.)\n"
         "\n"
         "OPTIONAL EXTRAS\n"
-        "  --enc-static <b64>    already have the at-rest key? use it and skip the reconnect\n"
+        "  --key companion_enc_static.txt    already have the at-rest key? use it and skip the reconnect\n"
         "  --history             instead of decrypting, pull chat history OLDER than the browser\n"
         "                        cache from your phone (networked, needs Node; phone must answer)\n"
         "  --memory --live       instead of reconnecting, hunt the key in RAM/swap/hibernation\n"
@@ -1044,7 +1147,7 @@ def main():
         "EXAMPLES\n"
         "  wawf \"" + _example_profile() + "\"\n"
         "  wawf \"" + _example_profile() + "\" --out sqlite:D:\\case\\db\n"
-        "  wawf \"" + _example_profile() + "\" --enc-static <b64> --out json:D:\\case --audit\n"
+        "  wawf \"" + _example_profile() + "\" --key companion_enc_static.txt --out json:D:\\case --audit\n"
         "\n"
         "PROFILE LOCATIONS ON THIS SYSTEM\n" + _profile_help() + "\n",
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1058,9 +1161,11 @@ def main():
     p.add_argument("--out", action="append", metavar="[FORMAT:]PATH",
                    help="where to write the results, repeatable. FORMAT is txt, json or sqlite/db; "
                         "a plain path writes text + JSON. Default: wawf_out. See OUTPUT below for examples.")
-    p.add_argument("--enc-static", metavar="B64",
-                   help="the at-rest key (companion_enc_static, base64). Given this, the networked "
-                        "reconnect is skipped entirely.")
+    p.add_argument("--key", metavar="FILE",
+                   help="a companion_enc_static.txt captured earlier, to decrypt without touching the "
+                        "network. Normally unnecessary: a copy left beside the output is picked up "
+                        "automatically. A FILE rather than the key itself, so no secret reaches your "
+                        "shell history, process list or command auditing.")
     p.add_argument("--creds", metavar="FILE",
                    help="an existing creds_in.json to reuse instead of recovering credentials again")
 
