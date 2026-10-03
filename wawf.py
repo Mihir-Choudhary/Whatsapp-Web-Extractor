@@ -238,6 +238,11 @@ def cmd_run(a):
         return 3
 
     key = _find_key(a, workdir, outs)
+    # Record provenance HERE, where it is actually known. It used to be inferred further down as
+    # `not a.key`, which is also true of a key the reconnect had just captured -- so a single decrypt
+    # failure made the tool discard a seconds-old key, announce it was "left over from before the
+    # browser last re-paired", and perform a second pointless network reconnect.
+    key_was_guessed = key is not None and not getattr(a, "key", None)
     if not key and getattr(a, "key", None):
         # The user named this file. Falling back to a networked reconnect here would contradict the
         # entire reason --key exists -- it is how you decrypt WITHOUT touching the account -- and
@@ -259,6 +264,7 @@ def cmd_run(a):
         key = _read_key_file(keyfile)
         if not key:
             return 3
+        key_was_guessed = False          # just captured from the server; not a guess
 
     # An auto-detected key can be STALE, and silently trusting it is the exact mistake that cost this
     # project days with creds_in.json: the at-rest key changes when the browser re-pairs, just as the
@@ -267,14 +273,15 @@ def cmd_run(a):
     # cmd_decrypt already refuses a wrong key rather than writing garbage (it returns 3), so when the
     # key was one we GUESSED at, treat that as "guess was wrong" and go capture a real one. An
     # explicit --key is different: the user named that file, so a failure is reported, not papered over.
-    guessed = key is not None and not getattr(a, "key", None)
+    guessed = key_was_guessed
 
     def _decrypt_all(k):
         for fmt, path in outs:
             if fmt == "sqlite":
                 rc = cmd_sqlite(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=k, out=path))
             elif fmt == "raw":
-                rc = cmd_raw(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=k, out=path))
+                rc = cmd_raw(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=k, out=path,
+                                                raw_include_keys=getattr(a, "raw_include_keys", False)))
             else:
                 rc = cmd_decrypt(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=k,
                                                     out=path, only=fmt))
@@ -304,7 +311,8 @@ def cmd_run(a):
         if fmt == "sqlite":
             rc = cmd_sqlite(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=key, out=path))
         elif fmt == "raw":
-            rc = cmd_raw(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=key, out=path))
+            rc = cmd_raw(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=key, out=path,
+                                            raw_include_keys=getattr(a, "raw_include_keys", False)))
         else:
             rc = cmd_decrypt(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=key,
                                                 out=path, only=fmt))
@@ -503,8 +511,10 @@ def cmd_raw(a):
     if a.profile and os.path.isdir(os.path.join(a.profile, "IndexedDB")):
         sys.path.insert(0, os.path.join(HERE, "scripts"))
         import chromium_reader as cr
-        idb = cr.load_source(a.profile)["idb"]
-        ls = cr.load_source(a.profile)["localStorage"]
+        # ONE call: load_source has no cache -- it re-reads localStorage and the whole IndexedDB and
+        # then cleans up on every call -- so asking twice parsed a 54 MB LevelDB twice for nothing.
+        _src = cr.load_source(a.profile)
+        idb, ls = _src["idb"], _src["localStorage"]
     else:
         log.error("raw output currently supports Chromium profiles only (the Firefox reader returns "
                   "one store at a time); use --out json:DIR for Firefox.")
@@ -522,10 +532,6 @@ def cmd_raw(a):
         cipher_key = HKDF(algorithm=hashes.SHA256(), length=16,
                           salt=base64.b64decode(a.enc_static),
                           info=base64.b64decode(json.loads(ls["WAWebEncKeySalt"]))).derive(root)
-    if cipher_key is None:
-        log.warning("no at-rest key available: the raw dump will carry the records as stored, with "
-                    "msgRowOpaqueData still encrypted.")
-
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     from idbutil import as_bytes as ab
 
@@ -545,6 +551,37 @@ def cmd_raw(a):
         if not pt or not (1 <= pt[-1] <= 16) or pt[-pt[-1]:] != bytes([pt[-1]]) * pt[-1]:
             return None, "padding check failed (wrong key for this record)"
         return pt[:-pt[-1]], None
+
+    if cipher_key is None:
+        log.warning("no at-rest key available: the raw dump will carry the records as stored, with "
+                    "msgRowOpaqueData still encrypted.")
+    else:
+        # VALIDATE BEFORE WRITING, and report a wrong key with the same exit code the other writers
+        # use (3). Without this, cmd_raw returned 0 whatever happened: a stale key produced a dump in
+        # which every single body had failed to decrypt, the run said "success", and the caller's
+        # stale-key recovery -- which triggers on rc 3 -- never fired. The examiner would get a
+        # complete-looking raw dump with nothing decrypted in it, which is the worst possible outcome
+        # because nothing about it looks wrong.
+        _refs, _good = [], 0
+        for _r in idb.get("model-storage", {}).get("message", []):
+            if not isinstance(_r, dict):
+                continue
+            _op = _r.get("msgRowOpaqueData")
+            if isinstance(_op, dict) and _op.get("_scheme") == 1 and ab(_op.get("_data")):
+                _refs.append(_op)
+                if len(_refs) >= 40:
+                    break
+        for _op in _refs:
+            if decrypt(_op)[0] is not None:
+                _good += 1
+        if _refs and _good < len(_refs) * 0.5:
+            log.error("the at-rest key is INVALID for this profile/device (%d/%d reference bodies "
+                      "validate). Refusing to write a raw dump with nothing decrypted in it.",
+                      _good, len(_refs))
+            return 3
+        if _refs:
+            log.info("at-rest key VALIDATED against %d/%d reference bodies", _good, len(_refs))
+
 
     os.makedirs(a.out, exist_ok=True)
     totals = {"stores": 0, "records": 0, "encrypted": 0, "decrypted": 0}
@@ -888,7 +925,7 @@ def cmd_creds(a):
                  "the repo's tools/reconnect Node client for history sync")
     return 0
 
-def _sub(script, extra):
+def _sub(script, extra, secret_env=None):
     """Run a helper script that owns its CLI (wa_forensic / export_sqlite).
     Dev mode: `python scripts/foo.py ...`. Frozen (.exe): re-exec self through the
     `_runpy` dispatch, since a bundled binary can't execute a loose .py file."""
@@ -906,6 +943,13 @@ def _sub(script, extra):
     _env = dict(AUDIT.child_env() or os.environ)
     _env.setdefault("PYTHONIOENCODING", "utf-8")
     _env.setdefault("PYTHONUTF8", "1")
+    # Key material goes through the ENVIRONMENT, never argv. `--key` is justified to users on the
+    # grounds that "no secret reaches your shell history, process list or command auditing", and
+    # passing the base64 key as a child argument broke exactly that: on Windows a child's command
+    # line is readable from Task Manager and Win32_Process, so every --memory and every
+    # --out sqlite: run published the at-rest key to any process on the machine.
+    if secret_env:
+        _env.update({k: v for k, v in secret_env.items() if v})
     rc = subprocess.run(cmd, env=_env).returncode        # child appends to the same case DB
     AUDIT.event("helper subprocess exit rc=%s" % rc, level=("INFO" if rc == 0 else "ERROR"),
                 category="subprocess", detail={"script": script, "rc": rc})
@@ -920,10 +964,9 @@ def cmd_memory(a):
     # line then crashed every --memory/--memimage run with AttributeError. Resolve from the key FILE.
     _k = getattr(a, "enc_static", None) or (_read_key_file(a.key) if getattr(a, "key", None)
                                             and os.path.isfile(a.key) else None)
-    if _k: extra += ["--enc-static", _k]
     if a.origin: extra += ["--origin", a.origin]
     if a.yes: extra.append("--yes")
-    return _sub("wa_forensic.py", extra)
+    return _sub("wa_forensic.py", extra, secret_env={"WAWF_ENC_STATIC": _k})
 
 def cmd_reconnect(a):
     """Recover Noise creds (unless --creds given), then log back in as the linked companion device
@@ -1198,10 +1241,17 @@ def cmd_history(a):
     # happens by itself when a device is revoked) the account gets a new registrationId and a new
     # Signal identity, and a stale snapshot then authenticates as a device that no longer exists.
     # That connects, asks every chat, receives nothing, and is indistinguishable from throttling.
-    if _sub("check_identity.py", eng + ["--dir", work, "--quiet"]):
+    # check_identity exits 0 = current, 1 = stale, 2 = could not tell. Only 1 is a mismatch. Treating
+    # every non-zero code as fatal aborted a healthy run with a wrong diagnosis whenever the check
+    # itself could not complete -- for instance a transient lock on its second read of the profile.
+    _ident = _sub("check_identity.py", eng + ["--dir", work, "--quiet"])
+    if _ident == 1:
         log.error("the credentials just exported do not match the profile — refusing to run with them. "
                   "Run scripts/check_identity.py --profile <profile> --dir %s for the details.", work)
         return 3
+    if _ident:
+        log.warning("could not verify the exported credentials against the profile (check exited %s); "
+                    "continuing, since this is not evidence of a mismatch.", _ident)
     log.info("[3/4] building anchors from on-disk messages ...")
     if _sub("build_anchors.py", eng + ["--out", os.path.join(work, "anchors.json")]): return 3
     log.warning("[4/4] NETWORKED iterative history sync — logs in as your linked device and asks your phone, "
@@ -1348,7 +1398,7 @@ def cmd_history(a):
 
 def cmd_sqlite(a):
     _require_source(a, "sqlite")                            # a profile (or --origin) is required; nothing is auto-detected
-    extra = ["--enc-static", a.enc_static, "--out", a.out]
+    extra = ["--out", a.out]
     if a.profile and os.path.isdir(os.path.join(a.profile, "IndexedDB")):
         extra += ["--profile", a.profile]          # Chromium (Chrome/Edge/Brave/Opera)
     else:
@@ -1357,7 +1407,7 @@ def cmd_sqlite(a):
             cand = os.path.join(a.profile, "storage/default/https+++web.whatsapp.com")
             if os.path.isdir(cand): origin = cand
         if origin: extra += ["--origin", origin]
-    return _sub("export_sqlite.py", extra)
+    return _sub("export_sqlite.py", extra, secret_env={"WAWF_ENC_STATIC": a.enc_static})
 
 def _win_utf8_console():
     """Windows consoles default to a legacy codepage that renders our em dashes / arrows / box characters as
@@ -1429,6 +1479,10 @@ def main():
                    help="where to write the results, repeatable. FORMAT is txt, json, sqlite/db "
                         "or raw (every store verbatim, decrypted in place); "
                         "a plain path writes text + JSON. Default: wawf_out. See OUTPUT below for examples.")
+    p.add_argument("--raw-include-keys", action="store_true",
+                   help="with --out raw: also dump signal-storage and wawc_db_enc. They hold the "
+                        "account's Signal sessions, prekeys and the at-rest root key, so a dump that "
+                        "includes them is key material and must not travel with a case.")
     p.add_argument("--key", metavar="FILE",
                    help="a companion_enc_static.txt captured earlier, to decrypt without touching the "
                         "network. Normally unnecessary: a copy left beside the output is picked up "

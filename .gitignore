@@ -16,7 +16,10 @@ __pycache__/
 # (creds_in.json = Noise private key; companion_enc_static.txt = the at-rest master key),
 # so a `git add .` from a repo clone must never be able to stage them.
 creds_in.json
-companion_enc_static.txt
+# Wildcarded like the neighbours: _find_key searches the cwd and every --out directory for this
+# name and cmd_reconnect writes it there, so a .bak or dated copy is trivially created and an
+# exact-name entry would let it through. This is the at-rest master key.
+companion_enc_static.txt*
 signal_state.json
 appstate_keys.json
 # Un-anchored AND wildcarded: the overlay is key material, and archived/renamed copies of it

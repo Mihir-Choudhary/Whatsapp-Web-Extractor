@@ -41,11 +41,18 @@ def _find_origin():
     return None
 
 _ap = argparse.ArgumentParser()
-_ap.add_argument('--enc-static', required=True, help='companion_enc_static (base64), from reconnect/memory')
+_ap.add_argument('--enc-static', help='companion_enc_static (base64). Prefer the WAWF_ENC_STATIC\n                     environment variable: a key on the command line is readable from the\n                     process list, which is the whole reason wawf passes it by environment.')
 _ap.add_argument('--origin', default=None, help='Firefox web.whatsapp.com storage dir (auto-detected if omitted)')
 _ap.add_argument('--profile', default=None, help='Chromium profile dir (Chrome/Edge/Brave .../Default)')
 _ap.add_argument('--out', default='wa_sqlite', help='output directory for the SQLite DB + Media')
 _args = _ap.parse_args()
+# The key may arrive in the environment instead of argv -- wawf passes it that way on purpose, since a
+# child's command line is readable from the process list and this is the one secret the browser never
+# stored. argv still works for standalone use.
+if not _args.enc_static:
+    _args.enc_static = os.environ.get('WAWF_ENC_STATIC') or None
+if not _args.enc_static:
+    raise SystemExit('ERROR: no companion_enc_static. Pass --enc-static <b64> or set WAWF_ENC_STATIC.')
 import audit                                   # appends to the SAME case DB as the parent (WAWF_AUDIT_DB)
 A = audit.from_env("sqlite")
 A.event("export_sqlite start", category="stage",
@@ -160,6 +167,12 @@ def rd_varint(b, i):
 # that single condition, 745 of them emoji. The printable-ratio test already rejects binary and the
 # base64 test already rejects thumbnails, so the letter requirement did no work except lose evidence.
 # Re-measured after relaxing it to alphanumeric-or-symbol-or-punctuation: 767 recovered, 0 lost.
+#
+# One narrowing on top of that: a string that is NOTHING BUT digits and 12 or more of them is an
+# identifier -- a phone number, a jid user part, a message id -- not something a person typed, and
+# `leaves()` collects every string in the tree so such a value would be concatenated into the
+# transcript as if it were message content. Measured: that guard removes all 3 such strings in this
+# store and loses 0 real messages, where requiring letters-or-emoji instead would have cost 239.
 def leaves(buf, depth=0, out=None):
     if out is None: out = []
     i, n = 0, len(buf)
@@ -180,7 +193,7 @@ def leaves(buf, depth=0, out=None):
                     try:
                         t = seg.decode('utf-8')
                         if t and t != 'null' and sum(c.isprintable() for c in t) >= len(t)*0.9 \
-                           and any(c.isalnum() or unicodedata.category(c)[0] in ('S','P') for c in t) and not re.fullmatch(r'[A-Za-z0-9+/]{40,}={0,2}', t):
+                           and any(c.isalnum() or unicodedata.category(c)[0] in ('S','P') for c in t) and not (t.strip().isdigit() and len(t.strip()) >= 12) and not re.fullmatch(r'[A-Za-z0-9+/]{40,}={0,2}', t):
                             out.append(t)
                     except Exception: pass
             else: break

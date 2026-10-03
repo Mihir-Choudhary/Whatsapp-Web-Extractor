@@ -212,10 +212,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--profile'); ap.add_argument('--origin')
     ap.add_argument('--live', action='store_true')
-    ap.add_argument('--memimage'); ap.add_argument('--enc-static')
+    ap.add_argument('--memimage'); ap.add_argument('--enc-static')   # or WAWF_ENC_STATIC in the env
     ap.add_argument('--deep', action='store_true', help='brute raw 16B key from memory (fallback if salt string absent)')
     ap.add_argument('--yes', action='store_true', help='skip authorization prompt')
     a = ap.parse_args()
+    # wawf hands the key over in the environment rather than argv, because a child's command line is
+    # readable from the process list and this is the one secret the browser never writes to disk.
+    if not a.enc_static:
+        a.enc_static = os.environ.get('WAWF_ENC_STATIC') or None
     import audit                               # appends to the case DB from --audit (no-op otherwise)
     global A
     A = audit.from_env("memory")

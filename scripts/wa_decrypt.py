@@ -49,6 +49,12 @@ def _varint(b, i):
 # that single condition, 745 of them emoji. The printable-ratio test already rejects binary and the
 # base64 test already rejects thumbnails, so the letter requirement did no work except lose evidence.
 # Re-measured after relaxing it to alphanumeric-or-symbol-or-punctuation: 767 recovered, 0 lost.
+#
+# One narrowing on top of that: a string that is NOTHING BUT digits and 12 or more of them is an
+# identifier -- a phone number, a jid user part, a message id -- not something a person typed, and
+# `leaves()` collects every string in the tree so such a value would be concatenated into the
+# transcript as if it were message content. Measured: that guard removes all 3 such strings in this
+# store and loses 0 real messages, where requiring letters-or-emoji instead would have cost 239.
 def leaves(buf, depth=0, out=None):
     if out is None: out = []
     i, n = 0, len(buf)
@@ -69,7 +75,7 @@ def leaves(buf, depth=0, out=None):
                     try:
                         t = seg.decode("utf-8")
                         if t and t != "null" and sum(c.isprintable() for c in t) >= len(t)*0.9 \
-                           and any(c.isalnum() or unicodedata.category(c)[0] in ('S','P') for c in t) and not re.fullmatch(r'[A-Za-z0-9+/]{40,}={0,2}', t):
+                           and any(c.isalnum() or unicodedata.category(c)[0] in ('S','P') for c in t) and not (t.strip().isdigit() and len(t.strip()) >= 12) and not re.fullmatch(r'[A-Za-z0-9+/]{40,}={0,2}', t):
                             out.append(t)
                     except Exception: pass
             else: break

@@ -205,8 +205,13 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   const subplatOS={win32:'Windows',darwin:'Mac OS'}[SUBPLAT];
   if(subplatOS) console.error(`[i] declaring webSubPlatform ${SUBPLAT.toUpperCase()} (WA_SUBPLATFORM) `
     +`— diverges from the browser, which sends WEB_BROWSER`);
+  // syncFullHistory appears ONCE. It was set twice in this literal -- once from subplatOS and again
+  // as a hardcoded false further along -- and in JS the later key wins, so the flag was always false
+  // and WA_SUBPLATFORM did nothing at all while logging that it had taken effect. Any A/B measured
+  // with it was measuring nothing. Baileys only derives its own shouldSyncHistoryMessage from this
+  // when we do not supply one, and we always do, so driving it from subplatOS is safe.
   const sock=makeWASocket({version,auth:authState,syncFullHistory:!!subplatOS,logger:P?P({level:'silent'}):undefined,msgRetryCounterCache,
-    printQRInTerminal:false,markOnlineOnConnect:true,syncFullHistory:false,
+    printQRInTerminal:false,markOnlineOnConnect:true,
     // CRITICAL: accept ON_DEMAND history only, and decline the INITIAL (RECENT/bootstrap) sync.
     // On connect Baileys calls ev.buffer() and holds every event. If this predicate says yes to the
     // initial sync it waits for that notification, enters 'Syncing', and only flushes after
@@ -239,12 +244,17 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     let r=sid!=null && pending.get(sid);
     if(r){ pending.delete(sid); if(sid!=null) resolved.add(sid); return r; }
     if(sid!=null && resolved.has(sid)) return 'duplicate';   // the other listener, same chunk
+    // Record the sid on the FALLBACK paths too. `resolved` exists to stop the second listener's copy
+    // of a chunk being reported as a late arrival, but it was only populated on the exact-match
+    // branch -- and the whole reason these fallbacks exist is that the id scheme may NOT match. So a
+    // chunk resolved by fallback still produced the spurious "[late] arrived after its request had
+    // timed out" line that `resolved` was introduced to eliminate.
     if(pending.size===1){ const [k,v]=pending.entries().next().value;
       console.error(`  [${what}] session id ${sid} did not match; attributing to the single outstanding request ${k}`);
-      pending.delete(k); return v; }
+      pending.delete(k); if(sid!=null) resolved.add(sid); resolved.add(k); return v; }
     if(lastRequestId!=null && pending.has(lastRequestId)){ const v=pending.get(lastRequestId);
       console.error(`  [${what}] session id ${sid} did not match; attributing to the most recent request ${lastRequestId}`);
-      pending.delete(lastRequestId); return v; }
+      pending.delete(lastRequestId); if(sid!=null) resolved.add(sid); resolved.add(lastRequestId); return v; }
     console.error(`  [${what}] reply for session ${sid} has no outstanding request -- `
       +`banking it rather than discarding it`);
     return null;
@@ -303,6 +313,10 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   sock.ev.on('messages.upsert', async u=>{ for(const m of (u.messages||[])){
     const hn=histNotif(m.message); if(!hn) continue;
     const sid=hn.peerDataRequestSessionId; const r=resolveFor(sid,'upsert');
+    // Bail BEFORE the download. The same chunk routinely arrives twice (we listen on two events), and
+    // this check used to sit after fetchBlob + decrypt + decode -- so every page paid a second full
+    // CDN fetch, with up to 3 retries and a 20s socket timeout each, purely to throw the result away.
+    if(r==='duplicate') continue;
     // SALVAGE A LATE ANSWER. `resolveFor` returning null means no request is waiting any more --
     // almost always because we timed out and deleted the pending entry. The old code did
     // `if(!r) continue;` here, i.e. it threw the notification away without downloading it, which
@@ -315,7 +329,6 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     try{ const blob=await fetchBlob(hn); const inf=decryptHistory(blob, Buffer.from(hn.mediaKey));
          msgs=flatten(B.proto.HistorySync.decode(inf)); }
     catch(e){ console.error('  blob err', e.message); }
-    if(r==='duplicate') continue;             // same chunk via the other listener; already banked
     if(!r){
       if(msgs&&msgs.length){
         let fresh=0; for(const mm of msgs){ if(!all.has(mm.id)) fresh++; all.set(mm.id,mm); }

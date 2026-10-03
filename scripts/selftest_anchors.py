@@ -49,6 +49,17 @@ WANT = {0: True,    # COMPLETE_BUT_MORE_MESSAGES_REMAIN_ON_PRIMARY
         3: True,    # NOT_INCLUDED_IN_HIST_SYNC
         4: True,    # COMPLETE_ON_DEMAND_SYNC_BUT_MORE_MSG_REMAIN_ON_PRIMARY
         5: True}    # COMPLETE_ON_DEMAND_SYNC_WITH_MORE_MSG_ON_PRIMARY_BUT_NO_ACCESS
+# Asserting the dict against a literal copy of itself only catches an accidental edit, not a WRONG
+# mapping -- and one entry here is load-bearing: value 2 (INCOMPLETE) maps to False, which makes
+# build_anchors DROP those chats by default. Invert that one and the tool permanently stops asking
+# for exactly the chats whose history sync is unfinished, and the symptom is the silence this whole
+# changeset exists to disambiguate. So assert the PROPERTY the reference function has, derived from
+# its own truth table, rather than restating our copy of it.
+#   primaryHasMoreMessagesReadyToLoad() returns true for {0,3,4,5} and false for {1,2}.
+check("true set", {k for k, v in build_anchors._MORE_ON_PRIMARY.items() if v}, {0, 3, 4, 5})
+check("false set", {k for k, v in build_anchors._MORE_ON_PRIMARY.items() if not v}, {1, 2})
+check("INCOMPLETE(2) is not askable", build_anchors._MORE_ON_PRIMARY[2], False)
+check("COMPLETE_AND_NO_MORE(1) is not askable", build_anchors._MORE_ON_PRIMARY[1], False)
 check("table", build_anchors._MORE_ON_PRIMARY, WANT)
 check("unknown value defaults to askable", build_anchors._MORE_ON_PRIMARY.get(99, True), True)
 
