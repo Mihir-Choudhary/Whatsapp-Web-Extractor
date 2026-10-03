@@ -162,6 +162,7 @@ def decrypt_body(op):
     if not isinstance(op, dict) or op.get('_scheme') != 1: return None   # MSGKEY is the scheme-1 key (scheme-0 -> garbage)
     iv = as_bytes(op.get('iv')); data = as_bytes(op.get('_data'))
     if not iv or not data: return None
+    if len(data) % 16: return None            # misaligned: CBC would decrypt part and drop the tail
     try: pt = pk7(Cipher(algorithms.AES(MSGKEY), modes.CBC(iv)).decryptor().update(data))
     except Exception: return None
     return message_text(pt, 8000) or None

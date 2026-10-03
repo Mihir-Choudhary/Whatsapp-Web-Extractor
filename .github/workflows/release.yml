@@ -39,6 +39,7 @@ jobs:
         shell: bash
         run: |
           python scripts/selftest_identities.py
+          python scripts/selftest_pipeline.py
           python scripts/selftest_anchors.py
       - name: Build
         run: pyinstaller wawf.spec --noconfirm

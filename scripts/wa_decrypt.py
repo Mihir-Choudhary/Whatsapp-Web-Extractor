@@ -474,6 +474,7 @@ def main():
     chats = collections.defaultdict(list); ok = fail = 0
     for m in msgs:
         if not m["data"] or m["scheme"] != 1: continue   # only scheme-1 bodies match this key; skip (don't write garbage)
+        if len(m["data"]) % 16: fail += 1; continue       # misaligned: see the note in wawf.py's cmd_decrypt
         try: pt = pk7(Cipher(algorithms.AES(key), modes.CBC(m["iv"])).decryptor().update(m["data"]))
         except Exception: fail += 1; continue
         txt = message_text(pt)

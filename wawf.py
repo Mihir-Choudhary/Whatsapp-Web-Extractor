@@ -699,6 +699,13 @@ def cmd_decrypt(a):
     chats = collections.defaultdict(list); ok = fail = 0
     for m in msgs:
         if not m["data"] or m["scheme"] != 1: continue   # scheme-1 only; skip scheme-0 (would be garbage)
+        # CBC consumes whole blocks: update() on a ciphertext that is not a multiple of 16 returns the
+        # blocks it could and silently buffers the tail, so a truncated record decrypts to a SHORT
+        # plaintext and is still counted as a success. Count it as what it is. None of the 22,121
+        # bodies in the reference profile are misaligned; this is about the counts staying truthful
+        # on a damaged store, which is exactly the case where they are what is being measured.
+        if len(m["data"]) % 16:
+            fail += 1; log.debug("misaligned body %s: %d bytes", m["id"][:24], len(m["data"])); continue
         try: pt = WD.pk7(Cipher(algorithms.AES(key), modes.CBC(m["iv"])).decryptor().update(m["data"]))
         except Exception as e: fail += 1; log.debug("decrypt fail %s: %s", m["id"][:24], e); continue
         chats[m["chat"]].append(WD.msg_row(m, ts(m["t"]), WD.message_text(pt), ids))
@@ -724,7 +731,7 @@ def cmd_decrypt(a):
         AUDIT.artifact(f"{a.out}/identities.json", kind="identity correlation (jid/lid/phone/name)",
                        records=len(tbl["identities"]))
     if only == "json":
-        log.info("decrypted %d bodies (%d failed) -> %s/chats.json", ok, fail, a.out)
+        log.info("decrypted %d bodies (%d failed) -> %s/ (chats.json + identities.json)", ok, fail, a.out)
         AUDIT.artifact(f"{a.out}/chats.json", kind="decrypted chats (JSON)", records=ok)
         return 0
     WD.write_transcripts(f"{a.out}/transcripts.txt", chats, ids)
