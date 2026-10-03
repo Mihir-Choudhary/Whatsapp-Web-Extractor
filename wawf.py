@@ -830,6 +830,16 @@ def cmd_history(a):
     if n: log.info("resuming: %s messages recovered on prior runs — continuing older than those.", f"{n:,}")
 
     MIN_NEW, MAX_PASSES = 40, 25                             # stop when a pass adds < MIN_NEW; hard safety cap
+    # Exit 7 from the Node client means its cooldown breaker stopped the pass: ten unanswered requests
+    # inside WhatsApp's own 7200-second window. That is not a failure and must not be treated as one.
+    # A sweep of a few hundred chats cannot fit inside one window, so the right response is to wait the
+    # cooldown out and resume from the checkpoint -- which costs nothing, because every pass re-anchors
+    # on the oldest message recovered so far. Set WAWF_COOLDOWN_SEC=0 to get the old behaviour of
+    # stopping instead, and WAWF_MAX_COOLDOWNS to bound how long a run may sit waiting.
+    COOLDOWN_RC = 7
+    COOLDOWN = int(os.environ.get("WAWF_COOLDOWN_SEC", 7200))
+    MAX_COOLDOWNS = int(os.environ.get("WAWF_MAX_COOLDOWNS", 6))
+    cooldowns_used = 0
     try:
         for p in range(1, MAX_PASSES + 1):
             log.info("──── history pass %d ────", p)
@@ -855,6 +865,20 @@ def cmd_history(a):
                 if i and i not in master: master[i] = m; new += 1
             by = _checkpoint(accum)                          # checkpoint the accumulated set every pass
             log.info("pass %d: +%d new  ·  total recovered: %d across %d chats", p, new, len(master), len(by))
+            if rc == COOLDOWN_RC:
+                _deepen_anchors(anchors_path, master)        # bank progress before the wait
+                if COOLDOWN and cooldowns_used < MAX_COOLDOWNS:
+                    cooldowns_used += 1
+                    log.warning("pass %d was stopped by the cooldown breaker (%d/%d). WhatsApp Web waits "
+                                "%ds after this many unanswered requests, so we wait too, then resume "
+                                "deeper. %s messages are already banked and nothing is lost if this is "
+                                "interrupted.", p, cooldowns_used, MAX_COOLDOWNS, COOLDOWN, f"{len(master):,}")
+                    time.sleep(COOLDOWN)
+                    continue
+                log.warning("pass %d stopped by the cooldown breaker and the wait budget is spent "
+                            "(%d used). Re-run later to continue deeper; progress is saved.",
+                            p, cooldowns_used)
+                break
             if new < MIN_NEW:
                 if master:
                     log.info("converged — last pass added < %d new messages. Stopping.", MIN_NEW)

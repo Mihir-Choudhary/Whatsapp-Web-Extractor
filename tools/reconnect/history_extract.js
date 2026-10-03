@@ -241,7 +241,7 @@ function histNotif(message){ // dig through device/ephemeral wrappers
       Promise.resolve(sock.requestPlaceholderResend(m.key)).catch(()=>{});
     }
   } });
-  const all=new Map(); let done=false, opened=false;
+  const all=new Map(); let done=false, opened=false, cooldownTripped=false;
   // Checkpoint the accumulated messages to disk. Called after EVERY page (not just at the end) so a
   // kill/crash/timeout never loses what was already pulled (writes atomically via a temp rename).
   const writeOut=()=>{ try{
@@ -492,6 +492,7 @@ function histNotif(message){ // dig through device/ephemeral wrappers
         }
         probed++;
         if(tripped){
+          cooldownTripped=true;            // reported to the caller as exit 7, so a pass can be resumed
           console.error(`
 [!] ${failCount} unanswered requests inside the ${COOLDOWN}s window. WhatsApp Web itself stops `
             +`here (history_sync_on_demand_failure_limit=${FAIL_LIMIT}) and goes quiet for the `
@@ -513,7 +514,13 @@ function histNotif(message){ // dig through device/ephemeral wrappers
         }
         await sleep(Number(process.env.CHAT_DELAY_MS||400));   // be a polite client between chats
       }
-      console.error('[*] pagination complete'); finish(0);
+      // Exit 7 means "stopped by the cooldown breaker, not finished". The caller can then wait out
+      // WhatsApp's cooldown and resume from the checkpoint rather than treating the pass as a failure;
+      // a full sweep of a few hundred chats cannot fit inside one cooldown window.
+      console.error(cooldownTripped
+        ? '[*] stopped by the cooldown breaker — resume after the cooldown to continue deeper'
+        : '[*] pagination complete');
+      finish(cooldownTripped?7:0);
     }
   });
   setTimeout(()=>{ console.error('[maxrun]'); finish(0); }, 590000);
