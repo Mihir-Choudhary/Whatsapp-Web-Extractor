@@ -13,6 +13,15 @@ for pkg in ("ccl_chromium_reader", "cramjam", "websocket"):
     datas += d; binaries += b; hiddenimports += h
 hiddenimports += collect_submodules("cryptography")
 
+# The helper scripts are bundled as DATA and executed through runpy, so PyInstaller never analyses
+# their imports. A bare `import urllib` would be bundled; `import urllib.request` is not, and the
+# frozen build then died with ModuleNotFoundError the moment it tried to reconnect -- which is the
+# exe's DEFAULT job, so the binary could not capture its own at-rest key. Found by actually running
+# the exe rather than the scripts. Checked across every bundled script: urllib.request is the only
+# stdlib submodule in that position (wa_reconnect.py, mediafetch.py, fetch_history_blobs.py);
+# urllib.error rides along with it and is named explicitly so it cannot be dropped either.
+hiddenimports += ["urllib.request", "urllib.error"]
+
 # Bundle every helper script as data so runpy + the runtime sys.path insert resolve them
 # (chromium_reader, wa_decrypt, export_baileys_creds, wa_forensic, export_sqlite,
 #  wa_reconnect + _wa_tokens, snappy_pure*, sclone, ...). They live under _MEIPASS/scripts at runtime.

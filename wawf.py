@@ -14,9 +14,10 @@ You must say WHICH profile to examine — nothing is auto-detected. For Chromium
 (Chrome/Edge/Brave/Opera/Vivaldi) pass the profile folder itself (the one containing "IndexedDB");
 for Firefox pass the profile folder, or --origin for its web.whatsapp.com storage folder.
 
-Output is chosen with --out [FORMAT:]PATH (repeatable; FORMAT = txt | json | sqlite/db). A plain path
-writes transcripts.txt + chats.json; sqlite: writes an Android-style msgstore.db + wa.db. A Windows
-drive letter is never mistaken for a FORMAT.
+Output is chosen with --out [FORMAT:]PATH (repeatable; FORMAT = txt | json | sqlite/db | raw). A plain
+path writes transcripts.txt + chats.json; sqlite: writes an Android-style msgstore.db + wa.db; raw:
+writes every object store verbatim with the bodies decrypted in place, changing nothing else. A
+Windows drive letter is never mistaken for a FORMAT.
 
 Two alternative actions replace the default job:
   --history                     pull chat history OLDER than the browser cache from the phone (Node)
@@ -66,8 +67,16 @@ def _audit_db_path(a):
     v = getattr(a, "audit_db", None)
     if v: return v                                          # explicit --audit-db <path>
     out = getattr(a, "out", None)
+    # The top-level CLI takes --out REPEATEDLY (action="append"), so this is a list there and a plain
+    # string on the internal single-output paths. Each entry may also carry a FORMAT: prefix, which is
+    # not part of any path. Passing either straight to os.path crashed the run outright -- reachable
+    # only by actually typing `--audit --out FORMAT:DIR`, which is why the unit paths never saw it.
+    if isinstance(out, (list, tuple)):
+        out = _parse_out(out[0])[1] if out else None
+    elif isinstance(out, str):
+        out = _parse_out(out)[1]
     if out:
-        base = out if (os.path.isdir(out) or not os.path.splitext(out)[1]) else os.path.dirname(out)
+        base = _out_workdir(out)        # the folder an --out target lives in
     else:
         base = os.getcwd()
     return os.path.join(base or ".", "wawf_audit.db")
@@ -428,6 +437,13 @@ def _jsonable(o, depth=0):
         return {str(k): _jsonable(v, depth + 1) for k, v in o.items()}
     if isinstance(o, (list, tuple)):
         return [_jsonable(v, depth + 1) for v in o]
+    # JavaScript `undefined` is a VALUE in these records, and distinct from null -- the structured
+    # clone format keeps them apart, and whether a field was never set or was explicitly nulled can
+    # matter. JSON has neither, so it gets an unambiguous marker of its own rather than falling into
+    # the generic repr bucket, where it was indistinguishable from an object we simply could not
+    # serialise. Not mapped to null: that would silently merge two different states.
+    if type(o).__name__ in ("Undefined", "JSUndefined") or repr(o) == "<Undefined>":
+        return {"__undefined__": True}
     b = None
     try:
         b = _ab(o)
@@ -553,6 +569,13 @@ def cmd_raw(a):
                "decryption": "AES-CBC-128, HKDF(root, salt=companion_enc_static, info=WAWebEncKeySalt)",
                "note": "records are verbatim as stored; _wawf_plaintext_* fields are ADDED, "
                        "msgRowOpaqueData is left untouched",
+               "markers": {"__bytes__": "base64 of a binary value, with its length",
+                           "__undefined__": "JavaScript undefined, which JSON cannot express and "
+                                            "which is NOT the same as null",
+                           "__repr__": "a value no other marker covers, as its Python repr",
+                           "_wawf_plaintext_b64": "decrypted msgRowOpaqueData._data, verbatim",
+                           "_wawf_plaintext_fields": "the same bytes as a schema-free protobuf tree",
+                           "_wawf_plaintext_error": "why a body could not be decrypted"},
                "totals": totals, "not_decrypted": dict(skipped),
                "excluded_databases": {"reason": "holds key material, not evidence; pass "
                                                 "--raw-include-keys to override",
@@ -1379,7 +1402,8 @@ def main():
     p.add_argument("--origin", metavar="DIR",
                    help="Firefox web.whatsapp.com storage folder, instead of a profile folder")
     p.add_argument("--out", action="append", metavar="[FORMAT:]PATH",
-                   help="where to write the results, repeatable. FORMAT is txt, json or sqlite/db; "
+                   help="where to write the results, repeatable. FORMAT is txt, json, sqlite/db "
+                        "or raw (every store verbatim, decrypted in place); "
                         "a plain path writes text + JSON. Default: wawf_out. See OUTPUT below for examples.")
     p.add_argument("--key", metavar="FILE",
                    help="a companion_enc_static.txt captured earlier, to decrypt without touching the "
