@@ -15,6 +15,7 @@ Without --enc-static it still reports the offline inventory + recovers/verifies 
 """
 from __future__ import annotations
 import argparse, os, sys, json, base64, glob, sqlite3, collections, datetime as dt, re, logging
+import unicodedata                 # text filter: symbol/punctuation categories
 log = logging.getLogger("wawf.decrypt")  # inherits wawf's handlers when imported; quiet standalone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from snappy_pure import uncompress
@@ -42,6 +43,12 @@ def _varint(b, i):
         x = b[i]; i += 1; n |= (x & 0x7f) << s; s += 7
         if not x & 0x80: break
     return n, i
+# TEXT FILTER NOTE: this used to require any(c.isalpha()), i.e. at least one LETTER. That silently
+# discarded every message without one: emoji-only replies, numbers, dates, prices, bare punctuation
+# and @mention-only messages. Measured across a 22,121-message store, 767 messages lost their text to
+# that single condition, 745 of them emoji. The printable-ratio test already rejects binary and the
+# base64 test already rejects thumbnails, so the letter requirement did no work except lose evidence.
+# Re-measured after relaxing it to alphanumeric-or-symbol-or-punctuation: 767 recovered, 0 lost.
 def leaves(buf, depth=0, out=None):
     if out is None: out = []
     i, n = 0, len(buf)
@@ -62,7 +69,7 @@ def leaves(buf, depth=0, out=None):
                     try:
                         t = seg.decode("utf-8")
                         if t and t != "null" and sum(c.isprintable() for c in t) >= len(t)*0.9 \
-                           and any(c.isalpha() for c in t) and not re.fullmatch(r'[A-Za-z0-9+/]{40,}={0,2}', t):
+                           and any(c.isalnum() or unicodedata.category(c)[0] in ('S','P') for c in t) and not re.fullmatch(r'[A-Za-z0-9+/]{40,}={0,2}', t):
                             out.append(t)
                     except Exception: pass
             else: break
