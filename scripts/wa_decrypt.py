@@ -98,6 +98,241 @@ def as_str(x):
     if isinstance(x, dict): return x.get("_serialized") or (f"{x.get('user')}@{x.get('server')}" if x.get("user") else None)
     return None
 
+# ---------------- who is who ----------------
+# A transcript that reads "me / them" is not evidence: the first question asked of a message is WHO
+# sent it, and "them" cannot be cross-referenced against anything. Everything needed to answer it was
+# already in the profile, in stores this loader read for a record count and then threw away.
+#
+# WhatsApp addresses one person in three ways, and the stores mix them freely:
+#   <phone>@c.us             UI / legacy form           -- older messages' `from`, contact phoneNumber
+#   <phone>@s.whatsapp.net   wire form of that phone    -- PN-keyed contact records
+#   <lid>@lid                "linked id", an alias      -- every recent message's `author`
+# any of which may carry a `:<device>` suffix. Collapsing those forms onto one key per person is the
+# whole job: a message addressed one way will not find the contact record stored the other way.
+_PN_SERVERS = ("c.us", "s.whatsapp.net")
+
+def canon_jid(j):
+    """One key per person: `:device` suffix dropped, phone-number servers folded onto `@c.us`."""
+    s = j.strip() if isinstance(j, str) else ""
+    if not s or "@" not in s: return s
+    user, _, server = s.rpartition("@")
+    return user.split(":")[0] + "@" + ("c.us" if server in _PN_SERVERS else server)
+
+# Not people: WhatsApp's own pseudo-chats. They have no contact record and never will, so name them
+# here rather than leaving a reader to wonder who "status@broadcast" is.
+_PSEUDO = {"status@broadcast": "Status updates", "0@c.us": "WhatsApp"}
+
+def _dedupe(records, key="id"):
+    """Newest-first records, one per key. The Chromium reader deliberately yields superseded and
+    deleted versions too (they are evidence), so the same contact appears several times; the first
+    occurrence is the live one. Taking only that stops a stale record resurrecting an old name."""
+    out, seen = [], set()
+    for o in records or ():
+        if not isinstance(o, dict): continue
+        k = canon_jid(o.get(key))
+        if not k or k in seen: continue
+        seen.add(k); out.append(o)
+    return out
+
+def _txt(v):
+    return v.strip() if isinstance(v, str) and v.strip() else None
+
+class Identities:
+    """jid/lid -> who that is, from `model-storage`'s own contact, group-metadata, chat and
+    participant stores.
+
+    The contact store holds TWO records per person -- one keyed by `@lid`, one by `@s.whatsapp.net` --
+    and the name may be on either, so records are merged into one identity per person before being
+    labelled. That merge is also what yields the lid<->phone correlation: the lid-keyed record carries
+    the matching `phoneNumber`, and on disk that is the only place the mapping exists.
+
+    Naming order is most-authoritative first: `name` is what the examined user saved in their own
+    address book, `pushname` is what the contact chose to call themselves, and a phone number
+    identifies without naming. When nothing is known the jid is returned unchanged -- a label is never
+    invented, so "unidentified" stays visibly different from "identified".
+    """
+    def __init__(self, stores=None, ls=None):
+        st = stores or {}
+        self._id = {}      # canon jid -> identity dict (several keys share one object: that IS the merge)
+        self._subject = {} # canon group jid -> subject, from group-metadata (authoritative)
+        self._chat = {}    # canon chat jid -> WhatsApp's own display name, from the chat store
+        self.groups = {}   # canon group jid -> membership as the client last saw it
+        self.me = set()    # my own addresses, every form
+        for o in _dedupe(st.get("contact")):
+            jid, pn = canon_jid(o.get("id")), canon_jid(o.get("phoneNumber"))
+            if not jid: continue
+            ent = self._id.get(jid) or (self._id.get(pn) if pn else None) or {
+                "lid": None, "pn": None, "name": None, "pushname": None, "addressbook": False}
+            if jid.endswith("@lid"): ent["lid"] = ent["lid"] or jid
+            elif jid.endswith("@c.us"): ent["pn"] = ent["pn"] or jid
+            if pn: ent["pn"] = ent["pn"] or pn
+            ent["name"] = ent["name"] or _txt(o.get("name")) or _txt(o.get("verifiedName"))
+            ent["pushname"] = ent["pushname"] or _txt(o.get("pushname"))
+            ent["addressbook"] = ent["addressbook"] or bool(o.get("isAddressBookContact"))
+            for k in (jid, pn):
+                if k: self._id[k] = ent
+        for o in _dedupe(st.get("group-metadata")):            # authoritative group subject
+            jid, subj = canon_jid(o.get("id")), _txt(o.get("subject"))
+            if jid and subj: self._subject[jid] = subj
+        # Kept separate from the subject rather than merged into it: for a group whose metadata is
+        # absent (one that was left, or never synced) the chat store's name is the only name there is
+        # and should be used -- but it is WhatsApp's own rendering, not the group's subject, and
+        # source() has to be able to say which of the two a label came from.
+        for o in _dedupe(st.get("chat")):
+            jid, nm = canon_jid(o.get("id")), _txt(o.get("name"))
+            if jid and nm: self._chat[jid] = nm
+        for o in _dedupe(st.get("participant"), key="groupId"):
+            jid = canon_jid(o.get("groupId"))
+            if not jid: continue
+            def lst(k, _o=o): return [canon_jid(x) for x in (_o.get(k) or ()) if isinstance(x, str)]
+            self.groups[jid] = {"subject": self._subject.get(jid) or self._chat.get(jid),
+                                "participants": lst("participants"),
+                                "past_participants": lst("pastParticipants"),
+                                "admins": lst("admins"), "super_admins": lst("superAdmins")}
+        for k in ("last-wid-md", "WALid"):                     # my own phone form and lid form
+            try: self.me.add(canon_jid(json.loads((ls or {}).get(k) or '""')))
+            except Exception as e: log.debug("own jid from %s: %s", k, e)
+        self.me.discard("")
+        # ...and those two are one person, which the contact store does not always record: my lid
+        # usually has a pushname record while my phone form has none. Linking them stops my own
+        # outgoing messages resolving two different ways inside one transcript.
+        mine = [self._id[j] for j in sorted(self.me) if j in self._id]
+        ent = next((e for e in mine if e["name"] or e["pushname"]), None) or (mine[0] if mine else {
+            "lid": None, "pn": None, "name": None, "pushname": None, "addressbook": False})
+        for j in sorted(self.me):
+            if j.endswith("@lid"): ent["lid"] = ent["lid"] or j
+            else: ent["pn"] = ent["pn"] or j
+            self._id[j] = ent
+
+    def entry(self, jid):
+        """The merged identity behind any form of a jid, or None."""
+        return self._id.get(canon_jid(jid))
+
+    def key(self, jid):
+        """A stable key for the IDENTITY, not the address: every form of one person yields the same
+        key. A participant list keyed on this has one row per person, where keying on the jid gives
+        the same person twice -- once under their lid and once under their phone number."""
+        cj = canon_jid(jid); e = self.entry(cj) or {}
+        return e.get("lid") or e.get("pn") or cj
+
+    def is_me(self, jid):
+        return canon_jid(jid) in self.me
+
+    # One order, used by both label() and source(), so the label and its stated provenance can never
+    # disagree. A group is named by its subject and nothing else; a person is named by the examined
+    # user's own address book first, because that is the name that identifies them TO THAT USER -- the
+    # chat store's display name is WhatsApp's own rendering and only fills gaps.
+    def _resolve(self, jid):
+        """-> (label, source). The single decision; everything else formats it."""
+        cj = canon_jid(jid)
+        if not cj: return "(unknown)", "unresolved"
+        if cj.endswith("@g.us"):
+            if cj in self._subject: return self._subject[cj], "group-subject"
+            if cj in self._chat: return self._chat[cj], "chat-name"
+            return cj, "unresolved"
+        e = self.entry(cj) or {}
+        if e.get("name"): return e["name"], "address-book"
+        if e.get("pushname"): return e["pushname"], "pushname"
+        if cj in self._chat: return self._chat[cj], "chat-name"
+        if cj in _PSEUDO: return _PSEUDO[cj], "system"
+        pn = e.get("pn") or (cj if cj.endswith("@c.us") else None)
+        if pn: return "+" + pn.split("@")[0], "phone"
+        return cj, "unresolved"
+
+    def source(self, jid):
+        """Where a label came from, so coverage can be measured instead of assumed."""
+        return self._resolve(jid)[1]
+
+    def label(self, jid, mark_me=False):
+        """What to print for a jid: a name, else a phone number, else the jid unchanged."""
+        lab = self._resolve(jid)[0]
+        return lab + " (me)" if mark_me and canon_jid(jid) in self.me else lab
+
+    def row(self, jid):
+        """Flat correlation record: what this jid is, and every other form of the same identity."""
+        cj = canon_jid(jid); e = self.entry(cj) or {}
+        return {"jid": cj, "lid": e.get("lid"), "phone": e.get("pn"), "name": e.get("name"),
+                "pushname": e.get("pushname"), "address_book": bool(e.get("addressbook")),
+                "label": self.label(cj), "source": self.source(cj), "is_me": cj in self.me}
+
+    def table(self, jids):
+        """The correlation table for the jids actually seen, plus group membership -- exported so an
+        analyst can join on it rather than re-derive it from the stores."""
+        rows = {}
+        for j in jids:
+            cj = canon_jid(j)
+            if cj and cj not in rows: rows[cj] = self.row(cj)
+        def members(ps): return [{"jid": p, "label": self.label(p, mark_me=True)} for p in ps]
+        return {"_note": "identity correlation for this export. 'source' says where each label came "
+                         "from; 'unresolved' means the profile knows no name and no number for that "
+                         "jid, and the raw jid is used as the label.",
+                "me": sorted(self.me),
+                "identities": [rows[k] for k in sorted(rows)],
+                "groups": {g: {"subject": v["subject"],
+                               "participants": members(v["participants"]),
+                               "past_participants": members(v["past_participants"]),
+                               "admins": members(v["admins"]),
+                               "super_admins": members(v["super_admins"])}
+                           for g, v in sorted(self.groups.items())}}
+
+    def coverage(self, jids):
+        """{source: count} over the given jids -- what the logs report."""
+        return collections.Counter(self.source(j) for j in jids)
+
+# A decrypted body is protobuf, and `leaves()` deliberately collects EVERY string in the tree --
+# which includes the sender's own jid, carried inside the message for addressing. That is metadata,
+# not something a person typed, and now that the sender is resolved into its own column it is pure
+# noise: measured over a 22,121-message store it was tacked onto the end of 6,218 lines.
+#
+# Dropped -- UNLESS it is the only string the body has. That is 424 messages here (393 image, 29
+# video, 2 chat), where the address is all the text there is, and dropping it would turn a visible
+# line into no line at all. So the filter can remove noise but can never remove a message.
+_ADDRESS = re.compile(r"\+?\d{5,}(?::\d+)?@(?:lid|c\.us|s\.whatsapp\.net|g\.us|broadcast)\Z")
+
+def message_text(pt, cap=2000):
+    """The readable text of a decrypted body: every distinct string in it, addressing stripped."""
+    lv = list(dict.fromkeys(leaves(pt)))
+    keep = [x for x in lv if not _ADDRESS.match(x.strip())]
+    return " ".join(keep or lv)[:cap]
+
+def msg_row(m, when, text, ids):
+    """One chats.json record. The identity fields are ADDITIVE: `sender` stays exactly as stored and
+    the resolved name plus the lid/phone pair are added beside it, so nothing is replaced by an
+    interpretation of it."""
+    e = ids.entry(m.get("sender")) or {}
+    return {"t": when, "dir": "me" if m["from_me"] else "them", "type": m["type"],
+            "chat": m.get("chat"), "chat_name": ids.label(m.get("chat")),
+            "sender": m.get("sender"), "sender_name": ids.label(m.get("sender")),
+            "sender_lid": e.get("lid"), "sender_phone": e.get("pn"),
+            "sender_source": ids.source(m.get("sender")), "text": text}
+
+def write_transcripts(path, chats, ids):
+    """transcripts.txt -- the artifact people actually read. Every line names its sender, and each
+    chat header lists its senders with every jid form they appear under, so any line can be traced
+    back to an identifier. `->` is outgoing, `<-` incoming."""
+    with open(path, "w", encoding="utf-8") as f:   # emoji/non-Latin text -> pin UTF-8 (Windows is cp1252)
+        f.write("# Names resolved from the examined profile's own contact/group stores: address-book\n"
+                "# name, else WhatsApp pushname, else phone number, else the raw jid unchanged.\n"
+                "# Each chat header lists its senders and their jid forms. '->' sent, '<-' received.\n")
+        for c, ml in sorted(chats.items(), key=lambda kv: -len(kv[1])):
+            tm = [m for m in ml if m["text"]]
+            if not tm: continue
+            kind = "group" if str(c).endswith("@g.us") else "1:1"
+            f.write("\n===== %s  [%s]  (%s; %d msgs, %d text) =====\n"
+                    % (ids.label(c), c, kind, len(ml), len(tm)))
+            who = {}
+            for m in ml:
+                s = m.get("sender")
+                if s and ids.key(s) not in who: who[ids.key(s)] = ids.row(ids.key(s))
+            for cj, r in sorted(who.items(), key=lambda kv: (kv[1]["label"] or "").lower()):
+                forms = "  ".join(x for x in (r["lid"], r["phone"]) if x and x != cj)
+                f.write("  - %-26s %s%s%s\n" % (r["label"], cj, ("  " + forms) if forms else "",
+                                                 "  (me)" if r["is_me"] else ""))
+            for m in ml:
+                if m["text"]:
+                    f.write("[%s] %s %22s: %s\n" % (m["t"], "->" if m["dir"] == "me" else "<-",
+                                                    m.get("sender_name") or m["dir"], m["text"]))
+
 def load_firefox(origin):
     ls = {}
     lsp = os.path.join(origin, "ls/data.sqlite")
@@ -125,6 +360,7 @@ def load_firefox(origin):
         root = d[j:d.find(b"\x00"*8, j)]
     msgs = []
     meta = {"contact": 0, "group-metadata": 0, "chat": 0}
+    stores = {}
     for sq in glob.glob(origin + "/idb/*meogdaerlo*.sqlite"):
         c = sqlite3.connect(f"file:{sq}?mode=ro&immutable=1", uri=True)
         sid = store_id(c, "message")
@@ -134,11 +370,11 @@ def load_firefox(origin):
                 try: msgs.append(_norm_msg(sclone.loads(uncompress(d))))
                 except Exception as e: skipped += 1; log.debug("firefox msg record skipped: %s", e)
             if skipped: log.debug("firefox: %d message record(s) failed to deserialize (of %d)", skipped, skipped + len(msgs))
-        for n in meta:                                        # counts for the terminal summary (cheap: COUNT by store id)
-            nsid = store_id(c, n)
-            if nsid: meta[n] = c.execute("SELECT COUNT(*) FROM object_data WHERE object_store_id=?", (nsid,)).fetchone()[0]
+        for n in _ID_STORES:                                  # who-is-who source records (small stores)
+            stores[n] = _ff_store(c, n)
+        for n in meta: meta[n] = len(stores.get(n, ()))       # counts for the terminal summary
         c.close()
-    return ls, root, msgs, meta
+    return ls, root, msgs, meta, stores
 
 def load_chromium(profile):
     import chromium_reader as cr
@@ -150,16 +386,33 @@ def load_chromium(profile):
     model = idb.get("model-storage", {})
     msgs = [_norm_msg(o) for o in model.get("message", []) if isinstance(o, dict)]
     meta = {n: sum(1 for o in model.get(n, []) if isinstance(o, dict)) for n in ("contact", "group-metadata", "chat")}
-    return ls, root, msgs, meta
+    stores = {n: [o for o in model.get(n, []) if isinstance(o, dict)] for n in _ID_STORES}
+    return ls, root, msgs, meta, stores
+
+# the stores that answer "who is this jid" -- small, and read by both engines
+_ID_STORES = ("contact", "group-metadata", "chat", "participant")
+
+def _ff_store(con, name):
+    """Every record of one Firefox object store, looked up by NAME (store ids are per-profile)."""
+    sid = store_id(con, name)
+    if sid is None: return []
+    out = []
+    for (d,) in con.execute("SELECT data FROM object_data WHERE object_store_id=?", (sid,)):
+        try: out.append(sclone.loads(uncompress(d)))
+        except Exception as e: log.debug("firefox %s record skipped: %s", name, e)
+    return out
 
 def load(profile=None, origin=None):
-    if origin: return ("firefox", *load_firefox(origin))
-    # auto-detect
-    if os.path.isdir(os.path.join(profile, "IndexedDB")):
-        return ("chromium", *load_chromium(profile))
-    for cand in (os.path.join(profile, "storage/default/https+++web.whatsapp.com"),):
-        if os.path.isdir(cand): return ("firefox", *load_firefox(cand))
-    raise SystemExit("Could not locate WhatsApp Web storage in that profile (pass --origin for Firefox).")
+    """-> (engine, localStorage, root_key, messages, store_counts, Identities)"""
+    if origin: engine, parts = "firefox", load_firefox(origin)
+    elif os.path.isdir(os.path.join(profile, "IndexedDB")): engine, parts = "chromium", load_chromium(profile)
+    else:
+        cand = os.path.join(profile, "storage/default/https+++web.whatsapp.com")
+        if not os.path.isdir(cand):
+            raise SystemExit("Could not locate WhatsApp Web storage in that profile (pass --origin for Firefox).")
+        engine, parts = "firefox", load_firefox(cand)
+    ls, root, msgs, meta, stores = parts
+    return engine, ls, root, msgs, meta, Identities(stores, ls)
 
 # ---------------- main ----------------
 def main():
@@ -170,7 +423,7 @@ def main():
     a = ap.parse_args()
     if not a.profile and not a.origin:
         ap.error("pass --profile <browser profile dir> or --origin <Firefox web.whatsapp.com dir>")
-    engine, ls, root, msgs, meta = load(a.profile, a.origin)
+    engine, ls, root, msgs, meta, ids = load(a.profile, a.origin)
     print(f"[*] engine={engine}  messages={len(msgs)}  root_key={'yes' if root else 'NO'}  ls_keys={len(ls)}")
     if not root: raise SystemExit("root key not found (wawc_db_enc/keys)")
     salt_ws = base64.b64decode(json.loads(ls["WAWebEncKeySalt"]))
@@ -223,23 +476,21 @@ def main():
         if not m["data"] or m["scheme"] != 1: continue   # only scheme-1 bodies match this key; skip (don't write garbage)
         try: pt = pk7(Cipher(algorithms.AES(key), modes.CBC(m["iv"])).decryptor().update(m["data"]))
         except Exception: fail += 1; continue
-        txt = " ".join(dict.fromkeys(leaves(pt)))[:2000]
+        txt = message_text(pt)
         ok += 1
-        chats[m["chat"]].append({"t": ts(m["t"]), "dir": "me" if m["from_me"] else "them",
-                                 "type": m["type"], "sender": m["sender"], "text": txt})
+        chats[m["chat"]].append(msg_row(m, ts(m["t"]), txt, ids))
     print(f"[+] decrypted {ok} bodies ({fail} failed)  ->  {a.out}/")
     if ok and fail > ok:
         print("[!] most bodies failed to decrypt — companion_enc_static likely wrong for THIS profile/device.")
     for c in chats: chats[c].sort(key=lambda x: x["t"])
     json.dump(chats, open(f"{a.out}/chats.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1, default=str)
-    with open(f"{a.out}/transcripts.txt", "w", encoding="utf-8") as f:  # emoji/non-Latin text -> pin UTF-8 (Windows default is cp1252)
-        for c, ml in sorted(chats.items(), key=lambda kv: -len(kv[1])):
-            tm = [m for m in ml if m["text"]]
-            if not tm: continue
-            f.write(f"\n===== {c} ({len(ml)} msgs, {len(tm)} text) =====\n")
-            for m in ml:
-                if m["text"]: f.write(f"[{m['t']}] {m['dir']:>4}: {m['text']}\n")
-    print(f"    transcripts.txt + chats.json written")
+    seen = set(chats) | set(m["sender"] for ml in chats.values() for m in ml if m.get("sender"))
+    json.dump(ids.table(seen), open(f"{a.out}/identities.json", "w", encoding="utf-8"),
+              ensure_ascii=False, indent=1, default=str)
+    write_transcripts(f"{a.out}/transcripts.txt", chats, ids)
+    cov = ids.coverage(s for ml in chats.values() for s in (m.get("sender") for m in ml) if s)
+    print(f"[+] senders identified: " + "  ".join(f"{k}={v}" for k, v in cov.most_common()))
+    print(f"    transcripts.txt + chats.json + identities.json written")
 
 if __name__ == "__main__":
     main()

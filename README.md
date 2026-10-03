@@ -55,13 +55,46 @@ full, copy-pasteable paths.
 Repeatable. `FORMAT` is `txt`, `json`, `sqlite`/`db` or `raw`; a plain path writes text **and** JSON:
 
 ```bash
-wawf <PROFILE> --out D:\case\out              # transcripts.txt AND chats.json
+wawf <PROFILE> --out D:\case\out              # transcripts.txt + chats.json + identities.json
 wawf <PROFILE> --out txt:D:\case\out          # only transcripts.txt
-wawf <PROFILE> --out json:D:\case\out         # only chats.json
+wawf <PROFILE> --out json:D:\case\out         # only chats.json + identities.json
 wawf <PROFILE> --out sqlite:D:\case\db        # Android msgstore.db + wa.db
 wawf <PROFILE> --out raw:D:\case\raw          # every store verbatim, decrypted in place
 wawf <PROFILE> --out sqlite:D:\case\db --out raw:D:\case\raw    # several at once
 ```
+
+#### Who sent it
+
+Every message names its sender. WhatsApp addresses one person three ways — `<phone>@c.us` (UI form),
+`<phone>@s.whatsapp.net` (the same phone, wire form) and `<lid>@lid` (an account alias, which is what
+recent messages actually carry) — so a transcript that printed the raw field would be unreadable, and
+one that printed "me / them" would be unusable. Both are resolved against the examined profile's own
+`contact` and `group-metadata` stores:
+
+```
+===== Weekend plans  [120363000000000000@g.us]  (group; 412 msgs, 390 text) =====
+  - Dev                        244358000000001@lid  919300000001@c.us
+  - Riya                       133461000000002@lid  919300000002@c.us  (me)
+[2026-07-03 00:50:37] ->                   Riya: I wanted to try golf at least once
+[2026-07-03 00:51:02] <-                    Dev: next weekend?
+```
+
+A name comes from the address book first, then the contact's own `pushname`, then their phone number,
+and **when nothing is known the jid is printed unchanged** — a label is never invented, so
+"unidentified" stays visibly different from "identified". Each chat header lists its senders with
+every jid form they appear under, so any line can be traced back to an identifier.
+
+`chats.json` keeps `sender` exactly as stored and **adds** `sender_name`, `sender_lid`,
+`sender_phone`, `sender_source` and `chat_name` beside it — nothing is replaced by an interpretation
+of it. `identities.json` is the correlation table itself: jid ↔ lid ↔ phone ↔ name ↔ pushname, where
+each label came from, which contacts are in the address book, plus group subjects, members, **past**
+members and admins. That mapping is the one thing the browser holds and the wire format does not: a
+lid-keyed contact record carries the matching `phoneNumber`, and on disk that is the only place the
+lid→phone link exists.
+
+The SQLite export carries the same correlation natively, in the Android shape a msgstore parser
+expects (`message.sender_jid_row_id` → `jid`, `chat.jid_row_id` → `jid`, `jid` → `wa_contacts`), so
+tools built for Android databases resolve senders from it without any extra work.
 
 #### `raw` — decrypt, and change nothing else
 
@@ -99,6 +132,16 @@ A Windows drive letter is never mistaken for a `FORMAT`, so `D:\case\out` works 
 | `--history` | *Instead of decrypting:* pull chat history older than the browser cache from your phone, iteratively, resuming across runs. Needs Node (offers to install it). Phone-side and rate-limited — see below. |
 | `--memory (--live \| --memimage FILE)` | *Instead of reconnecting:* find the key in RAM / swap / hibernation. `--live` is Linux-only (reads `/proc`, needs root); `--memimage` works anywhere. |
 | `--audit` | Write a chain-of-custody database beside the output (see below). |
+
+Sender resolution is **reported, not assumed** — a run prints where every label came from, so the one
+number that matters is visible:
+
+```
+senders identified: address-book=14,250  pushname=7,325  phone=543  unresolved=0
+```
+
+`unresolved` counts messages from jids the profile itself holds no name and no number for. On a
+healthy profile it is zero; anything else is a gap in the evidence, not a gap in the tool.
 | `-v`, `--log-file FILE` | Full logs and tracebacks; mirror them to a file. |
 
 ## Chain of custody — `--audit` (optional)

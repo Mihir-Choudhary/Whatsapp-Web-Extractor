@@ -178,7 +178,7 @@ def _load_wa(a):
     # exact stage it died in rather than just 'started'.
     AUDIT.event("reading browser storage (IndexedDB + localStorage) — can take a minute on a large profile",
                 category="stage", detail={"source": src})
-    engine, ls, root, msgs, meta = WD.load(getattr(a, "profile", None), getattr(a, "origin", None))
+    engine, ls, root, msgs, meta, ids = WD.load(getattr(a, "profile", None), getattr(a, "origin", None))
     log.info("engine=%s  messages=%d  root_key=%s  ls_keys=%d", engine, len(msgs), "yes" if root else "NO", len(ls))
     # what came OUT of the evidence source, and the on-disk root key that everything derives from
     AUDIT.event("loaded WhatsApp Web store", category="acquire",
@@ -189,7 +189,7 @@ def _load_wa(a):
                      "CryptoKey serialized to disk)", input_desc=src,
                      detail={"engine": engine, "root_len": len(root)})
     if not root: raise SystemExit("root key not found in wawc_db_enc/keys (is this a WhatsApp Web profile?)")
-    return WD, engine, ls, root, msgs, meta
+    return WD, engine, ls, root, msgs, meta, ids
 
 def _msg_date(v):
     try:
@@ -657,7 +657,7 @@ def cmd_decrypt(a):
     from cryptography.hazmat.primitives.kdf.hkdf import HKDF
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    WD, engine, ls, root, msgs, meta = _load_wa(a)
+    WD, engine, ls, root, msgs, meta, ids = _load_wa(a)
     _require_session(ls, getattr(a, "profile", None) or getattr(a, "origin", None))
     _summary(engine, ls, msgs, meta)
     salt_ws = base64.b64decode(json.loads(ls["WAWebEncKeySalt"]))
@@ -701,30 +701,45 @@ def cmd_decrypt(a):
         if not m["data"] or m["scheme"] != 1: continue   # scheme-1 only; skip scheme-0 (would be garbage)
         try: pt = WD.pk7(Cipher(algorithms.AES(key), modes.CBC(m["iv"])).decryptor().update(m["data"]))
         except Exception as e: fail += 1; log.debug("decrypt fail %s: %s", m["id"][:24], e); continue
-        chats[m["chat"]].append({"t": ts(m["t"]), "dir": "me" if m["from_me"] else "them",
-                                 "type": m["type"], "sender": m["sender"], "text": " ".join(dict.fromkeys(WD.leaves(pt)))[:2000]})
+        chats[m["chat"]].append(WD.msg_row(m, ts(m["t"]), WD.message_text(pt), ids))
         ok += 1
     for c in chats: chats[c].sort(key=lambda x: x["t"])
+    # Who is who, measured rather than assumed: every sender's label and where that label came from.
+    # "unresolved" is the number an examiner cares about -- jids the profile itself cannot name.
+    senders = [m["sender"] for ml in chats.values() for m in ml if m.get("sender")]
+    cov = ids.coverage(senders)
+    log.info("senders identified: %s", "  ".join(f"{k}={v:,}" for k, v in cov.most_common()) or "none")
+    if cov.get("unresolved"):
+        log.info("  %d message(s) from jids this profile holds no name or number for — the raw jid is "
+                 "used as the label, never a guess", cov["unresolved"])
     only = getattr(a, "only", None)                      # 'txt' / 'json' from --out FORMAT:PATH; None = both
     if only != "txt":
         json.dump(chats, open(f"{a.out}/chats.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1, default=str)
+        # The correlation table itself, as its own artifact: jid <-> lid <-> phone <-> name, plus group
+        # subjects and membership. chats.json carries the resolved name on every message; this is what
+        # you join on, and what shows the alternatives a label was chosen from.
+        tbl = ids.table(set(chats) | set(senders))
+        json.dump(tbl, open(f"{a.out}/identities.json", "w", encoding="utf-8"), ensure_ascii=False,
+                  indent=1, default=str)
+        AUDIT.artifact(f"{a.out}/identities.json", kind="identity correlation (jid/lid/phone/name)",
+                       records=len(tbl["identities"]))
     if only == "json":
         log.info("decrypted %d bodies (%d failed) -> %s/chats.json", ok, fail, a.out)
         AUDIT.artifact(f"{a.out}/chats.json", kind="decrypted chats (JSON)", records=ok)
         return 0
-    with open(f"{a.out}/transcripts.txt", "w", encoding="utf-8") as f:  # message text has emoji/non-Latin -> pin UTF-8 (Windows default is cp1252)
-        for c, ml in sorted(chats.items(), key=lambda kv: -len(kv[1])):
-            tm = [m for m in ml if m["text"]]
-            if not tm: continue
-            f.write(f"\n===== {c} ({len(ml)} msgs, {len(tm)} text) =====\n")
-            for m in ml:
-                if m["text"]: f.write(f"[{m['t']}] {m['dir']:>4}: {m['text']}\n")
-    log.info("decrypted %d bodies (%d failed) -> %s/ (chats.json + transcripts.txt)", ok, fail, a.out)
+    WD.write_transcripts(f"{a.out}/transcripts.txt", chats, ids)
+    # name what was actually written: with --out txt:PATH the JSON side is skipped, and a log line
+    # that lists files that are not there is a log line that gets believed
+    wrote = "transcripts.txt" if only == "txt" else "chats.json + identities.json + transcripts.txt"
+    log.info("decrypted %d bodies (%d failed) -> %s/ (%s)", ok, fail, a.out, wrote)
     # outcome of the bulk decrypt + hashes of what was produced (so the exports are tamper-evident)
     AUDIT.crypto("decrypt", algorithm="AES-CBC-128", scheme="1 (final)", key=key,
                  input_desc="all scheme-1 msgRowOpaqueData bodies", records_in=ok + fail,
                  records_ok=ok, records_failed=fail, detail={"chats": len(chats)})
-    AUDIT.artifact(f"{a.out}/chats.json", kind="decrypted chats (JSON)", records=ok)
+    # only record artifacts that were actually produced: with --out txt:PATH there is no chats.json,
+    # and a custody record asserting a file that does not exist is worse than no record
+    if only != "txt":
+        AUDIT.artifact(f"{a.out}/chats.json", kind="decrypted chats (JSON)", records=ok)
     AUDIT.artifact(f"{a.out}/transcripts.txt", kind="decrypted transcripts (text)", records=ok)
     return 0
 
@@ -1445,13 +1460,14 @@ def main():
         "                        That is the whole job; there are no sub-commands to chain.\n"
         "\n"
         "OUTPUT  --out [FORMAT:]PATH   (repeatable; default: wawf_out as text + JSON)\n"
-        "  --out D:\\case\\out                transcripts.txt AND chats.json in that folder\n"
-        "  --out txt:D:\\case\\out            only transcripts.txt (readable transcripts)\n"
-        "  --out json:D:\\case\\out           only chats.json (structured, per chat)\n"
+        "  --out D:\\case\\out                transcripts.txt + chats.json + identities.json\n"
+        "  --out txt:D:\\case\\out            only transcripts.txt (senders named)\n"
+        "  --out json:D:\\case\\out           chats.json + identities.json (structured)\n"
         "  --out sqlite:D:\\case\\db          Android-style msgstore.db + wa.db (open in any SQLite\n"
         "                                     viewer, or ingest with a WhatsApp forensic suite)\n"
+        "  --out raw:D:\\case\\raw            every object store verbatim, decrypted in place\n"
         "  --out sqlite:D:\\case\\db --out txt:D:\\case\\out       write several formats at once\n"
-        "  (FORMAT is one of txt, json, sqlite/db. A plain path with no FORMAT: writes text + JSON.\n"
+        "  (FORMAT is one of txt, json, sqlite/db, raw. A plain path with no FORMAT: writes text+JSON.\n"
         "   A drive letter is never mistaken for a format, so D:\\case\\out works as you'd expect.)\n"
         "\n"
         "OPTIONAL EXTRAS\n"

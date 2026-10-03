@@ -33,6 +33,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller                 # build-only (not a runtime dep)
           pip install -r requirements.txt
+      # Needs no profile, no network and no secrets, so it belongs in CI: these cover the parts
+      # where a quiet mistake mislabels evidence instead of failing loudly.
+      - name: Self-tests
+        shell: bash
+        run: |
+          python scripts/selftest_identities.py
+          python scripts/selftest_anchors.py
       - name: Build
         run: pyinstaller wawf.spec --noconfirm
       - name: Rename artifact

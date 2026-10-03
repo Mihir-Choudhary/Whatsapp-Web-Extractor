@@ -46,6 +46,16 @@ wainsight_case/
 storage_export/
 wa_decrypted/
 
+# THE DECRYPTED OUTPUTS THEMSELVES. `--out` defaults to ./wawf_out, and `--out .` is a thing people
+# type, so these land in the current directory -- which, in a clone, is the repo. transcripts.txt and
+# chats.json are the message bodies; identities.json is the most directly identifying artifact the
+# tool writes (every contact's name, phone number and lid<->phone mapping). Wildcarded like the
+# neighbours above, because a dated or .bak copy is trivially made and an exact-name entry lets it by.
+wawf_out/
+transcripts.txt*
+chats.json*
+identities.json*
+
 # Chain-of-custody case databases (--audit) and common output dirs: these hold real evidence
 # (decrypted messages, contacts, evidence hashes, key fingerprints) and must never be committed.
 wawf_audit.db

@@ -14,7 +14,6 @@ are exported to message_media but the browser cache isn't decoded — recover me
 (The Android schema is also ingestable by third-party suites such as akhil-dara/WAInsight.)
 """
 import sys as _sys
-import unicodedata                 # text filter: symbol/punctuation categories
 def _force_utf8_stdio():
     """Redirected/piped stdout defaults to the locale encoding, so a box-drawing character
     in a summary raises UnicodeEncodeError and takes the rest of the output with it."""
@@ -26,6 +25,10 @@ import sqlite3, sys, os, base64, json, glob, hashlib, re, argparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from snappy_pure import uncompress
 from idbutil import store_id
+# ONE text builder for every export, so a message cannot read differently in two exports of the same
+# evidence. (It used to be copied here, and when the filter was found to be dropping 767 messages the
+# fix had to be made twice -- that is the failure mode this import exists to prevent.)
+from wa_decrypt import message_text
 import sclone
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
@@ -155,58 +158,13 @@ A.crypto("derive", algorithm="AES-CBC-128", kdf="HKDF-SHA256 len=16", scheme="1 
 def pk7(b):
     if not b or len(b) % 16: return b
     p = b[-1]; return b[:-p] if 1 <= p <= 16 and b[-p:] == bytes([p])*p else b
-def rd_varint(b, i):
-    n = s = 0
-    while True:
-        x = b[i]; i += 1; n |= (x & 0x7f) << s; s += 7
-        if not x & 0x80: break
-    return n, i
-# TEXT FILTER NOTE: this used to require any(c.isalpha()), i.e. at least one LETTER. That silently
-# discarded every message without one: emoji-only replies, numbers, dates, prices, bare punctuation
-# and @mention-only messages. Measured across a 22,121-message store, 767 messages lost their text to
-# that single condition, 745 of them emoji. The printable-ratio test already rejects binary and the
-# base64 test already rejects thumbnails, so the letter requirement did no work except lose evidence.
-# Re-measured after relaxing it to alphanumeric-or-symbol-or-punctuation: 767 recovered, 0 lost.
-#
-# One narrowing on top of that: a string that is NOTHING BUT digits and 12 or more of them is an
-# identifier -- a phone number, a jid user part, a message id -- not something a person typed, and
-# `leaves()` collects every string in the tree so such a value would be concatenated into the
-# transcript as if it were message content. Measured: that guard removes all 3 such strings in this
-# store and loses 0 real messages, where requiring letters-or-emoji instead would have cost 239.
-def leaves(buf, depth=0, out=None):
-    if out is None: out = []
-    i, n = 0, len(buf)
-    while i < n:
-        try:
-            tag, i = rd_varint(buf, i); wt = tag & 7
-            if wt == 0: _, i = rd_varint(buf, i)
-            elif wt == 5: i += 4
-            elif wt == 1: i += 8
-            elif wt == 2:
-                ln, i = rd_varint(buf, i); seg = buf[i:i+ln]; i += ln
-                sub = []
-                if len(seg) >= 2 and seg[0] in (0x08,0x0a,0x10,0x12,0x1a,0x22,0x2a):
-                    try: leaves(seg, depth+1, sub)
-                    except Exception: sub = []
-                if sub: out += sub
-                else:
-                    try:
-                        t = seg.decode('utf-8')
-                        if t and t != 'null' and sum(c.isprintable() for c in t) >= len(t)*0.9 \
-                           and any(c.isalnum() or unicodedata.category(c)[0] in ('S','P') for c in t) and not (t.strip().isdigit() and len(t.strip()) >= 12) and not re.fullmatch(r'[A-Za-z0-9+/]{40,}={0,2}', t):
-                            out.append(t)
-                    except Exception: pass
-            else: break
-        except Exception: break
-    return out
 def decrypt_body(op):
     if not isinstance(op, dict) or op.get('_scheme') != 1: return None   # MSGKEY is the scheme-1 key (scheme-0 -> garbage)
     iv = as_bytes(op.get('iv')); data = as_bytes(op.get('_data'))
     if not iv or not data: return None
     try: pt = pk7(Cipher(algorithms.AES(MSGKEY), modes.CBC(iv)).decryptor().update(data))
     except Exception: return None
-    txt = leaves(pt)
-    return ' '.join(dict.fromkeys(txt))[:8000] if txt else None
+    return message_text(pt, 8000) or None
 
 def ser(x):
     if isinstance(x, dict): return as_text(x.get('_serialized')) or (f"{as_text(x.get('user'))}@{as_text(x.get('server'))}" if x.get('user') else None)
