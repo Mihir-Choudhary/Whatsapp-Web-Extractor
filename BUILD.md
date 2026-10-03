@@ -51,3 +51,30 @@ the helper's `__main__` in-process via `runpy`. In dev mode it just runs
 - `sqlite` — parse + key-validate pipeline, refuses a wrong key (exit 3), writes nothing on rejection
 - frozen `.exe`: `_runpy` dispatch (`sqlite`/`memory`), `history` guard, `memory` EOF/platform handling
 - exit codes: 0 ok · 1 error · 2 usage · 3 wrong key · 4 file-not-found
+
+## Windows blocks the binary it just built
+
+The exe is unsigned, and on a machine with **Smart App Control** enabled Windows refuses to run it:
+
+```
+Program 'wawf.exe' failed to run: An Application Control policy has blocked this file
+```
+
+This is reputation-based, not signature-based, so it hits a *freshly built* binary specifically.
+Observed on one machine during a single session: two earlier builds ran fine while the newest was
+blocked, with `(Get-MpComputerStatus).SmartAppControlState` reporting `On`. Nothing about the build
+changed between them except that the last one had never been seen before.
+
+It matters for distribution, not just for building: anyone downloading a release binary onto a Smart
+App Control machine can hit the same thing, and the message does not mention the tool at all.
+
+Ways round it, in the order worth trying:
+
+* run from source instead (`pip install -r requirements.txt && python wawf.py ...`) -- no binary, no
+  policy to satisfy, and in a forensic context arguably the better provenance anyway;
+* check `SmartAppControlState`: once it is `On` it cannot be re-enabled after being turned off, so
+  turning it off is a one-way decision about the whole machine and not one to make casually;
+* sign the binary with a certificate the machine trusts, which is the only real fix for distribution.
+
+A blocked launch is an OS policy decision and says nothing about whether the build is good: verify a
+build by running it from source, or on a machine without the policy.
