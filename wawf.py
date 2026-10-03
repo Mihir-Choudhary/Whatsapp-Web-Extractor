@@ -427,7 +427,10 @@ def _pb_tree(buf, depth=0):
     return out
 
 
-def _jsonable(o, depth=0):
+_JSONABLE_MAX_DEPTH = 32
+
+
+def _jsonable(o, depth=0, seen=None):
     """Make a structured-clone record JSON-serialisable WITHOUT reshaping it.
 
     Field names, ordering and the literal "<Undefined>" markers are all left exactly as the browser
@@ -441,10 +444,24 @@ def _jsonable(o, depth=0):
     if isinstance(o, (bytes, bytearray, memoryview)):
         b = bytes(o)
         return {"__bytes__": base64.b64encode(b).decode(), "len": len(b)}
+    # The structured clone format PERMITS CYCLES -- an object may reference itself or an ancestor --
+    # and `depth` used to be threaded through here without ever being compared to anything, so it
+    # read like a guard while being none. One self-referencing record would then recurse until
+    # RecursionError and take the whole dump down, losing every store after it. Neither condition
+    # occurred in the 70,476 records of this profile, which is exactly why it needs handling now
+    # rather than when it appears on someone else's.
+    if depth > _JSONABLE_MAX_DEPTH:
+        return {"__truncated__": "nesting deeper than %d" % _JSONABLE_MAX_DEPTH}
+    if seen is None:
+        seen = ()
+    if id(o) in seen:
+        return {"__cycle__": True}
     if isinstance(o, dict):
-        return {str(k): _jsonable(v, depth + 1) for k, v in o.items()}
+        seen = seen + (id(o),)
+        return {str(k): _jsonable(v, depth + 1, seen) for k, v in o.items()}
     if isinstance(o, (list, tuple)):
-        return [_jsonable(v, depth + 1) for v in o]
+        seen = seen + (id(o),)
+        return [_jsonable(v, depth + 1, seen) for v in o]
     # JavaScript `undefined` is a VALUE in these records, and distinct from null -- the structured
     # clone format keeps them apart, and whether a field was never set or was explicitly nulled can
     # matter. JSON has neither, so it gets an unambiguous marker of its own rather than falling into
@@ -483,13 +500,6 @@ def cmd_raw(a):
     the store plus a decryption, and never a substitute for it. One JSONL file per object store.
     """
     _require_source(a, "raw")
-    key = None
-    if a.enc_static:
-        import wa_decrypt as WD
-        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-        from cryptography.hazmat.primitives import hashes
-        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-
     if a.profile and os.path.isdir(os.path.join(a.profile, "IndexedDB")):
         sys.path.insert(0, os.path.join(HERE, "scripts"))
         import chromium_reader as cr
@@ -581,6 +591,8 @@ def cmd_raw(a):
                            "__undefined__": "JavaScript undefined, which JSON cannot express and "
                                             "which is NOT the same as null",
                            "__repr__": "a value no other marker covers, as its Python repr",
+                           "__cycle__": "a reference back to an enclosing object",
+                           "__truncated__": "nesting beyond the depth cap",
                            "_wawf_plaintext_b64": "decrypted msgRowOpaqueData._data, verbatim",
                            "_wawf_plaintext_fields": "the same bytes as a schema-free protobuf tree",
                            "_wawf_plaintext_error": "why a body could not be decrypted"},
