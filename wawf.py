@@ -238,6 +238,14 @@ def cmd_run(a):
         return 3
 
     key = _find_key(a, workdir, outs)
+    if not key and getattr(a, "key", None):
+        # The user named this file. Falling back to a networked reconnect here would contradict the
+        # entire reason --key exists -- it is how you decrypt WITHOUT touching the account -- and
+        # would quietly do the one thing the flag was chosen to avoid. _find_key has already said
+        # what is wrong with the file.
+        log.error("--key was given but could not be used, so stopping rather than reaching for the "
+                  "network. Fix the file, or omit --key to capture a fresh one deliberately.")
+        return 3
     if not key:
         log.info("[2/3] reconnecting as the linked device to capture the at-rest key (NETWORKED) ...")
         keyfile = os.path.join(workdir, KEY_FILENAME)
@@ -896,7 +904,11 @@ def cmd_memory(a):
     if a.live: extra.append("--live")
     if a.memimage: extra += ["--memimage", a.memimage]
     if a.deep: extra.append("--deep")
-    if a.enc_static: extra += ["--enc-static", a.enc_static]
+    # Renaming --enc-static to --key removed this attribute from the top-level namespace, and this
+    # line then crashed every --memory/--memimage run with AttributeError. Resolve from the key FILE.
+    _k = getattr(a, "enc_static", None) or (_read_key_file(a.key) if getattr(a, "key", None)
+                                            and os.path.isfile(a.key) else None)
+    if _k: extra += ["--enc-static", _k]
     if a.origin: extra += ["--origin", a.origin]
     if a.yes: extra.append("--yes")
     return _sub("wa_forensic.py", extra)
