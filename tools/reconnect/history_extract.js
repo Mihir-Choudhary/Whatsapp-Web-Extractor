@@ -241,14 +241,45 @@ function histNotif(message){ // dig through device/ephemeral wrappers
       Promise.resolve(sock.requestPlaceholderResend(m.key)).catch(()=>{});
     }
   } });
+  const all=new Map(); let done=false, opened=false;
+  // Checkpoint the accumulated messages to disk. Called after EVERY page (not just at the end) so a
+  // kill/crash/timeout never loses what was already pulled (writes atomically via a temp rename).
+  const writeOut=()=>{ try{
+    const arr=[...all.values()]; const nw=arr.filter(m=>!ondisk.has(m.id));
+    const byChat={}; for(const m of nw) byChat[m.chat]=(byChat[m.chat]||0)+1;
+    fs.writeFileSync(OUT+'.tmp', JSON.stringify({recovered_total:arr.length, new_not_on_disk:nw.length, by_chat:byChat, messages:nw},null,1));
+    fs.renameSync(OUT+'.tmp', OUT);
+    return {tot:arr.length, nw:nw.length, chats:Object.keys(byChat).length};
+  }catch(e){ console.error('  [checkpoint err]', e.message); return null; } };
+  // Declared ABOVE the event handlers on purpose. The handlers bank late arrivals into `all`
+  // and checkpoint through `writeOut`, and both are `const`: if an await were ever introduced
+  // between registering a handler and these lines, an early event would hit the temporal dead
+  // zone and throw instead of saving messages. Keeping them first removes that possibility.
+
   sock.ev.on('messages.upsert', async u=>{ for(const m of (u.messages||[])){
     const hn=histNotif(m.message); if(!hn) continue;
     const sid=hn.peerDataRequestSessionId; const r=resolveFor(sid,'upsert');
-    if(!r) continue;
+    // SALVAGE A LATE ANSWER. `resolveFor` returning null means no request is waiting any more --
+    // almost always because we timed out and deleted the pending entry. The old code did
+    // `if(!r) continue;` here, i.e. it threw the notification away without downloading it, which
+    // directly contradicts the rule stated above this handler: never discard a history blob we were
+    // sent. It also made a slow phone indistinguishable from a silent one, and shortening the
+    // per-request deadline to the reference client's 10s widened the window in which that happens.
+    // The chunk is still valid evidence and every message in it carries its own chat, so it needs no
+    // promise to be filed correctly -- download it, bank it, and say so.
     let msgs=null;                  // null = download/decode error (distinct from [] = genuine empty page)
     try{ const blob=await fetchBlob(hn); const inf=decryptHistory(blob, Buffer.from(hn.mediaKey));
          msgs=flatten(B.proto.HistorySync.decode(inf)); }
     catch(e){ console.error('  blob err', e.message); }
+    if(!r){
+      if(msgs&&msgs.length){
+        let fresh=0; for(const mm of msgs){ if(!all.has(mm.id)) fresh++; all.set(mm.id,mm); }
+        const w=writeOut();
+        console.error(`  [late] a notification arrived after its request had timed out: banked `
+          +`${msgs.length} message(s), ${fresh} new`+(w?` (total ${w.tot})`:''));
+      }
+      continue;
+    }
     r(msgs); } });
 
   // Baileys ALSO processes the on-demand history internally (Utils/process-message.js) and emits it here
@@ -258,7 +289,20 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   sock.ev.on('messaging-history.set', d=>{
     if(!d) return;
     const sid=d.peerDataRequestSessionId; const r=resolveFor(sid,'messaging-history.set');
-    if(!r) return;
+    // Same salvage as above: Baileys has already downloaded and decrypted this one itself, so a late
+    // arrival costs nothing to keep and dropping it would lose recovered messages outright.
+    if(!r){
+      const late=(d.messages||[]).map(w=>({ chat:w.key&&w.key.remoteJid, id:w.key&&w.key.id,
+        fromMe:!!(w.key&&w.key.fromMe), ts:Number(w.messageTimestamp)||0, text:txt(w.message),
+        type:w.message?Object.keys(w.message)[0]:'?' })).filter(x=>x.id);
+      if(late.length){
+        let fresh=0; for(const mm of late){ if(!all.has(mm.id)) fresh++; all.set(mm.id,mm); }
+        const w2=writeOut();
+        console.error(`  [late] history set arrived after its request had timed out: banked `
+          +`${late.length} message(s), ${fresh} new`+(w2?` (total ${w2.tot})`:''));
+      }
+      return;
+    }
     const msgs=(d.messages||[]).map(w=>({ chat:w.key&&w.key.remoteJid, id:w.key&&w.key.id, fromMe:!!(w.key&&w.key.fromMe),
       ts:Number(w.messageTimestamp)||0, text:txt(w.message), type:w.message?Object.keys(w.message)[0]:'?' })).filter(m=>m.chat&&m.id);
     console.error('  [messaging-history.set] '+msgs.length+' msgs for session '+sid);
@@ -315,16 +359,6 @@ function histNotif(message){ // dig through device/ephemeral wrappers
       .then(rid=>{ id=rid; lastRequestId=rid; pending.set(rid, msgs=>{ clearTimeout(timer); res(msgs); }); })
       .catch(e=>{ clearTimeout(timer); console.error('  fetch err', e.message); res(null); }); });
 
-  const all=new Map(); let done=false, opened=false;
-  // Checkpoint the accumulated messages to disk. Called after EVERY page (not just at the end) so a
-  // kill/crash/timeout never loses what was already pulled (writes atomically via a temp rename).
-  const writeOut=()=>{ try{
-    const arr=[...all.values()]; const nw=arr.filter(m=>!ondisk.has(m.id));
-    const byChat={}; for(const m of nw) byChat[m.chat]=(byChat[m.chat]||0)+1;
-    fs.writeFileSync(OUT+'.tmp', JSON.stringify({recovered_total:arr.length, new_not_on_disk:nw.length, by_chat:byChat, messages:nw},null,1));
-    fs.renameSync(OUT+'.tmp', OUT);
-    return {tot:arr.length, nw:nw.length, chats:Object.keys(byChat).length};
-  }catch(e){ console.error('  [checkpoint err]', e.message); return null; } };
   const finish=(c)=>{ if(done)return; done=true;
     const r=writeOut();
     if(r) console.error(`\n[DONE] recovered=${r.tot} NEW(not-on-disk)=${r.nw} across ${r.chats} chats -> ${OUT}`);
