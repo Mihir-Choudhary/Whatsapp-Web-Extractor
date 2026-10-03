@@ -60,8 +60,19 @@ const ourDevice = (() => {                       // ":44" out of "1234:44@s.what
 
 let answered = false, verdict = 'UNKNOWN';
 (async () => {
+  // Announce the build THIS profile's browser runs, taken from its own WAVersionBase, in preference to
+  // Baileys' default of asking a third-party endpoint (fetchLatestBaileysVersion) and falling back to a
+  // hardcoded constant. Not cosmetic: WhatsApp gates on-demand history on an AB prop
+  // (`history_sync_on_demand_companion`), and AB prop values are assigned by the server per client
+  // version and platform, so announcing a stale build asks for a version-gated feature as the wrong
+  // client. Measured on this profile: we announced 2.3000.1043857760, the browser 2.3000.1049127777.
+  // Falls back to the old lookup when the profile did not carry one.
   let version = [2, 3000, 1023223821];
-  try { version = (await B.fetchLatestBaileysVersion()).version; } catch (e) {}
+  if (Array.isArray(inp.wa_version) && inp.wa_version.length === 3) {
+    version = inp.wa_version.map(Number);
+  } else {
+    try { version = (await B.fetchLatestBaileysVersion()).version; } catch (e) {}
+  }
   console.error(`[health] device slot :${ourDevice}  registrationId ${creds.registrationId}  WA ${version.join('.')}`);
 
   const sock = makeWASocket({ version, auth: { creds, keys: rt.keys }, logger: quiet,

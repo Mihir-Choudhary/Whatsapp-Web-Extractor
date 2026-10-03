@@ -327,6 +327,77 @@ def cmd_decrypt(a):
     AUDIT.artifact(f"{a.out}/transcripts.txt", kind="decrypted transcripts (text)", records=ok)
     return 0
 
+def _wa_user_prefs(profile, origin):
+    """Read WhatsApp Web's own `model-storage/user-prefs` key/value store off the profile.
+
+    This is a different store from the one the credential export reads (`wawc/user`), and it holds
+    the client's self-description: the build it runs, its edge routing, the feature list its phone
+    advertised. Exception-safe by design -- every caller treats a missing value as "fall back to the
+    old behaviour", so a profile shape we have not seen degrades instead of failing.
+    """
+    try:
+        if profile and os.path.isdir(os.path.join(profile, "IndexedDB")):
+            sys.path.insert(0, os.path.join(HERE, "scripts"))
+            import chromium_reader as _cr
+            recs = _cr.load_source(profile)["idb"].get("model-storage", {}).get("user-prefs", [])
+        elif origin:
+            import glob as _glob, sqlite3 as _sq
+            sys.path.insert(0, os.path.join(HERE, "scripts"))
+            from snappy_pure import uncompress as _unc
+            from idbutil import store_id as _sidf
+            import sclone as _sc
+            mm = _glob.glob(f"{origin}/idb/*meogdaerlo*.sqlite")
+            if not mm:
+                return {}
+            con = _sq.connect(f"file:{mm[0]}?mode=ro&immutable=1", uri=True)
+            sid = _sidf(con, "user-prefs")
+            if sid is None:
+                return {}
+            recs = []
+            for (row,) in con.execute("SELECT data FROM object_data WHERE object_store_id=?", (sid,)):
+                try:
+                    recs.append(_sc.loads(_unc(row)))
+                except Exception:
+                    continue
+        else:
+            return {}
+        return {str(r.get("key")): r.get("value") for r in (recs or [])
+                if isinstance(r, dict) and r.get("key") is not None}
+    except Exception as e:
+        log.debug("could not read user-prefs: %s", e)
+        return {}
+
+
+def _wa_version(profile, origin):
+    """The client version WhatsApp Web announces in its ClientPayload, taken from the profile.
+
+    `WAVersionBase` in model-storage/user-prefs is the build the browser actually runs, and it is
+    corroborated by the loader's own urls (`__spin_r=<build>`, `btmanifest/<build>/whatsapp/main`).
+
+    This matters because it is not a cosmetic string. WhatsApp gates features on it: the on-demand
+    history check is
+
+        isWindows ? (PrimaryFeatures.extendedHistorySyncOnDemand
+                     && getABPropConfigValue('history_sync_on_demand_companion')) : true
+
+    and AB prop values are assigned by the server per client version and platform. Baileys instead
+    asks a THIRD-PARTY endpoint (fetchLatestBaileysVersion) and falls back to a hardcoded constant,
+    so we were announcing 2.3000.1043857760 while this profile's browser announced 2.3000.1049127777
+    -- over five million builds stale, on the one field a version-gated feature keys off.
+
+    Returns [major, minor, build] or None.
+    """
+    raw = _wa_user_prefs(profile, origin).get("WAVersionBase")
+    if raw is None:
+        return None
+    try:
+        parts = str(raw).strip().strip('"').split(".")
+        v = [int(x) for x in parts[:3]]
+        return v if len(v) == 3 else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _edge_routing(profile, origin):
     """The `ED=` query parameter WhatsApp Web puts on its own WebSocket url.
 
@@ -357,38 +428,12 @@ def _edge_routing(profile, origin):
     """
     try:
         import json as _json
-        recs = None
-        if profile and os.path.isdir(os.path.join(profile, "IndexedDB")):
-            sys.path.insert(0, os.path.join(HERE, "scripts"))
-            import chromium_reader as _cr
-            recs = _cr.load_source(profile)["idb"].get("model-storage", {}).get("user-prefs", [])
-        elif origin:
-            import glob as _glob, sqlite3 as _sq
-            sys.path.insert(0, os.path.join(HERE, "scripts"))
-            from snappy_pure import uncompress as _unc
-            from idbutil import store_id as _sidf
-            import sclone as _sc
-            mm = _glob.glob(f"{origin}/idb/*meogdaerlo*.sqlite")
-            if not mm:
-                return None
-            con = _sq.connect(f"file:{mm[0]}?mode=ro&immutable=1", uri=True)
-            sid = _sidf(con, "user-prefs")
-            if sid is None:
-                return None
-            recs = []
-            for (row,) in con.execute("SELECT data FROM object_data WHERE object_store_id=?", (sid,)):
-                try:
-                    recs.append(_sc.loads(_unc(row)))
-                except Exception:
-                    continue
-        for r in recs or []:
-            if isinstance(r, dict) and str(r.get("key")) == "WARoutingInfo":
-                v = r.get("value")
-                if isinstance(v, str):
-                    v = _json.loads(v)
-                if isinstance(v, dict):
-                    er = v.get("edgeRouting")
-                    return er if isinstance(er, str) and er else None
+        v = _wa_user_prefs(profile, origin).get("WARoutingInfo")
+        if isinstance(v, str):
+            v = _json.loads(v)
+        if isinstance(v, dict):
+            er = v.get("edgeRouting")
+            return er if isinstance(er, str) and er else None
     except Exception as e:
         log.debug("edge routing unavailable: %s", e)
     return None
@@ -458,6 +503,11 @@ def cmd_creds(a):
     _er = _edge_routing(a.profile, a.origin)        # the ED= the real client puts on its socket url
     if _er:
         out["edge_routing"] = _er
+    _wv = _wa_version(a.profile, a.origin)         # announce the build THIS profile's browser runs
+    if _wv:
+        out["wa_version"] = _wv
+        log.info("client version from the profile: %s (announced instead of a third-party lookup)",
+                 ".".join(str(x) for x in _wv))
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     json.dump(out, open(a.out, "w", encoding="utf-8"), indent=1)
     abs_out = os.path.abspath(a.out)

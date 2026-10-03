@@ -148,7 +148,22 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   // Only meaningful when riding the browser profile's registration. With our own paired device the
   // profile's session count is irrelevant -- ownDevice.state carries its own keys.
   if(!ownDevice&&!rt.stats.sessions&&!rt.stats.carried) console.error('[!] no Signal sessions recovered -- inbound messages will NOT decrypt; re-run the credential export against the browser profile');
-  let version=[2,3000,1023223821]; try{version=(await B.fetchLatestBaileysVersion()).version;}catch(e){}
+  // Announce the build THIS profile's browser runs, taken from its own WAVersionBase, in preference to
+  // Baileys' default of asking a third-party endpoint (fetchLatestBaileysVersion) and falling back to a
+  // hardcoded constant. Not cosmetic: WhatsApp gates on-demand history on an AB prop
+  // (`history_sync_on_demand_companion`), and AB prop values are assigned by the server per client
+  // version and platform, so announcing a stale build asks for a version-gated feature as the wrong
+  // client. Measured on this profile: we announced 2.3000.1043857760, the browser 2.3000.1049127777.
+  // Falls back to the old lookup when the profile did not carry one.
+  let version=[2,3000,1023223821];
+  if(Array.isArray(inp.wa_version)&&inp.wa_version.length===3){
+    version=inp.wa_version.map(Number);
+    console.error('[i] announcing the profile\'s own client version '+version.join('.'));
+  } else {
+    try{version=(await B.fetchLatestBaileysVersion()).version;}catch(e){}
+    console.error('[i] no wa_version in creds — falling back to '+version.join('.')
+      +' (re-export creds to announce the profile\'s build)');
+  }
   // Make the FIRST retry receipt carry a fresh prekey bundle. When a payload cannot be decrypted
   // (inevitable here: the session in the profile is a snapshot of a live ratchet that has moved on)
   // the only way to recover is to ask the sender to re-encrypt to a NEW session, and the sender can
@@ -170,7 +185,27 @@ function histNotif(message){ // dig through device/ephemeral wrappers
       return v===undefined ? Math.max(1, rt.retryCount(id)) : v; },
     set:(k,v)=>retryCounters.set(k,v), del:k=>retryCounters.delete(k) };
   const authState = ownDevice ? ownDevice.state : {creds,keys:store};
-  const sock=makeWASocket({version,auth:authState,logger:P?P({level:'silent'}):undefined,msgRetryCounterCache,
+  // OPT-IN, default OFF: WA_SUBPLATFORM=win32 (or darwin) makes Baileys declare
+  // ClientPayload.WebInfo.webSubPlatform as WIN32/DARWIN instead of WEB_BROWSER. It only takes effect
+  // via getWebInfo(), which needs BOTH browser[0] to be a known OS name and syncFullHistory true --
+  // and on an already-registered login syncFullHistory touches nothing else: requireFullSync and
+  // historySyncConfig live in generateRegistrationNode (pairing only), and shouldSyncHistoryMessage is
+  // ours, so Baileys' auto-derived one is never used.
+  //
+  // Why it is worth having: WhatsApp's getEarliestHistorySyncDate() grants a desktop client
+  // ABProp('history_sync_on_demand_time_boundary_days_desktops') = 1095 days of reachable history,
+  // against YEAR_SECONDS for a browser. Three years instead of one.
+  //
+  // Why it is NOT the default: it means claiming to be the Windows desktop app while the DeviceProps
+  // registered at pair time -- by a browser -- say otherwise, and the real browser, which demonstrably
+  // CAN fetch history, sends WEB_BROWSER. So this is a deliberate DIVERGENCE from the reference
+  // client, not alignment with it. The last time this project diverged on a hunch (duplicating the ED
+  // routing parameter) it silently broke serving and cost a day. Enable it to test, with a probe.
+  const SUBPLAT=String(process.env.WA_SUBPLATFORM||'').toLowerCase();
+  const subplatOS={win32:'Windows',darwin:'Mac OS'}[SUBPLAT];
+  if(subplatOS) console.error(`[i] declaring webSubPlatform ${SUBPLAT.toUpperCase()} (WA_SUBPLATFORM) `
+    +`— diverges from the browser, which sends WEB_BROWSER`);
+  const sock=makeWASocket({version,auth:authState,syncFullHistory:!!subplatOS,logger:P?P({level:'silent'}):undefined,msgRetryCounterCache,
     printQRInTerminal:false,markOnlineOnConnect:true,syncFullHistory:false,
     // CRITICAL: accept ON_DEMAND history only, and decline the INITIAL (RECENT/bootstrap) sync.
     // On connect Baileys calls ev.buffer() and holds every event. If this predicate says yes to the
@@ -182,7 +217,7 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     // Declining here takes the 'History sync is disabled by config' branch -> Online + immediate flush,
     // while ON_DEMAND notifications are still processed (ON_DEMAND is in PROCESSABLE_HISTORY_TYPES).
     shouldSyncHistoryMessage:h=>{ try{ return !!h && h.syncType===B.proto.Message.HistorySyncNotification.HistorySyncType.ON_DEMAND; }catch(e){ return false; } },
-    getMessage:async()=>undefined,browser:['Forensic','Recovery','1.0']});
+    getMessage:async()=>undefined,browser:[subplatOS||'Forensic','Recovery','1.0']});
 
   // Correlate each response to its request by peerDataRequestSessionId (== the fetchMessageHistory id),
   // so a late/duplicate notification can't resolve a different chat's page. Only matched notifications
