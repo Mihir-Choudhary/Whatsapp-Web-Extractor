@@ -114,6 +114,29 @@ out3 = json.load(open(ap, encoding="utf-8"))
 check("anchor left alone", out3["anchors"][0]["oldest_id"], "OLD1")
 check("but the id is still recorded as on-disk", set(out3["ondisk_ids"]), {"S"})
 
+print("\n_deepen_anchors: `only` confines a targeted refetch, and survives being deepened")
+# A refetch narrows anchors.json to the chats that are missing something. The adoption below is what
+# defeated that: every chat in the ledger has recovered messages and no anchor, so the first deepen
+# re-created one for all 185 of them and the subset was gone. Measured on the real ledger before the
+# fix: filtered to 20, back to 185 after one pass.
+json.dump({"anchors": [
+    {"chat": "1203@g.us", "chat_id": "1203@g.us", "more_on_primary": True,
+     "oldest_id": "A0", "oldest_ts": 1_760_000_000, "oldest_fromMe": False},
+    {"chat": "9195@s.whatsapp.net", "chat_id": "9650@lid", "more_on_primary": True,
+     "oldest_id": "B0", "oldest_ts": 1_760_000_000, "oldest_fromMe": False}],
+    "ondisk_ids": []}, open(ap, "w", encoding="utf-8"))
+wawf._deepen_anchors(ap, {
+    "G1": {"id": "G1", "chat": "1203@g.us", "ts": 1_759_000_000, "fromMe": False},
+    "D1": {"id": "D1", "chat": "9195@s.whatsapp.net", "ts": 1_759_000_000, "fromMe": False},
+    "X1": {"id": "X1", "chat": "7777@g.us", "ts": 1_759_000_000, "fromMe": False}},
+    only={"1203@g.us"})
+a = json.load(open(ap, encoding="utf-8"))
+check("only the targeted chat remains", sorted(str(x["chat"]) for x in a["anchors"]), ["1203@g.us"])
+g = a["anchors"][0]
+check("...and it was still deepened", (g["oldest_id"], g["oldest_ts"]), ("G1", 1_759_000_000))
+check("...keeping its wire form and more_on_primary",
+      (g["chat"], g["more_on_primary"]), ("1203@g.us", True))
+
 print()
 if fails:
     print(f"FAILED ({len(fails)}): " + ", ".join(fails))

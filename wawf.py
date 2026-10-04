@@ -1213,7 +1213,7 @@ def _target_anchors(anchors_path, chats):
     os.replace(tmp, anchors_path)
     return len(keep), len(anchors) - len(keep)
 
-def _deepen_anchors(anchors_path, master):
+def _deepen_anchors(anchors_path, master, only=None):
     """Re-anchor each chat on the OLDEST message recovered so far and add all recovered ids to the
     on-disk set, so the next history pass continues further back instead of re-pulling the same window.
 
@@ -1230,6 +1230,13 @@ def _deepen_anchors(anchors_path, master):
     """
     a = json.load(open(anchors_path, encoding="utf-8"))
     ondisk = set(a["ondisk_ids"]); anchors = list(a["anchors"])
+    # `only` confines this to a set of chats, for a refetch that deliberately asks a subset. Without
+    # it the adoption below defeated that subset entirely: the anchors were filtered down to the 20
+    # chats missing a sender, and then the first call here re-created one for every chat in the
+    # ledger -- 185 of them -- because every one of those chats has recovered messages and no anchor.
+    if only is not None:
+        anchors = [x for x in anchors
+                   if str(x.get("chat")) in only or str(x.get("chat_id")) in only]
     # Index every jid form an anchor is known by, so a recovered message maps back to ITS anchor
     # whichever form the phone used to label it.
     idx = {}
@@ -1241,6 +1248,7 @@ def _deepen_anchors(anchors_path, master):
         if m.get("id"): ondisk.add(m["id"])
         c = m.get("chat"); ts = m.get("ts", 0)
         if not c or not m.get("id") or ts <= 0: continue   # ts<=0 (stubs) can't anchor fetchMessageHistory
+        if only is not None and str(c) not in only: continue   # outside a targeted refetch's scope
         x = idx.get(str(c))
         if x is None:                                      # a chat with no anchor: adopt it as-is
             x = {"chat": c, "chat_id": c, "more_on_primary": True}
@@ -1611,6 +1619,7 @@ def cmd_history(a):
     # disk (i.e. back at the browser-cache boundary), so reload everything recovered on prior runs and push
     # the anchors + on-disk id set past it — otherwise run 2 would re-request run 1's window and overwrite it.
     refetch = bool(getattr(a, "history_refetch", False))
+    refetch_only = None                                  # the chats a refetch confines itself to
     n = _resume_master(accum, anchors_path, master, deepen=not refetch)
     if n and not refetch:
         log.info("resuming: %s messages recovered on prior runs — continuing older than those.", f"{n:,}")
@@ -1624,6 +1633,7 @@ def cmd_history(a):
                      "to fill in. Run without the flag to fetch history deeper instead.")
             return 0
         kept, dropped = _target_anchors(anchors_path, gaps)
+        refetch_only = gaps                              # keep every later deepen inside this set
         log.warning("--history-refetch: %s recovered message(s) in %d group chat(s) have no sender, "
                     "because the extractor that banked them did not capture it. Re-asking those %d "
                     "chat(s) only (%d other chat(s) set aside), so the request budget goes where the "
@@ -1680,7 +1690,7 @@ def cmd_history(a):
             log.info("pass %d: +%d new%s  ·  total recovered: %d across %d chats", p, new,
                      (", %d enriched" % enriched) if enriched else "", len(master), len(by))
             if rc == COOLDOWN_RC:
-                _deepen_anchors(anchors_path, master)        # bank progress before the wait
+                _deepen_anchors(anchors_path, master, only=refetch_only)   # bank before the wait
                 if COOLDOWN and cooldowns_used < MAX_COOLDOWNS:
                     cooldowns_used += 1
                     log.warning("pass %d was stopped by the cooldown breaker (%d/%d). WhatsApp Web waits "
@@ -1704,7 +1714,7 @@ def cmd_history(a):
                 else:                                        # never say "converged" when nothing ever arrived
                     log.warning("pass %d came back empty — the phone answered none of the requests. Stopping.", p)
                 break
-            _deepen_anchors(anchors_path, master)            # go deeper next pass
+            _deepen_anchors(anchors_path, master, only=refetch_only)   # go deeper next pass
     except KeyboardInterrupt:
         log.warning("interrupted — checkpointing %s recovered messages before exit.", f"{len(master):,}")
         _checkpoint(accum); _checkpoint(pass_out)
