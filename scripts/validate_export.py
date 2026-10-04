@@ -165,10 +165,28 @@ if DB:
     con = sqlite3.connect('file:%s?mode=ro' % os.path.join(DB, 'msgstore.db'), uri=True)
     con.execute("ATTACH DATABASE ? AS wa", ('file:%s?mode=ro' % os.path.join(DB, 'wa.db'),))
     q = lambda s: con.execute(s).fetchone()[0]
-    print("  ..   messages %d  chats %d  jids %d  contacts %d  quoted %d"
+    # Which tables this database actually has, established ONCE before anything queries them. The
+    # export writes a table only when it has rows for it, so an export with no replies has no
+    # message_quoted and an export with no media has no message_media -- and a validator that dies
+    # on `no such table` cannot report on the export it was pointed at. The four below are not
+    # optional: without them it is not this export.
+    present = {r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")} | {
+        'wa.' + r[0] for r in con.execute("SELECT name FROM wa.sqlite_master WHERE type='table'")}
+    core = [t for t in ('message', 'chat', 'jid', 'wa.wa_contacts') if t not in present]
+    if core:
+        sys.exit("not a wawf SQLite export (missing: %s)" % ", ".join(core))
+
+    def has(*tables):
+        missing = [t for t in tables if t not in present]
+        if missing:
+            print("  ..   %s absent -- checks on it skipped" % ", ".join(missing))
+            return False
+        return True
+
+    print("  ..   messages %d  chats %d  jids %d  contacts %d"
           % (q("SELECT COUNT(*) FROM message"), q("SELECT COUNT(*) FROM chat"),
-             q("SELECT COUNT(*) FROM jid"), q("SELECT COUNT(*) FROM wa.wa_contacts"),
-             q("SELECT COUNT(*) FROM message_quoted")))
+             q("SELECT COUNT(*) FROM jid"), q("SELECT COUNT(*) FROM wa.wa_contacts")))
     chk("message count matches chats.json", q("SELECT COUNT(*) FROM message") == len(msgs))
     chk("key_id is unique", q("SELECT COUNT(*)-COUNT(DISTINCT key_id) FROM message") == 0,
         q("SELECT COUNT(*)-COUNT(DISTINCT key_id) FROM message"))
@@ -186,33 +204,29 @@ if DB:
     chk("timestamps are plausible",
         q("SELECT COUNT(*) FROM message WHERE timestamp<1420070400000 OR timestamp>1830000000000") == 0,
         con.execute("SELECT MIN(timestamp),MAX(timestamp) FROM message").fetchone())
-    chk("quoted text is now stored, not NULL",
-        q("SELECT COUNT(*) FROM message_quoted WHERE text_data IS NOT NULL AND text_data<>''") > 0,
-        q("SELECT COUNT(*) FROM message_quoted WHERE text_data IS NOT NULL AND text_data<>''"))
-    print("  ..   quoted rows whose text equals the reply's own text: %d"
-          % q("""SELECT COUNT(*) FROM message_quoted mq JOIN message m ON m._id=mq.message_row_id
-                 WHERE mq.text_data IS NOT NULL AND mq.text_data=m.text_data"""))
+    if has('message_quoted'):
+        print("  ..   quoted rows: %d" % q("SELECT COUNT(*) FROM message_quoted"))
+        chk("quoted text is stored, not NULL",
+            q("SELECT COUNT(*) FROM message_quoted WHERE text_data IS NOT NULL AND text_data<>''") > 0,
+            q("SELECT COUNT(*) FROM message_quoted WHERE text_data IS NOT NULL AND text_data<>''"))
+        print("  ..   quoted rows whose text equals the reply's own text: %d"
+              % q("""SELECT COUNT(*) FROM message_quoted mq JOIN message m ON m._id=mq.message_row_id
+                     WHERE mq.text_data IS NOT NULL AND mq.text_data=m.text_data"""))
     # Every child table hangs off message._id or chat._id. A row pointing at nothing is a row an
     # importer either drops silently or crashes on, and either way the export is not what it claims.
-    kids = [(t, c) for t in ('message_media', 'message_quoted', 'message_thumbnail',
-                             'message_mentions', 'message_link', 'message_poll')
-            for c in ('message_row_id',)]
-    present = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    kids = [t for t in ('message_media', 'message_quoted', 'message_thumbnail',
+                        'message_mentions', 'message_link', 'message_poll') if t in present]
     orphans = {}
-    for t, c in kids:
-        if t not in present: continue
-        n = q("SELECT COUNT(*) FROM %s WHERE %s NOT IN (SELECT _id FROM message)" % (t, c))
+    for t in kids:
+        n = q("SELECT COUNT(*) FROM %s WHERE message_row_id NOT IN (SELECT _id FROM message)" % t)
         if n: orphans[t] = n
     chk("no child row points at a message that is not there", not orphans, orphans)
-    rows = {t: q("SELECT COUNT(*) FROM %s" % t) for t, _ in kids if t in present}
-    print("  ..   child rows: %s" % rows)
-    chk("media rows carry a key or a path",
-        q("""SELECT COUNT(*) FROM message_media
-             WHERE (media_key IS NULL OR media_key='') AND (direct_path IS NULL OR direct_path='')""") == 0,
-        q("""SELECT COUNT(*) FROM message_media
-             WHERE (media_key IS NULL OR media_key='') AND (direct_path IS NULL OR direct_path='')""")
-        if 'message_media' in present else 0)
-    if 'call_log' in present:
+    print("  ..   child rows: %s" % {t: q("SELECT COUNT(*) FROM %s" % t) for t in kids})
+    if has('message_media'):
+        n = q("""SELECT COUNT(*) FROM message_media
+                 WHERE (media_key IS NULL OR media_key='') AND (direct_path IS NULL OR direct_path='')""")
+        chk("media rows carry a key or a path", n == 0, n)
+    if has('call_log'):
         print("  ..   call_log rows: %d" % q("SELECT COUNT(*) FROM call_log"))
         chk("every call row resolves to a jid",
             q("SELECT COUNT(*) FROM call_log WHERE jid_row_id NOT IN (SELECT _id FROM jid)") == 0)

@@ -243,6 +243,28 @@ check("...or a message line", len([l for l in ht.split("\n") if l.startswith("["
 check("the label still reads as the name", "Line Break Name" in ht, True)
 check("chats.json keeps the label verbatim", hrow["sender_name"], "Line\nBreak\tName")
 
+# A long name must read the SAME on a message line as in the legend, and must stay separable from
+# the jid beside it. Flattening labels per call site with different widths produced one person in two
+# renderings, and a label long enough to fill the column left a single space between it and the jid,
+# which is also the separator the legend is parsed on.
+LONGNAME = "Aaaaaaaaaa Bbbbbbbbbb Cccccccccc Dddddddddd Eeeeeeeeee"      # 54 chars
+longids = Identities({"contact": [{"id": "965000000001@lid", "name": LONGNAME}],
+                      "group-metadata": [{"id": "120300000009@g.us", "subject": "G"}]}, LS)
+lrow = msg_row({"chat": "120300000009@g.us", "from_me": False, "type": "chat", "t": 0,
+                "sender": "965000000001@lid", "id": "false_x_1"}, "2026-01-01 00:00:00",
+               pb("hi"), longids)
+p4 = os.path.join(tempfile.mkdtemp(), "l.txt")
+write_transcripts(p4, {"120300000009@g.us": [lrow]}, longids)
+lt = open(p4, encoding="utf-8").read()
+leg = [l[4:] for l in lt.split("\n") if l.startswith("  - ")]
+msgl = [l for l in lt.split("\n") if l.startswith("[")]
+legend_label = leg[0].split("  ")[0].strip()
+line_label = msgl[0].split("] ", 1)[1].split(": ", 1)[0].strip()[3:].strip()
+check("a long label reads the same on the line as in the legend", line_label, legend_label)
+check("a long label stays separable from the jid that follows it", "  " in leg[0], True)
+check("...and the jid is still recoverable from the legend row",
+      "965000000001@lid" in leg[0].split("  ", 1)[-1], True)
+
 print()
 print("message text: addressing is noise, but never the whole message")
 check("sender jid stripped from text", message_text(pb("hello there", "919500000002@s.whatsapp.net")),

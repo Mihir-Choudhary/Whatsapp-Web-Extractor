@@ -384,6 +384,12 @@ def msg_row(m, when, pt, ids):
             "sender_source": ids.source(m.get("sender")),
             "text": message_text(pt), "quoted_text": quoted_text(pt)}
 
+# ONE cap for every place a label is written. Capping per call site (40 on a message line, 60 in the
+# legend, 80 in a header) rendered the same person two different ways in one file and made a line
+# impossible to match to its legend entry. Long enough for any real name -- the longest in the
+# reference profile is 32 characters -- and short enough to keep a line readable.
+_LABEL_MAX = 48
+
 def _oneline(v, width=None):
     """A label flattened to one line, for a file whose structure is lines.
 
@@ -411,16 +417,16 @@ def write_transcripts(path, chats, ids):
             if not tm: continue
             kind = "group" if str(c).endswith("@g.us") else "1:1"
             f.write("\n===== %s  [%s]  (%s; %d msgs, %d text) =====\n"
-                    % (_oneline(ids.label(c), 80), c, kind, len(ml), len(tm)))
+                    % (_oneline(ids.label(c), _LABEL_MAX), c, kind, len(ml), len(tm)))
             who = {}
             for m in ml:
                 s = m.get("sender")
                 if s and ids.key(s) not in who: who[ids.key(s)] = ids.row(ids.key(s))
             for cj, r in sorted(who.items(), key=lambda kv: (kv[1]["label"] or "").lower()):
                 forms = "  ".join(x for x in (r["lid"], r["phone"]) if x and x != cj)
-                f.write("  - %-26s %s%s%s\n" % (_oneline(r["label"], 60), cj,
-                                                 ("  " + forms) if forms else "",
-                                                 "  (me)" if r["is_me"] else ""))
+                f.write("  - %s  %s%s%s\n" % (_oneline(r["label"], _LABEL_MAX).ljust(24), cj,
+                                               ("  " + forms) if forms else "",
+                                               "  (me)" if r["is_me"] else ""))
             for m in ml:
                 if not m["text"]: continue
                 # 3.7% of messages contain newlines, and writing them raw broke the one-line-per-
@@ -429,7 +435,7 @@ def write_transcripts(path, chats, ids):
                 # uses for its own header. Continuations are now indented under a '|' so every line
                 # is attributable and no message content can be mistaken for structure.
                 head = "[%s] %s %22s: " % (m["t"], "->" if m["dir"] == "me" else "<-",
-                                           _oneline(m.get("sender_name") or m["dir"], 40))
+                                           _oneline(m.get("sender_name") or m["dir"], _LABEL_MAX))
                 cont = " " * (len(head) - 2) + "| "
                 body = m["text"].replace("\r\n", "\n").replace("\r", "\n").split("\n")
                 f.write(head + body[0] + "\n")
