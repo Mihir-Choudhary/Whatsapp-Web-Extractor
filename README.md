@@ -172,8 +172,7 @@ A Windows drive letter is never mistaken for a `FORMAT`, so `D:\case\out` works 
 | `--origin DIR` | Firefox `web.whatsapp.com` storage folder instead of a profile folder. |
 | `--raw-include-keys` | With `--out raw:` — also dump `signal-storage` and `wawc_db_enc`. Those are key material; a dump including them must not travel with a case. |
 | `--history` | *Instead of decrypting:* pull chat history older than the browser cache from your phone, iteratively, resuming across runs. Needs Node (offers to install it). Phone-side and rate-limited — see below. |
-| `--memory (--live \| --memimage FILE)` | *Instead of reconnecting:* find the key in RAM / swap / hibernation. Needs a **Firefox** WhatsApp Web store to validate candidates against (`--origin`), because that is the reader this mode uses; on a Chromium profile it says so and stops. `--live` is additionally Linux-only (reads `/proc`, needs root). |
-| `--audit` | Write a chain-of-custody database beside the output (see below). |
+| `--no-audit` | Do **not** write the chain-of-custody database. It is written by default (see below). |
 
 Sender resolution is **reported, not assumed** — a run prints where every label came from, so the one
 number that matters is visible:
@@ -186,15 +185,21 @@ senders identified: address-book=14,250  pushname=7,325  phone=543  unresolved=0
 healthy profile it is zero; anything else is a gap in the evidence, not a gap in the tool.
 | `-v`, `--log-file FILE` | Full logs and tracebacks; mirror them to a file. |
 
-## Chain of custody — `--audit` (optional)
+## Chain of custody (on by default)
 
-Add `--audit` to any command and the tool records everything it did into a SQLite **case database**, written
+The tool records everything it did into a SQLite **case database** beside the output. This is not
+something to remember to switch on — the run that most needs the trail is the one where nobody
+thought to ask for it — so it is written unless you pass `--no-audit`. It costs one file: no network,
+no extra read of the evidence.
+
+The database records everything it did, written
 into the output directory (one DB per case — never a single global log):
 
 ```bash
-wawf <PROFILE> --out out/ --audit                       # -> out/wawf_audit.db
-wawf <PROFILE> --out sqlite:db/ --audit                # appends to db/wawf_audit.db
+wawf <PROFILE> --out out/                               # -> out/wawf_audit.db
+wawf <PROFILE> --out sqlite:db/                        # appends to db/wawf_audit.db
 wawf <PROFILE> --out out/ --audit-db /cases/acme/custody.db     # or name the DB yourself
+wawf <PROFILE> --out out/ --no-audit                   # write no case database at all
 ```
 
 Re-running **appends** a new `run` row, so repeated passes over the same case — a decrypt, then a
@@ -244,18 +249,11 @@ all, and it keeps working after the device has been revoked, because decryption 
 wawf <PROFILE> --key companion_enc_static.txt --out D:\case\out
 ```
 
-**C. Take the key from memory** instead of the network — RAM dump, swap, or hibernation file. A
-candidate found in memory is only accepted once it decrypts ciphertext from the store, and the
-reader behind that check is the Firefox one, so this mode needs a Firefox origin:
-
-```bash
-wawf --origin .../storage/default/https+++web.whatsapp.com --memimage dump.raw --out D:\case\out
-wawf --origin .../storage/default/https+++web.whatsapp.com --memory --out D:\case\out   # Linux, root
-```
-
-Pointed at a Chromium profile it reports that and stops rather than searching for a Firefox profile
-of its own. For Chromium, capture the key with a normal `wawf <PROFILE>` run, or decrypt offline with
-a `--key` file.
+**C. From memory — not currently exposed.** Recovering the key from a RAM dump, swap or hibernation
+file works, and the code for it is still in the repository (`scripts/wa_forensic.py`), but it could
+only validate candidates against a **Firefox** store, which left no case where it beat route A or
+route B. The command-line options were withdrawn rather than shipped half-covering; the note in
+`wawf.py` says what restoring them needs.
 
 **D. No key at all.** Still useful: metadata, contacts, timestamps, media keys — everything except
 message text.

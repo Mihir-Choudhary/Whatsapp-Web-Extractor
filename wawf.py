@@ -21,7 +21,6 @@ Windows drive letter is never mistaken for a FORMAT.
 
 Two alternative actions replace the default job:
   --history                     pull chat history OLDER than the browser cache from the phone (Node)
-  --memory (--live|--memimage)  hunt the at-rest key in RAM / swap / hibernation
 
 Examples:
   wawf "C:\\Users\\<you>\\AppData\\Local\\Microsoft\\Edge\\User Data\\Default"
@@ -978,6 +977,9 @@ def _sub(script, extra, secret_env=None):
     return rc
 
 def cmd_memory(a):
+    """NOT REACHABLE from the CLI -- its arguments are withdrawn (see the note in main()). Kept whole,
+    with wa_forensic.py, so the mode can be restored once it can validate candidates against a
+    Chromium store as well as a Firefox one."""
     # The scan finds candidate keys in RAM and then VALIDATES each against ciphertext from the
     # profile -- and that reader is the Firefox one (`idb/*.sqlite`). Given a Chromium profile there
     # is nothing to validate against, and the child reported "Could not locate a Firefox WhatsApp
@@ -991,9 +993,11 @@ def cmd_memory(a):
                   "which captures the key over the network instead.")
         return 2
     extra = []
-    if a.live: extra.append("--live")
-    if a.memimage: extra += ["--memimage", a.memimage]
-    if a.deep: extra.append("--deep")
+    # getattr, because the arguments these read are no longer defined -- the function is kept whole
+    # for a later restoration, and must not rot into an AttributeError in the meantime
+    if getattr(a, "live", False): extra.append("--live")
+    if getattr(a, "memimage", None): extra += ["--memimage", a.memimage]
+    if getattr(a, "deep", False): extra.append("--deep")
     # Renaming --enc-static to --key removed this attribute from the top-level namespace, and this
     # line then crashed every --memory/--memimage run with AttributeError. Resolve from the key FILE.
     _k = getattr(a, "enc_static", None) or (_read_key_file(a.key) if getattr(a, "key", None)
@@ -1496,8 +1500,7 @@ def main():
         "  --key companion_enc_static.txt    already have the at-rest key? use it and skip the reconnect\n"
         "  --history             instead of decrypting, pull chat history OLDER than the browser\n"
         "                        cache from your phone (networked, needs Node; phone must answer)\n"
-        "  --memory --live       instead of reconnecting, hunt the key in RAM/swap/hibernation\n"
-        "  --audit               write a chain-of-custody database beside the output\n"
+        "  --no-audit            do NOT write the chain-of-custody database (written by default)\n"
         "\n"
         "EXAMPLES\n"
         "  wawf \"" + _example_profile() + "\"\n"
@@ -1533,24 +1536,28 @@ def main():
     g.add_argument("--history", action="store_true",
                    help="pull chat history older than the browser cache from your phone. NETWORKED and "
                         "phone-dependent; needs Node (offers to install it). Results are saved and resume.")
-    g.add_argument("--memory", action="store_true",
-                   help="recover the at-rest key from volatile memory instead of reconnecting")
-    g.add_argument("--live", action="store_true", help="with --memory: scan this machine's running browser (Linux, root)")
-    g.add_argument("--memimage", metavar="FILE", help="with --memory: scan a RAM/swap/hibernation image file")
-    g.add_argument("--deep", action="store_true", help="with --memory: slower, more exhaustive scan")
+    # The memory scan (--memory / --live / --memimage / --deep) is NOT exposed. The code is intact --
+    # `cmd_memory` below, `scripts/wa_forensic.py`, and the key-from-RAM research behind them -- it is
+    # the CLI surface that is withdrawn, because the mode could only validate candidates against a
+    # FIREFOX store and there is no scenario yet where it beats the two routes that always work: a
+    # normal run captures the key over the network, and `--key` decrypts offline with a key captured
+    # earlier. Restoring it is these four add_argument lines plus the dispatch branch, both marked.
     g.add_argument("--yes", action="store_true",
-                   help="auto-confirm prompts (installing Node for --history, scanning live memory)")
+                   help="auto-confirm prompts (installing Node for --history)")
 
     g = p.add_argument_group("chain of custody")
     # NOTE: a plain flag, NOT nargs='?'. An optional-value option would swallow the PROFILE positional.
-    g.add_argument("--audit", action="store_true",
-                   help="record an audit database: every file touched, key derivation, network request, "
-                        "artifact (with SHA-256) and error, crash-safe. One database per case, written "
-                        "beside the output as wawf_audit.db.")
-    g.add_argument("--audit-db", metavar="DB", help="path for the --audit database (default: beside the output)")
+    # ON by default. A forensic tool's record of what it touched is not a feature to opt into: the
+    # run that most needs the trail is the one where nobody thought to ask for it. Costs a file
+    # beside the output and nothing else -- no network, no extra read of the evidence.
+    g.add_argument("--no-audit", action="store_true",
+                   help="do NOT write the audit database (it is written by default: every file "
+                        "touched, key derivation, network request, artifact with its SHA-256, and "
+                        "error, crash-safe, as wawf_audit.db beside the output)")
+    g.add_argument("--audit-db", metavar="DB", help="path for the audit database (default: beside the output)")
     g.add_argument("--audit-secrets", action="store_true",
-                   help="with --audit, also store raw key material (default: only SHA-256 fingerprints "
-                        "plus derivation parameters, so the log is not a secret store)")
+                   help="also store raw key material in the audit database (default: only SHA-256 "
+                        "fingerprints plus derivation parameters, so the log is not a secret store)")
 
     g = p.add_argument_group("diagnostics")
     g.add_argument("-v", "--verbose", action="store_true", help="DEBUG logs + full tracebacks on error")
@@ -1560,14 +1567,13 @@ def main():
     setup_logging(a.verbose, a.log_file)
     # Pick the action. The default IS the job: credentials -> key -> decrypt. --history and --memory are
     # the two alternative actions; everything else is an option on the default job.
-    if a.memory or a.live or a.memimage:
-        a.cmd, action = "memory", cmd_memory
-    elif a.history:
+    # (the memory-scan branch belonged here; see the note where its arguments were withdrawn)
+    if a.history:
         a.cmd, action = "history", cmd_history
     else:
         a.cmd, action = "decrypt", cmd_run
     global AUDIT
-    if getattr(a, "audit", False) or getattr(a, "audit_db", None):   # --audit-db alone implies --audit
+    if not getattr(a, "no_audit", False):            # the trail is written unless asked not to
         AUDIT = audit.open_db(_audit_db_path(a), record_secrets=getattr(a, "audit_secrets", False))
         if AUDIT.enabled:
             AUDIT.start_run(a.cmd, sys.argv)
