@@ -20,6 +20,12 @@ import wa_decrypt as WD
 from wa_decrypt import _dedupe_msgs
 
 FAIL = []
+# These tests print message text and contact names, which include emoji. On a Windows console that
+# is cp1252 by default -- which is what CI runs -- printing one raises UnicodeEncodeError and the
+# suite dies mid-run with a traceback instead of a result.
+try: sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception: pass
+
 
 def check(name, cond):
     if cond:
@@ -32,17 +38,25 @@ SALT_WS = bytes(range(100, 132))              # stands in for WAWebEncKeySalt
 ENC_STATIC = bytes(range(200, 232))           # the server-issued value, never on disk
 KEY = HKDF(algorithm=hashes.SHA256(), length=16, salt=ENC_STATIC, info=SALT_WS).derive(ROOT)
 
+def _vi(n):
+    """A protobuf varint, so a fixture string may be any length (a 1-byte length caps it at 127)."""
+    out = bytearray()
+    while True:
+        b = n & 0x7f; n >>= 7
+        out.append(b | (0x80 if n else 0))
+        if not n: return bytes(out)
+
 def msg(*strings):
     out = b""
     for i, v in enumerate(strings, start=1):
-        b = v.encode(); out += bytes([i << 3 | 2, len(b)]) + b
+        b = v.encode(); out += bytes([i << 3 | 2]) + _vi(len(b)) + b
     return out
 
 def pb(*strings, quoted=None):
     """A decrypted body: field 1 is this message, field 2 the message it replies to."""
-    m = msg(*strings); out = bytes([0x0a, len(m)]) + m
+    m = msg(*strings); out = bytes([0x0a]) + _vi(len(m)) + m
     if quoted is not None:
-        q = msg(quoted); out += bytes([0x12, len(q)]) + q
+        q = msg(quoted); out += bytes([0x12]) + _vi(len(q)) + q
     return out
 
 def enc(pt, key=KEY):

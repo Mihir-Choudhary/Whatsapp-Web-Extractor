@@ -35,6 +35,13 @@ def check(label, got, want):
 # ---------------------------------------------------------------- 1. the wire form
 import build_anchors
 
+# These tests print message text and contact names, which include emoji. On a Windows console that
+# is cp1252 by default -- which is what CI runs -- printing one raises UnicodeEncodeError and the
+# suite dies mid-run with a traceback instead of a result.
+try: sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception: pass
+
+
 print("Wid.toJid(): server c.us -> s.whatsapp.net, everything else unchanged")
 check("c.us mapped", build_anchors._to_jid("9199@c.us"), "9199@s.whatsapp.net")
 check("lid untouched", build_anchors._to_jid("6627@lid"), "6627@lid")

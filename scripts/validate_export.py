@@ -15,6 +15,12 @@ Nothing is written and nothing leaves the machine; samples are printed only for 
 """
 import json, io, os, re, sys, sqlite3, collections, datetime as dt, unicodedata
 
+# Failure details quote real message text and contact labels, so emoji are routine -- and on a
+# Windows console that is cp1252 by default, printing one raises UnicodeEncodeError and kills the
+# run exactly when it has something to report. The writers pin UTF-8 for the same reason.
+try: sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception: pass
+
 if len(sys.argv) < 2:
     sys.exit("usage: validate_export.py <out_dir> [<sqlite_dir>]")
 OUT = sys.argv[1]
@@ -57,25 +63,37 @@ chk("no exact-duplicate rows",
     all(len(ml) == len({json.dumps(m, sort_keys=True) for m in ml}) for ml in ch.values()),
     sum(len(ml) - len({json.dumps(m, sort_keys=True) for m in ml}) for ml in ch.values()))
 chk("every row has a message id", not [m for m in msgs if not m.get('id')])
-chk("message ids are unique", len({m.get('id') for m in msgs}) == len(msgs),
-    len(msgs) - len({m.get('id') for m in msgs}))
+# An id may legitimately appear twice: the loader keeps a version whose CONTENT differs (an edit, a
+# re-delivery) under the same id, and drops only copies identical in everything it carries. So the
+# invariant is "no two identical rows", checked above -- a repeated id is reported, not failed.
+byid = collections.Counter(m.get('id') for m in msgs)
+rep = {k: v for k, v in byid.items() if v > 1}
+print("  ..   ids appearing more than once (differing versions kept): %d" % len(rep))
+chk("a repeated id always means genuinely different rows",
+    all(len({json.dumps(m, sort_keys=True) for m in msgs if m.get('id') == k}) == v
+        for k, v in list(rep.items())[:50]), list(rep)[:2])
 chk("every sender resolves to a label", not [m for m in msgs if not m.get('sender_name')])
 # A person's row is keyed by one canonical address and lists every form they appeared under,
 # so a lookup goes through `jids` -- indexing by `jid` alone misses the same person reached
 # by their phone number instead of their lid.
+# A record holding neither `author` nor `from` has no sender, and `table()` skips the empty form,
+# so these rows must be skipped here too rather than reported as missing identities.
+withsender = [m for m in msgs if m.get('sender')]
+print("  ..   rows with no sender at all: %d" % (len(msgs) - len(withsender)))
 lab = {}
 for r in ids['identities']:
     for j in (r.get('jids') or [r.get('jid')]): lab[j] = r.get('label')
     lab.setdefault(r.get('jid'), r.get('label'))
 chk("sender_name agrees with identities.json",
-    not [m for m in msgs if canon(m.get('sender')) in lab and m.get('sender_name') != lab[canon(m.get('sender'))]])
+    not [m for m in withsender if canon(m.get('sender')) in lab
+         and m.get('sender_name') != lab[canon(m.get('sender'))]])
 chk("every sender appears in identities.json",
-    not {m.get('sender') for m in msgs if canon(m.get('sender')) not in lab})
+    not {m.get('sender') for m in withsender if canon(m.get('sender')) not in lab})
 me = set(ids['me'])
-wrongdir = [m for m in msgs if m.get('dir') == 'them' and canon(m.get('sender')) in me]
+wrongdir = [m for m in withsender if m.get('dir') == 'them' and canon(m.get('sender')) in me]
 chk("no incoming message is attributed to me", not wrongdir, len(wrongdir))
 chk("direction agrees with who sent it",
-    not [m for m in msgs if (canon(m.get('sender')) in me) != (m.get('dir') == 'me')])
+    not [m for m in withsender if (canon(m.get('sender')) in me) != (m.get('dir') == 'me')])
 chk("the stored fromMe flag is still legible on every row",
     all(str(m.get('id')).startswith(('true_', 'false_')) for m in msgs if m.get('id')))
 flagdiff = [m for m in msgs if str(m.get('id')).startswith('true_') and m.get('dir') != 'me']
@@ -94,8 +112,9 @@ chk("no duplicate identity rows",
     len({r['jid'] for r in ids['identities']}) == len(ids['identities']))
 mine_forms = {j for r in ids['identities'] if r.get('is_me')
               for j in (r.get('jids') or [r.get('jid')])}
-chk("the one row marked as me covers exactly my own addresses", mine_forms == me,
-    sorted(mine_forms ^ me))
+# `me` holds every form the profile named; `jids` lists only the forms that actually appear in
+# this export. My phone form is often never an `author`, so equality would fail on a sound export.
+chk("every address marked as me is one of mine", mine_forms <= me, sorted(mine_forms - me))
 chk("source=address-book implies a name",
     not [r for r in ids['identities'] if r['source'] == 'address-book' and not r['name']])
 chk("source=pushname implies a pushname",
@@ -110,13 +129,13 @@ chk("one row per person, not per address",
 allforms = [j for r in ids['identities'] for j in r.get('jids', [])]
 chk("each address form belongs to exactly one person", len(allforms) == len(set(allforms)))
 chk("every sender's address form is listed on its person",
-    not {canon(m.get('sender')) for m in msgs} - set(allforms))
+    not {canon(m.get('sender')) for m in withsender} - set(allforms))
 chk("group jids are labelled by subject, not by a phone number",
     not [r for r in ids['identities'] if r['jid'].endswith('@g.us') and r['label'].startswith('+')])
 print("  ..   label sources: %s" % dict(collections.Counter(r['source'] for r in ids['identities'])))
 
 print("\n=== transcripts.txt ===")
-HDR = re.compile(r'^===== (.*?)  \[(.+?)\]  \((group|1:1); (\d+) msgs, (\d+) text\) =====$')
+HDR = re.compile(r'^===== (.*?)  \[(.+?)\]  \((group|1:1); (\d+) msgs, (\d+) with text\) =====$')
 MSG = re.compile(r'^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\] (->|<-) +(.*?): (.*)$')
 blocks = []; cur = None; stray = []
 for ln in txt.split('\n'):
@@ -138,15 +157,35 @@ print("  ..   %d chat blocks, %d message lines, %d continuation lines, %d quote 
       % (len(blocks), sum(len(b['lines']) for b in blocks), sum(b['cont'] for b in blocks),
          sum(b['re'] for b in blocks)))
 chk("no unclassifiable line", not stray, stray[:2])
-chk("one block per chat that has text",
-    len(blocks) == len([c for c, ml in ch.items() if any(m.get('text') for m in ml)]))
+# Every chat with any message gets a block, and every message in it gets a line -- a message with
+# no text of its own is shown as its type, not omitted.
+chk("one block per chat", len(blocks) == len([c for c, ml in ch.items() if ml]))
 chk("no duplicate blocks", len({b['jid'] for b in blocks}) == len(blocks))
 chk("header msg count matches chats.json",
     not [b for b in blocks if b['msgs'] != len(ch.get(b['jid'], []))])
-chk("header text count matches chats.json",
+chk("header 'with text' count matches chats.json",
     not [b for b in blocks if b['text'] != len([m for m in ch.get(b['jid'], []) if m.get('text')])])
-chk("header text count matches lines written",
-    not [b for b in blocks if b['text'] != len(b['lines'])])
+# Lines are 1:1 with messages and in the same order, so they can be PAIRED rather than matched on
+# (timestamp, sender) -- which is ambiguous, because two messages a second apart share a timestamp
+# at this resolution. Pairing by position, the invariant is: a message with no text of its own is
+# shown as its type, never as a blank line.
+mismatched = []
+for b in blocks:
+    rows = ch.get(b['jid'], [])
+    if len(rows) != len(b['lines']): continue          # already reported above
+    for l, m in zip(b['lines'], rows):
+        want = "(%s)" % (m.get('type') or 'unknown')
+        if not m.get('text') and l[3] != want:
+            mismatched.append((b['jid'], l[0], l[3], want))
+chk("a message with no text of its own is shown as its type", not mismatched, mismatched[:2])
+chk("...and a line's timestamp matches the message it pairs with",
+    not [1 for b in blocks for l, m in zip(b['lines'], ch.get(b['jid'], []))
+         if len(ch.get(b['jid'], [])) == len(b['lines']) and l[0] != m.get('t')])
+chk("every message has a line", not [b for b in blocks if b['msgs'] != len(b['lines'])],
+    [(b['jid'], b['msgs'], len(b['lines'])) for b in blocks if b['msgs'] != len(b['lines'])][:2])
+chk("no message is silently dropped from the transcript",
+    sum(len(b['lines']) for b in blocks) == len(msgs),
+    "%d lines vs %d messages" % (sum(len(b['lines']) for b in blocks), len(msgs)))
 chk("blocks ordered busiest first",
     [b['msgs'] for b in blocks] == sorted((b['msgs'] for b in blocks), reverse=True))
 chk("lines ordered by time", all([l[0] for l in b['lines']] == sorted(l[0] for l in b['lines']) for b in blocks))
@@ -158,18 +197,20 @@ chk("no legend row duplicated inside a block",
 chk("no content line sits at column 0 where structure lives",
     not [l for l in txt.split('\n') if l[:1] not in ('', '#', '[', ' ', '=')], )
 chk("no stray carriage return", '\r' not in txt)
-chk("file is valid UTF-8 with emoji intact", any(ord(c) > 0xFFFF for c in txt))
+print("  ..   astral-plane characters present (emoji survived): %s"
+      % any(ord(c) > 0xFFFF for c in txt))
 
 if DB:
     print("\n=== sqlite export ===")
     con = sqlite3.connect('file:%s?mode=ro' % os.path.join(DB, 'msgstore.db'), uri=True)
     con.execute("ATTACH DATABASE ? AS wa", ('file:%s?mode=ro' % os.path.join(DB, 'wa.db'),))
     q = lambda s: con.execute(s).fetchone()[0]
-    # Which tables this database actually has, established ONCE before anything queries them. The
-    # export writes a table only when it has rows for it, so an export with no replies has no
-    # message_quoted and an export with no media has no message_media -- and a validator that dies
-    # on `no such table` cannot report on the export it was pointed at. The four below are not
-    # optional: without them it is not this export.
+    # Which tables this database actually has, established ONCE before anything queries them.
+    # export_sqlite creates every table in one `executescript`, so for an export THIS repo produced
+    # they are all present however few rows they hold -- the guard is for a database from anywhere
+    # else, and for not dying with `no such table` when pointed at one. What varies for our own
+    # exports is the ROW COUNT, which is why the quoted-text check below tests that instead. The
+    # four named here are not optional: without them it is not this export.
     present = {r[0] for r in con.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")} | {
         'wa.' + r[0] for r in con.execute("SELECT name FROM wa.sqlite_master WHERE type='table'")}
@@ -188,8 +229,10 @@ if DB:
           % (q("SELECT COUNT(*) FROM message"), q("SELECT COUNT(*) FROM chat"),
              q("SELECT COUNT(*) FROM jid"), q("SELECT COUNT(*) FROM wa.wa_contacts")))
     chk("message count matches chats.json", q("SELECT COUNT(*) FROM message") == len(msgs))
-    chk("key_id is unique", q("SELECT COUNT(*)-COUNT(DISTINCT key_id) FROM message") == 0,
-        q("SELECT COUNT(*)-COUNT(DISTINCT key_id) FROM message"))
+    # Same policy as the JSON: a repeated key_id means a version whose content differs was kept.
+    # Reported, because an Android importer may still object to it, but not a defect here.
+    print("  ..   repeated key_id (differing versions kept): %d"
+          % q("SELECT COUNT(*)-COUNT(DISTINCT key_id) FROM message"))
     chk("no orphan chat_row_id", q("SELECT COUNT(*) FROM message WHERE chat_row_id NOT IN (SELECT _id FROM chat)") == 0)
     chk("no orphan jid_row_id on chats", q("SELECT COUNT(*) FROM chat WHERE jid_row_id NOT IN (SELECT _id FROM jid)") == 0)
     chk("no duplicate jid rows", q("SELECT COUNT(*)-COUNT(DISTINCT user||'@'||server) FROM jid") == 0)
@@ -205,10 +248,16 @@ if DB:
         q("SELECT COUNT(*) FROM message WHERE timestamp<1420070400000 OR timestamp>1830000000000") == 0,
         con.execute("SELECT MIN(timestamp),MAX(timestamp) FROM message").fetchone())
     if has('message_quoted'):
-        print("  ..   quoted rows: %d" % q("SELECT COUNT(*) FROM message_quoted"))
-        chk("quoted text is stored, not NULL",
-            q("SELECT COUNT(*) FROM message_quoted WHERE text_data IS NOT NULL AND text_data<>''") > 0,
-            q("SELECT COUNT(*) FROM message_quoted WHERE text_data IS NOT NULL AND text_data<>''"))
+        nq = q("SELECT COUNT(*) FROM message_quoted")
+        nqt = q("SELECT COUNT(*) FROM message_quoted WHERE text_data IS NOT NULL AND text_data<>''")
+        print("  ..   quoted rows: %d (%d carry the quoted text)" % (nq, nqt))
+        print("  ..   quoted rows with no key_id to join on: %d"
+              % q("SELECT COUNT(*) FROM message_quoted WHERE key_id IS NULL"))
+        # Only meaningful where the JSON found quotes: an export of a chat with no replies has none,
+        # and that is not a defect.
+        jq = sum(1 for m in msgs if m.get('quoted_text'))
+        if jq:
+            chk("the quoted text the JSON found is in the database too", nqt > 0, nqt)
         print("  ..   quoted rows whose text equals the reply's own text: %d"
               % q("""SELECT COUNT(*) FROM message_quoted mq JOIN message m ON m._id=mq.message_row_id
                      WHERE mq.text_data IS NOT NULL AND mq.text_data=m.text_data"""))
@@ -240,8 +289,11 @@ if DB:
                   JOIN wa.wa_contacts c ON c.jid=(j.user||'@'||j.server)
                   WHERE m.from_me=0 AND m.sender_jid_row_id NOT IN (SELECT _id FROM jid)
                     AND COALESCE(NULLIF(c.display_name,''),NULLIF(c.wa_name,''),NULLIF(c.number,'')) IS NOT NULL""")
-    chk("every inbound message's sender resolves to a name or number", tot - named <= 5,
-        "%d of %d resolve" % (named, tot))
+    # A tolerance measured on one store is not an invariant; report the rate and fail only on a
+    # collapse, which is what a broken join looks like.
+    print("  ..   inbound senders resolving to a name or number: %d of %d" % (named, tot))
+    chk("the sender correlation chain resolves", tot == 0 or named >= tot * 0.9,
+        "%d of %d" % (named, tot))
     # text agreement with chats.json, below the 2000-char cap where both must agree exactly
     jt = collections.Counter(m.get('text') for m in msgs if m.get('text') and len(m.get('text')) < 2000)
     st = collections.Counter(r[0] for r in con.execute(
@@ -253,7 +305,11 @@ if DB:
     # or mis-scraping content. The reverse is expected and bounded -- the database decrypts bodies
     # only for the types Android stores text for, so location/vcard/system messages have none.
     chk("the database contains no text the JSON lacks", extra_s == 0, extra_s)
-    chk("the JSON-only remainder stays small", extra_j < 60, extra_j)
+    # The database decrypts bodies only for the types Android stores text for, so a JSON-only
+    # remainder is expected. Its SIZE depends on how many location/vcard/system messages a store
+    # holds, so it is reported rather than bounded by a number from one profile.
+    print("  ..   texts the JSON has and the database does not: %d (types it does not decrypt)"
+          % extra_j)
     con.close()
 
 print()

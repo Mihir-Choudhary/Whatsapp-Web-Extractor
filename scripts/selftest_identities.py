@@ -22,13 +22,27 @@ from wa_decrypt import (Identities, canon_jid, msg_row, write_transcripts, messa
                         quoted_text, split_body)
 
 FAIL = []
+# These tests print message text and contact names, which include emoji. On a Windows console that
+# is cp1252 by default -- which is what CI runs -- printing one raises UnicodeEncodeError and the
+# suite dies mid-run with a traceback instead of a result.
+try: sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception: pass
+
 
 # A decrypted body is {1: this message, 2: the message it replies to}. Inside a message, field 1 is
 # `conversation`; a bare jid anywhere in the tree is addressing metadata.
+def _vi(n):
+    """A protobuf varint, so a fixture string may be any length (a 1-byte length caps it at 127)."""
+    out = bytearray()
+    while True:
+        b = n & 0x7f; n >>= 7
+        out.append(b | (0x80 if n else 0))
+        if not n: return bytes(out)
+
 def fields(*pairs):
     out = b""
     for f, v in pairs:
-        b = v.encode(); out += bytes([f << 3 | 2, len(b)]) + b
+        b = v.encode(); out += bytes([f << 3 | 2]) + _vi(len(b)) + b
     return out
 
 def msg(*strings):
@@ -36,9 +50,10 @@ def msg(*strings):
 
 def pb(*strings, quoted=None):
     """A body: own content, optionally with a quoted message beside it."""
-    out = bytes([0x0a, len(msg(*strings))]) + msg(*strings)
+    m = msg(*strings)
+    out = bytes([0x0a]) + _vi(len(m)) + m
     if quoted is not None:
-        q = msg(quoted); out += bytes([0x12, len(q)]) + q
+        q = msg(quoted); out += bytes([0x12]) + _vi(len(q)) + q
     return out
 
 def check(name, got, want):
@@ -106,6 +121,15 @@ bare = Identities({"contact": [{"id": "703600000005@lid", "phoneNumber": "918100
 check("source: phone only", bare.source("703600000005@lid"), "phone")
 check("number used when nothing is named", bare.label("703600000005@lid"), "+918100000005")
 check("superseded record does not win", ids.label("965000000001@lid"), "Priya Desk")
+# ...but the lid<->phone mapping is harvested even from a superseded record, because it is an
+# identifier that does not change and losing it costs an identity
+gapped = Identities({"contact": [
+    {"id": "703600000007@lid", "pushname": "Later"},                      # live: no phoneNumber
+    {"id": "703600000007@lid", "phoneNumber": "918100000007@c.us"}]}, {})  # superseded: has it
+check("the link survives a live record that omits it",
+      gapped.row("703600000007@lid")["phone"], "918100000007@c.us")
+check("...while the live record still supplies the name",
+      gapped.label("703600000007@lid"), "Later")
 
 print("\nmy own identity")
 check("my lid is me", ids.is_me("133400000001@lid"), True)
@@ -116,6 +140,42 @@ check("one identity for both of my forms",
 check("...and it is named", ids.label("133400000001@lid"), "Riya")
 check("me marker only when asked", ids.label("133400000001@lid", mark_me=True), "Riya (me)")
 check("a contact is not me", ids.is_me("965000000001@lid"), False)
+
+print("\nmy identity survives a profile that names only one of my forms")
+# `last-wid-md` is present on any logged-in profile; `WALid` is not guaranteed. With only the phone
+# form known and my own messages authored by my lid, a literal membership test calls every outgoing
+# message incoming.
+HALF = {"last-wid-md": json.dumps("919000000001:44@c.us")}          # no WALid
+# mechanism 1: a contact record ties my lid to my number (the usual case -- the real profile has it)
+linked = Identities({"contact": STORES["contact"] + [
+    {"id": "133400000001@lid", "phoneNumber": "919000000001@c.us", "pushname": "Riya"}]}, HALF)
+check("my lid is me when a contact record ties it to my number",
+      linked.is_me("133400000001@lid"), True)
+# mechanism 2: nothing links them, so it is learned from who authored the outgoing messages
+half = Identities(STORES, HALF)
+check("unknown before learning", half.is_me("133400000001@lid"), False)
+half.learn_me([{"from_me": True, "sender": "133400000001@lid"} for _ in range(50)] +
+              [{"from_me": True, "sender": "965000000001@lid"}] +      # a system event's actor
+              [{"from_me": False, "sender": "965000000001@lid"} for _ in range(20)])
+check("my lid is learned from message authorship", half.is_me("133400000001@lid"), True)
+check("a rare mismatching actor is NOT taken for me", half.is_me("965000000001@lid"), False)
+check("learning adds nothing when the profile already named both forms",
+      Identities(STORES, LS).learn_me([{"from_me": True, "sender": "133400000001@lid"}]), set())
+check("my phone form is me", half.is_me("919000000001@c.us"), True)
+check("a contact is still not me", half.is_me("965000000001@lid"), False)
+check("my own message is not relabelled as incoming",
+      msg_row({"chat": "x@c.us", "from_me": True, "type": "chat", "t": 0,
+               "sender": "133400000001@lid", "id": "true_x_1"}, "t", pb("mine"), half)["dir"], "me")
+
+print("\none person, one label")
+# A chat-store name attached to the phone form must be found from the lid form too, or chats.json
+# and identities.json name the same person differently.
+two = Identities({"contact": [{"id": "965000000001@lid", "phoneNumber": "919500000002@c.us"}],
+                  "chat": [{"id": "919500000002@c.us", "name": "Alice ChatStore"}]}, LS)
+check("label via the lid form", two.label("965000000001@lid"), "Alice ChatStore")
+check("label via the phone form", two.label("919500000002@c.us"), "Alice ChatStore")
+check("label via the identity key", two.label(two.key("965000000001@lid")), "Alice ChatStore")
+check("and the provenance says where it came from", two.source("965000000001@lid"), "chat-name")
 
 print("\nchats and groups")
 check("group subject wins over chat name", ids.label("120300000009@g.us"), "Weekend plans")
@@ -207,6 +267,23 @@ check("one legend row per person, not per address form",     # my lid AND my pho
 check("incoming line names the sender", "<- %22s: hello" % "Priya Desk" in txt, True)
 check("outgoing line is marked", "-> %22s: hi" % "Riya" in txt, True)
 check("no 'them' left in the body", " them:" not in txt, True)
+
+# A sticker reply has no text of its own; its quote is the only record of what it answered, and
+# before this it produced no line at all.
+stick = msg_row({"chat": "120300000009@g.us", "from_me": False, "type": "sticker", "t": 0,
+                 "sender": "965000000001@lid", "id": "false_x_3"}, "2026-01-01 00:00:04",
+                bytes([0x12]) + _vi(len(msg("their words"))) + msg("their words"), ids)
+plain = msg_row({"chat": "120300000009@g.us", "from_me": False, "type": "image", "t": 0,
+                 "sender": "965000000001@lid", "id": "false_x_4"}, "2026-01-01 00:00:05",
+                pb("919500000002@s.whatsapp.net"), ids)
+p6 = os.path.join(tempfile.mkdtemp(), "s.txt")
+write_transcripts(p6, {"120300000009@g.us": [stick, plain]}, ids)
+st = open(p6, encoding="utf-8").read()
+check("a text-less message still gets a line", len([l for l in st.split("\n") if l.startswith("[")]), 2)
+check("...shown as its type", "(sticker)" in st and "(image)" in st, True)
+check("...and the sticker reply's quote is finally visible", "re: their words" in st, True)
+check("the header counts messages and texted messages separately",
+      "(group; 2 msgs, 0 with text)" in st, True)
 check("the quote is shown as context, not as the message", "re: earlier words" in txt, True)
 
 # a message that spans lines must stay attributable: continuations are indented under '|', so no
@@ -261,6 +338,19 @@ msgl = [l for l in lt.split("\n") if l.startswith("[")]
 legend_label = leg[0].split("  ")[0].strip()
 line_label = msgl[0].split("] ", 1)[1].split(": ", 1)[0].strip()[3:].strip()
 check("a long label reads the same on the line as in the legend", line_label, legend_label)
+# Truncation must be visible. A label cut at the column width, or a quote cut at the line budget,
+# reads as the whole value if nothing says otherwise -- and in a transcript that is a quiet claim
+# about what somebody wrote. The full value is in chats.json; the mark is what sends a reader there.
+check("a truncated label says so", line_label.endswith("\u2026"), True)
+qrow = msg_row({"chat": "120300000009@g.us", "from_me": False, "type": "chat", "t": 0,
+                "sender": "965000000001@lid", "id": "false_x_2"}, "2026-01-01 00:00:00",
+               pb("short reply", quoted="quoted words " * 20), longids)   # spaces: an unbroken
+               # run of base64-legal characters is dropped by the text filter as a blob
+p5 = os.path.join(tempfile.mkdtemp(), "q.txt")
+write_transcripts(p5, {"120300000009@g.us": [qrow]}, longids)
+qt = [l for l in open(p5, encoding="utf-8").read().split("\n") if l.lstrip().startswith("re: ")]
+check("a truncated quote says so", qt[0].rstrip().endswith("\u2026"), True)
+check("...and the full quote is still on the row", len(qrow["quoted_text"]), 260)
 check("a long label stays separable from the jid that follows it", "  " in leg[0], True)
 check("...and the jid is still recoverable from the legend row",
       "965000000001@lid" in leg[0].split("  ", 1)[-1], True)
@@ -270,8 +360,16 @@ print("message text: addressing is noise, but never the whole message")
 check("sender jid stripped from text", message_text(pb("hello there", "919500000002@s.whatsapp.net")),
       "hello there")
 check("lid form stripped too", message_text(pb("ok", "965000000001@lid")), "ok")
-check("a jid-only body keeps its jid rather than vanishing",
-      message_text(pb("919500000002@s.whatsapp.net")), "919500000002@s.whatsapp.net")
+# A body whose own content is NOTHING BUT addressing has no text, and must not be given one.
+# This used to return the address, on the reasoning that it was "all the text there is" -- which
+# was about the whole body, before own and quoted content were separated. Once they are, a media
+# message with no caption genuinely has no text, and printing its routing jid as the message is
+# worse than printing nothing: the record stays in chats.json with its type, and the transcript
+# already omits messages that have none.
+check("a body that is only addressing has no text",
+      message_text(pb("919500000002@s.whatsapp.net")), "")
+check("...and an address alongside real text is still just stripped",
+      message_text(pb("see you", "919500000002@s.whatsapp.net")), "see you")
 check("real text that merely contains digits is untouched",
       message_text(pb("call me on 9876543")), "call me on 9876543")
 check("an email address is not an address jid", message_text(pb("a@b.com", "ok")), "a@b.com ok")
@@ -301,11 +399,37 @@ reply = pb("my answer", quoted="what they said")
 check("own text only", message_text(reply), "my answer")
 check("quote kept, not merged", quoted_text(reply), "what they said")
 check("no quote means no quoted text", quoted_text(pb("just me")), "")
-only_quote = bytes([0x12, len(msg("theirs"))]) + msg("theirs")
+only_quote = bytes([0x12]) + _vi(len(msg("theirs"))) + msg("theirs")
 check("body with only a quote has no own text", message_text(only_quote), "")
 check("...and the quote is still readable", quoted_text(only_quote), "theirs")
 check("an unparseable body falls back to scraping the whole thing",
       split_body(b"\xff\xff\xff")[0], b"\xff\xff\xff")
+# Anything that is not the quote is this message's own content, so an unfamiliar field cannot take
+# text out of the export without saying so.
+odd = bytes([0x0a]) + _vi(len(msg("mine"))) + msg("mine") + \
+      bytes([0x1a]) + _vi(len(msg("in field three"))) + msg("in field three")
+check("text in an unexpected field is kept", message_text(odd), "mine in field three")
+twice = bytes([0x0a]) + _vi(len(msg("first"))) + msg("first") + \
+        bytes([0x0a]) + _vi(len(msg("second copy"))) + msg("second copy")
+check("a repeated own-content field is kept", message_text(twice), "first second copy")
+check("...and the quote is still only the first field 2",
+      quoted_text(bytes([0x12]) + _vi(len(msg("q1"))) + msg("q1") +
+                  bytes([0x12]) + _vi(len(msg("q2"))) + msg("q2")), "q1")
+
+print()
+print("formatting controls cannot rewrite a line")
+rlo = "\u202e"
+check("a joiner is still text", message_text(pb("a\u200db")), "a\u200db")
+check("a bidi override survives into chats.json", rlo in message_text(pb("hello " + rlo + "world")), True)
+bidi_ids = Identities({"contact": [{"id": "1@lid", "name": "Ann" + rlo + "Bob"}]}, LS)
+brow = msg_row({"chat": "1@lid", "from_me": False, "type": "chat", "t": 0, "sender": "1@lid",
+                "id": "false_x_5"}, "2026-01-01 00:00:00", pb("see " + rlo + "this"), bidi_ids)
+p7 = os.path.join(tempfile.mkdtemp(), "b.txt")
+write_transcripts(p7, {"1@lid": [brow]}, bidi_ids)
+bt = open(p7, encoding="utf-8").read()
+check("...but not into the transcript's text", rlo in bt, False)
+check("...nor into a label there", "AnnBob" in bt, True)
+check("the row still holds the characters the store held", rlo in brow["text"], True)
 
 print()
 if FAIL:

@@ -12,6 +12,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sclone, wa_decrypt as WD
 
 FAIL = []
+# These tests print message text and contact names, which include emoji. On a Windows console that
+# is cp1252 by default -- which is what CI runs -- printing one raises UnicodeEncodeError and the
+# suite dies mid-run with a traceback instead of a result.
+try: sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception: pass
+
 def chk(name, got, want):
     if got == want: print("  ok   %s: %r" % (name, got))
     else: FAIL.append(name); print("  FAIL %s: got %r want %r" % (name, got, want))

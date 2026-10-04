@@ -64,8 +64,32 @@ def _varint(b, i):
 #
 # This is the same failure as the one that cost 767 emoji-only messages their text -- that fix
 # relaxed the "must contain a letter" rule and left this second gate in place behind it.
+# Category Cf -- joiners, selectors AND the bidi controls -- is accepted here, because this test
+# decides whether a string is text at all, and a bidi control is a text character: it occurs in
+# legitimate Arabic and Hebrew writing. Rejecting a string over one would discard the whole message,
+# which is worse than the problem -- measured, "see <RLO>this" is 8 printable of 9 and falls under
+# the 90% threshold, so the message would lose its text entirely.
+#
+# What a bidi control must not do is reach a LINE-STRUCTURED artifact, where it re-orders the sender,
+# the arrow and the text around each other in a file whose premise is that every line is
+# attributable. That is the writer's job: `_printable_line` below removes them on the way into
+# transcripts.txt, while chats.json keeps exactly what the store held.
+_JOINERS = {0x200C, 0x200D, 0x2060}
 def _textlike(c):
-    return c.isprintable() or c in "\n\r\t" or unicodedata.category(c) in ("Cf", "Mn", "Me", "Mc")
+    o = ord(c)
+    return (c.isprintable() or c in "\n\r\t" or o in _JOINERS
+            or 0xE0020 <= o <= 0xE007F
+            or unicodedata.category(c) in ("Cf", "Mn", "Me", "Mc"))
+
+# Bidi and other explicit-formatting controls, stripped on the way into the LINE-ORIENTED file only.
+# chats.json keeps the characters the store held; the transcript cannot, because they rewrite it.
+_BIDI = {0x200E, 0x200F, 0x061C, 0x2066, 0x2067, 0x2068, 0x2069,
+         0x202A, 0x202B, 0x202C, 0x202D, 0x202E}
+def _printable_line(t):
+    """Text safe to write into a line-structured artifact: no bidi reordering, no stray controls."""
+    return "".join(c for c in str(t or "")
+                   if ord(c) not in _BIDI and (c in "\n\t" or unicodedata.category(c)[0] != "C"
+                                               or ord(c) in _JOINERS or 0xE0020 <= ord(c) <= 0xE007F))
 
 def leaves(buf, depth=0, out=None):
     if out is None: out = []
@@ -183,6 +207,19 @@ class Identities:
             ent["addressbook"] = ent["addressbook"] or bool(o.get("isAddressBookContact"))
             for k in (jid, pn):
                 if k: self._id[k] = ent
+        # Names come from the live record only (above), because a superseded record can hold a name
+        # the user has since deleted. The lid<->phone LINK is different: it is an identifier mapping,
+        # it does not change, and losing it costs an identity. So it is harvested from every record,
+        # including superseded ones -- a live record that omits `phoneNumber` no longer hides it.
+        for o in st.get("contact") or ():
+            if not isinstance(o, dict): continue
+            jid, pn = canon_jid(o.get("id")), canon_jid(o.get("phoneNumber"))
+            if not (jid and pn): continue
+            ent = self._id.get(jid) or self._id.get(pn)
+            if ent is None: continue                           # no identity to attach it to
+            if jid.endswith("@lid"): ent["lid"] = ent["lid"] or jid
+            ent["pn"] = ent["pn"] or pn
+            self._id.setdefault(jid, ent); self._id.setdefault(pn, ent)
         for o in _dedupe(st.get("group-metadata")):            # authoritative group subject
             jid, subj = canon_jid(o.get("id")), _txt(o.get("subject"))
             if jid and subj: self._subject[jid] = subj
@@ -215,6 +252,51 @@ class Identities:
             if j.endswith("@lid"): ent["lid"] = ent["lid"] or j
             else: ent["pn"] = ent["pn"] or j
             self._id[j] = ent
+        # ...and `me` is the IDENTITY, not the two strings localStorage happened to hold. A profile
+        # with `last-wid-md` but no `WALid` knows my phone form only, while my own messages are
+        # authored by my lid -- so every outgoing message would fail `is_me` and be relabelled as
+        # incoming, which is the exact defect the sender-driven direction was added to fix. Any form
+        # the contact store ties to one of mine is mine too.
+        for j in (ent.get("lid"), ent.get("pn")):
+            if j: self.me.add(j)
+
+    def learn_me(self, msgs, min_share=0.5):
+        """Add my own address forms that the PROFILE did not name, taken from the messages.
+
+        `last-wid-md` is on every logged-in profile; `WALid` is not guaranteed, and a profile can
+        hold one of my forms while my own messages are authored by the other. Nothing then ties them
+        together unless a contact record happens to, and every outgoing message would be attributed
+        to the other party.
+
+        The store already records authorship: the message id's `fromMe` flag. So the author of my
+        outgoing messages IS me -- with one exception, group system events, where the flag means
+        "recorded locally" and the author is whoever acted. A share threshold is what separates the
+        two: my own lid accounts for essentially all flag-outgoing messages, while an actor on a
+        system event accounts for a handful. Only ADDS forms; whatever localStorage said still
+        stands, and a store whose flags are unusable simply teaches nothing.
+        """
+        c = collections.Counter(canon_jid(m.get("sender")) for m in msgs
+                                if m.get("from_me") and m.get("sender"))
+        c.pop("", None)
+        total = sum(c.values())
+        if not total: return set()
+        learned = set()
+        for form, n in c.items():
+            if n / total >= min_share and form not in self.me:
+                learned.add(form)
+        for form in learned:
+            ent = self._id.get(form)
+            if ent is None:
+                ent = next((self._id[j] for j in sorted(self.me) if j in self._id), None) or {
+                    "lid": None, "pn": None, "name": None, "pushname": None, "addressbook": False}
+                self._id[form] = ent
+            if form.endswith("@lid"): ent["lid"] = ent["lid"] or form
+            else: ent["pn"] = ent["pn"] or form
+            self.me.add(form)
+        if learned:
+            log.info("own address form(s) not named by the profile, taken from message authorship: %d",
+                     len(learned))
+        return learned
 
     def entry(self, jid):
         """The merged identity behind any form of a jid, or None."""
@@ -228,7 +310,13 @@ class Identities:
         return e.get("lid") or e.get("pn") or cj
 
     def is_me(self, jid):
-        return canon_jid(jid) in self.me
+        """Is this me, by IDENTITY. A form I have never seen still counts when it belongs to the same
+        person as a form I have, which a literal set membership test cannot tell."""
+        cj = canon_jid(jid)
+        if cj in self.me: return True
+        if not self.me: return False
+        k = self.key(cj)
+        return bool(k) and k in {self.key(x) for x in self.me}
 
     # One order, used by both label() and source(), so the label and its stated provenance can never
     # disagree. A group is named by its subject and nothing else; a person is named by the examined
@@ -245,7 +333,13 @@ class Identities:
         e = self.entry(cj) or {}
         if e.get("name"): return e["name"], "address-book"
         if e.get("pushname"): return e["pushname"], "pushname"
-        if cj in self._chat: return self._chat[cj], "chat-name"
+        # The chat store names a CHAT, which is keyed by whichever form that chat uses -- so a name
+        # attached to someone's phone form is invisible when the same person is reached by their lid.
+        # Looked up across every form of the identity, or one person gets two labels in one export:
+        # their chat-store name in chats.json (matched on the form the message used) and their phone
+        # number in identities.json and the legend (matched on the identity key).
+        for form in (cj, e.get("lid"), e.get("pn")):
+            if form and form in self._chat: return self._chat[form], "chat-name"
         if cj in _PSEUDO: return _PSEUDO[cj], "system"
         pn = e.get("pn") or (cj if cj.endswith("@c.us") else None)
         if pn: return "+" + pn.split("@")[0], "phone"
@@ -306,9 +400,15 @@ class Identities:
 # not something a person typed, and now that the sender is resolved into its own column it is pure
 # noise: measured over a 22,121-message store it was tacked onto the end of 6,218 lines.
 #
-# Dropped -- UNLESS it is the only string the body has. That is 424 messages here (393 image, 29
-# video, 2 chat), where the address is all the text there is, and dropping it would turn a visible
-# line into no line at all. So the filter can remove noise but can never remove a message.
+# Dropped unconditionally. It was once kept when it was the only string a body had, on the reasoning
+# that it was "all the text there is" -- but that reasoning was about the WHOLE body, before own and
+# quoted content were separated. Once they are, a body whose own content is nothing but addressing
+# has no text, and 569 messages (397 image, 104 sticker, 31 video, 22 ptt, 11 album, 2 chat, 1 audio,
+# 1 unknown) were printing their routing jid where their words would go. Re-measured across all
+# 22,121 bodies: removing the exception drops a bare address in every one of those cases and loses
+# nothing else -- zero messages lose anything that is not an address. The record itself is not lost
+# either; it stays in chats.json with its type, and the transcript already omits messages with no
+# text, which is what a media message without a caption is.
 _ADDRESS = re.compile(r"\+?\d{5,}(?::\d+)?@(?:lid|c\.us|s\.whatsapp\.net|g\.us|broadcast)\Z")
 
 # A decrypted body has TWO messages in it. Top-level field 1 is this message; top-level field 2 is
@@ -326,7 +426,7 @@ def split_body(pt):
 
     Deliberately forgiving: anything unexpected falls back to (whole body, None), which is exactly
     the old behaviour, so an unfamiliar shape loses nothing."""
-    own = quoted = None
+    own, quoted = [], None
     i, n = 0, len(pt)
     try:
         while i < n:
@@ -334,8 +434,14 @@ def split_body(pt):
             f, wt = tag >> 3, tag & 7
             if wt == 2:
                 ln, i = _varint(pt, i); seg = pt[i:i + ln]; i += ln
-                if f == 1 and own is None: own = seg
-                elif f == 2 and quoted is None: quoted = seg
+                # Field 2 is the quote, and only the first of it. EVERYTHING ELSE counts as this
+                # message's own content -- including a repeated field 1 and any field this wrapper
+                # has never been seen to carry. Keeping only field 1 would drop such content with no
+                # counter and no log line, which is the failure this file keeps having to re-fix;
+                # every body in the reference profile is exactly {1, 2}, so this costs nothing today
+                # and loses nothing tomorrow.
+                if f == 2 and quoted is None: quoted = seg
+                else: own.append(seg)
             elif wt == 0: _, i = _varint(pt, i)
             elif wt == 5: i += 4
             elif wt == 1: i += 8
@@ -343,25 +449,32 @@ def split_body(pt):
     except Exception as e:
         log.debug("body split failed, scraping whole body: %s", e)
         return pt, None
-    if own is None and quoted is None:
+    if not own and quoted is None:
         return pt, None          # parsed, but nothing recognised: scrape it all rather than lose it
-    return own, quoted           # own may be None -- a body whose only content is a quote has no
-                                 # text of its own, and saying so is the entire point
+    return (b"".join(own) or None), quoted   # own is None when the only content is a quote, and
+                                             # saying so is the entire point
 
 def _scrape(buf, cap):
     if not buf: return ""
     lv = list(dict.fromkeys(leaves(buf)))
-    keep = [x for x in lv if not _ADDRESS.match(x.strip())]
-    return " ".join(keep or lv)[:cap]
+    return " ".join(x for x in lv if not _ADDRESS.match(x.strip()))[:cap]
+
+def texts(pt, cap=2000):
+    """-> (own text, quoted text) from ONE parse of the body.
+
+    Both writers want both strings for every message, and calling `message_text` then `quoted_text`
+    parsed each body twice and walked the tree twice -- 22,121 bodies in the hot loop of both
+    exporters, for identical output."""
+    own, q = split_body(pt)
+    return _scrape(own, cap), _scrape(q, cap)
 
 def message_text(pt, cap=2000):
     """This message's OWN text: every distinct string in its own content, addressing stripped."""
-    return _scrape(split_body(pt)[0], cap)
+    return texts(pt, cap)[0]
 
 def quoted_text(pt, cap=2000):
     """The text of the message this one replies to, or "" -- kept apart, never merged into the above."""
-    q = split_body(pt)[1]
-    return _scrape(q, cap) if q else ""
+    return texts(pt, cap)[1]
 
 def msg_row(m, when, pt, ids):
     """One chats.json record, built from the decrypted body in one place so no writer can derive the
@@ -376,13 +489,14 @@ def msg_row(m, when, pt, ids):
     # ...but only when the profile actually told us who "me" is. On a profile missing `last-wid-md`
     # or `WALid` every message would otherwise read as incoming, which is worse than the flag.
     me = (ids.is_me(m.get("sender")) if (m.get("sender") and ids.me)
-          else bool(m["from_me"]))
+          else bool(m["from_me"]))      # is_me() compares identities, so either form of mine counts
+    own, quoted = texts(pt)
     return {"id": m.get("id"), "t": when, "dir": "me" if me else "them", "type": m["type"],
             "chat": m.get("chat"), "chat_name": ids.label(m.get("chat")),
             "sender": m.get("sender"), "sender_name": ids.label(m.get("sender")),
             "sender_lid": e.get("lid"), "sender_phone": e.get("pn"),
             "sender_source": ids.source(m.get("sender")),
-            "text": message_text(pt), "quoted_text": quoted_text(pt)}
+            "text": own, "quoted_text": quoted}
 
 # ONE cap for every place a label is written. Capping per call site (40 on a message line, 60 in the
 # legend, 80 in a header) rendered the same person two different ways in one file and made a line
@@ -399,8 +513,11 @@ def _oneline(v, width=None):
     breaks, continued under '|'); a label has no such affordance, so it is collapsed. Nothing is
     lost that identifies anyone: the raw jid sits beside it, and chats.json keeps the label verbatim.
     """
-    t = " ".join(str(v or "").split())
-    return t[:width] if width and len(t) > width else t
+    t = " ".join(_printable_line(v).split())
+    # A value cut to fit reads as the whole value unless something says otherwise, and in a
+    # transcript that is a quiet claim about what somebody is called. Mark it; the full label is in
+    # chats.json and identities.json.
+    return (t[:width - 1] + "\u2026") if width and len(t) > width else t
 
 def write_transcripts(path, chats, ids):
     """transcripts.txt -- the artifact people actually read. Every line names its sender, and each
@@ -411,12 +528,14 @@ def write_transcripts(path, chats, ids):
                 "# name, else WhatsApp pushname, else phone number, else the raw jid unchanged.\n"
                 "# Each chat header lists its senders and their jid forms. '->' sent, '<-' received.\n"
                 "# A message that spans lines is continued under '|', and 're:' is the message being\n"
-                "# replied to -- quoted by the client, written by whoever is named on that line.\n")
+                "# replied to -- quoted by the client, written by whoever is named on that line.\n"
+                "# '(image)', '(sticker)', '(revoked)' and the like are messages with no text of\n"
+                "# their own, shown as the type the store recorded.\n")
         for c, ml in sorted(chats.items(), key=lambda kv: -len(kv[1])):
             tm = [m for m in ml if m["text"]]
-            if not tm: continue
+            if not ml: continue
             kind = "group" if str(c).endswith("@g.us") else "1:1"
-            f.write("\n===== %s  [%s]  (%s; %d msgs, %d text) =====\n"
+            f.write("\n===== %s  [%s]  (%s; %d msgs, %d with text) =====\n"
                     % (_oneline(ids.label(c), _LABEL_MAX), c, kind, len(ml), len(tm)))
             who = {}
             for m in ml:
@@ -428,7 +547,14 @@ def write_transcripts(path, chats, ids):
                                                ("  " + forms) if forms else "",
                                                "  (me)" if r["is_me"] else ""))
             for m in ml:
-                if not m["text"]: continue
+                # EVERY message gets a line. Skipping the ones with no text of their own dropped
+                # 2,374 records from the readable artifact -- caption-less media, revoked messages,
+                # call logs -- and with them the `re:` quote on a sticker reply, which is the one
+                # case the own/quoted split was made for. A message with nothing to quote and nothing
+                # to say is still a message that was sent at a time by a person, so it is shown as
+                # its type in parentheses. Nothing is invented: `(image)` is the type the store
+                # recorded, not a guess at content.
+                body = m["text"] or ("(%s)" % (m.get("type") or "unknown"))
                 # 3.7% of messages contain newlines, and writing them raw broke the one-line-per-
                 # message structure this file promises: 2,394 continuation lines carried no
                 # timestamp and no sender, and 29 of them began with '#', which is what this file
@@ -437,13 +563,13 @@ def write_transcripts(path, chats, ids):
                 head = "[%s] %s %22s: " % (m["t"], "->" if m["dir"] == "me" else "<-",
                                            _oneline(m.get("sender_name") or m["dir"], _LABEL_MAX))
                 cont = " " * (len(head) - 2) + "| "
-                body = m["text"].replace("\r\n", "\n").replace("\r", "\n").split("\n")
-                f.write(head + body[0] + "\n")
-                for extra in body[1:]:
+                lines = _printable_line(body).replace("\r\n", "\n").replace("\r", "\n").split("\n")
+                f.write(head + lines[0] + "\n")
+                for extra in lines[1:]:
                     f.write(cont + extra + "\n")
-                q = (m.get("quoted_text") or "").replace("\r", " ").replace("\n", " ")
+                q = _oneline(m.get("quoted_text"), 160)   # marked when cut; full text in chats.json
                 if q:
-                    f.write(" " * (len(head) - 6) + "re: " + q[:160] + "\n")
+                    f.write(" " * (len(head) - 6) + "re: " + q + "\n")
 
 def load_firefox(origin):
     ls = {}
@@ -493,11 +619,17 @@ def _dedupe_msgs(msgs):
     """Drop records that are byte-for-byte the same message twice.
 
     The Chromium reader yields superseded versions as well as live ones, newest first, and that is
-    deliberate -- an edited or re-delivered message is evidence. But 25 ids in this store appeared
-    twice with every field identical, which is not a second version of anything; it put 37 duplicate
-    rows in chats.json, repeated lines in the transcript, and 37 duplicate `key_id`s in an export
-    whose schema treats that column as unique. Only EXACT duplicates are dropped, so a version that
-    actually differs still survives, under the same id, where it can be seen.
+    deliberate -- an edited or re-delivered message is evidence. 25 ids in this store appear twice,
+    and I first described those copies as byte-identical, which is wrong: they differ in `ack`,
+    `pendingReadReceipt` and `hasReaction`. That is the message moving through its lifecycle, not a
+    second message, and none of it is carried into an export.
+    
+    So the key is every field this normalisation KEEPS -- id, timestamp, direction, type, sender and
+    the ciphertext itself. Two copies that differ only in delivery state collapse to the newest; a
+    version whose text actually differs has different ciphertext, so it survives under the same id
+    where it can be seen. Before this, the duplicates put 37 extra rows in chats.json, repeated
+    lines in the transcript, and 37 duplicate `key_id`s in an export whose schema treats that column
+    as unique.
     """
     out, seen = [], set()
     for m in msgs:
@@ -543,7 +675,9 @@ def load(profile=None, origin=None):
             raise SystemExit("Could not locate WhatsApp Web storage in that profile (pass --origin for Firefox).")
         engine, parts = "firefox", load_firefox(cand)
     ls, root, msgs, meta, stores = parts
-    return engine, ls, root, msgs, meta, Identities(stores, ls)
+    ids = Identities(stores, ls)
+    ids.learn_me(msgs)          # fill in any of my own address forms the profile did not name
+    return engine, ls, root, msgs, meta, ids
 
 # ---------------- main ----------------
 def main():

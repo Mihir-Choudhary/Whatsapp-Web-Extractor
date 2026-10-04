@@ -28,7 +28,7 @@ from idbutil import store_id
 # ONE text builder for every export, so a message cannot read differently in two exports of the same
 # evidence. (It used to be copied here, and when the filter was found to be dropping 767 messages the
 # fix had to be made twice -- that is the failure mode this import exists to prevent.)
-from wa_decrypt import message_text, quoted_text
+from wa_decrypt import texts as _message_texts
 import sclone
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
@@ -166,7 +166,8 @@ def decrypt_body(op):
     if len(data) % 16: return (None, None)    # misaligned: CBC would decrypt part and drop the tail
     try: pt = pk7(Cipher(algorithms.AES(MSGKEY), modes.CBC(iv)).decryptor().update(data))
     except Exception: return (None, None)
-    return (message_text(pt, 8000) or None, quoted_text(pt, 8000) or None)
+    own, quoted = _message_texts(pt, 8000)      # one parse, both strings
+    return (own or None, quoted or None)
 
 def ser(x):
     if isinstance(x, dict): return as_text(x.get('_serialized')) or (f"{as_text(x.get('user'))}@{as_text(x.get('server'))}" if x.get('user') else None)
@@ -290,12 +291,18 @@ for o in store(MSG_SID):
         'quoted_text': quoted_body,
     }
     # This store yields superseded record versions as well as live ones, so the same message can
-    # arrive twice. An identical copy is not a second message: it inflated the row count and left 37
-    # duplicate `key_id`s in a schema that treats that column as unique, which an Android parser
-    # reads as two messages. Only EXACT duplicates are dropped -- a version that genuinely differs
-    # is kept, because an edit or a re-delivery is evidence.
-    _k = (idv, row['timestamp'], row['from_me'], row['message_type'], row['sender_jid'],
-          row['text_data'], row['quoted_text'])
+    # arrive twice; 25 ids do here. Those copies are NOT byte-identical records -- they differ in
+    # `ack`, `pendingReadReceipt` and `hasReaction` -- but delivery and read state is the message
+    # moving through its lifecycle, not a second message, and the newest copy comes first, so taking
+    # the first gives the current state.
+    #
+    # The key is therefore everything this row CARRIES except that volatile state: text, quote,
+    # timestamp, sender, type, media, thumbnail, mentions, and the quoted link. Keying on a handful
+    # of columns instead would have dropped a version that differs in its media key, its mentions or
+    # its thumbnail, while the comment claimed such versions were kept. `status` and `starred` are
+    # excluded deliberately: a message that was delivered, then read, then starred is one message.
+    _k = json.dumps({k: v for k, v in row.items() if k not in ('status', 'starred')},
+                    sort_keys=True, default=repr)
     if _k in _seen_msg: continue
     _seen_msg.add(_k)
     messages.append(row)
@@ -346,13 +353,19 @@ for c in contacts:
     lid = c.get('id'); phone = c.get('phoneNumber')
     if lid and phone and str(lid).endswith('@lid'):
         db.execute("INSERT INTO jid_map(jid_row_id,lid_row_id) VALUES(?,?)", (jid_id(phone), jid_id(lid)))
+CHATNAME = {}            # non-group chat display names, for wa_contacts to fall back on
 owner_jid_row = jid_id(OWNER_PHONE)
 for jraw, cid in _chat_id.items():
     ch = chats.get(jraw); g = groups.get(jraw)
     # Android keeps `chat.subject` for groups only -- a 1:1 chat's display name lives in wa_contacts,
     # and writing it here made the official "WhatsApp" account look like a group with a subject.
-    subject = as_text((g.get('subject') if g else None) or (ch.get('name') if ch else None)) \
-        if str(jraw).endswith('@g.us') else None
+    # A non-group name is not discarded, though: it is handed to wa_contacts below, because dropping
+    # it from `subject` without putting it anywhere would lose the only name a business account or
+    # the "WhatsApp" account has.
+    _nm = as_text((g.get('subject') if g else None) or (ch.get('name') if ch else None))
+    if _nm and not str(jraw).endswith('@g.us'):
+        CHATNAME[norm_jid(jraw)] = _nm
+    subject = _nm if str(jraw).endswith('@g.us') else None
     created = g.get('creation') if g else None
     sort_ts = int((ch.get('t') if ch else 0) or 0)*1000
     archived = 1 if (ch and ch.get('archive')) else 0
@@ -466,6 +479,17 @@ for c in contacts:
         wa.execute("INSERT OR IGNORE INTO wa_contacts(jid,display_name,wa_name,given_name,status,number) VALUES(?,?,?,?,?,?)",
                    (jraw, as_text(c.get('name')), as_text(c.get('pushname')), as_text(c.get('shortName')),
                     as_text(c.get('textStatusString')) or None, (as_text(c.get('phoneNumber')) or '').split('@')[0]))
+# A non-group chat's display name, for anyone the contact store does not cover: a business account,
+# the official "WhatsApp" account, a chat whose contact record never synced. It used to ride in
+# `chat.subject`, which is a group column in this schema -- moved here rather than dropped, because
+# otherwise it is the only name those chats have and it would appear nowhere in either database.
+# INSERT OR IGNORE, so a real contact record always wins; the UPDATE fills a blank display_name on
+# a row that exists but has no name.
+for jraw, nm in CHATNAME.items():
+    if not jraw: continue
+    wa.execute("INSERT OR IGNORE INTO wa_contacts(jid,display_name) VALUES(?,?)", (jraw, nm))
+    wa.execute("UPDATE wa_contacts SET display_name=? WHERE jid=? AND "
+               "(display_name IS NULL OR display_name='')", (nm, jraw))
 wa.commit(); wa.close()
 
 # ============ decrypt cached media into Media/ + set file_path ============
