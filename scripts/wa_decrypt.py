@@ -55,6 +55,18 @@ def _varint(b, i):
 # `leaves()` collects every string in the tree so such a value would be concatenated into the
 # transcript as if it were message content. Measured: that guard removes all 3 such strings in this
 # store and loses 0 real messages, where requiring letters-or-emoji instead would have cost 239.
+# `str.isprintable()` is False for a newline, for a zero-width joiner, and for the tag characters a
+# flag emoji is built from, so the 90%-printable test that rejects binary was also rejecting real
+# messages: a reply containing a blank line, "Same pg <ZWJ emoji>", a lone shrug, the England flag.
+# Measured over 22,121 bodies this recovers 12 strings and gives 3 messages back text they had none
+# of; nothing containing an actual control character is admitted, because Cc stays excluded while
+# the deliberate line breaks and the joiners/marks that are part of written text do not.
+#
+# This is the same failure as the one that cost 767 emoji-only messages their text -- that fix
+# relaxed the "must contain a letter" rule and left this second gate in place behind it.
+def _textlike(c):
+    return c.isprintable() or c in "\n\r\t" or unicodedata.category(c) in ("Cf", "Mn", "Me", "Mc")
+
 def leaves(buf, depth=0, out=None):
     if out is None: out = []
     i, n = 0, len(buf)
@@ -74,7 +86,7 @@ def leaves(buf, depth=0, out=None):
                 else:
                     try:
                         t = seg.decode("utf-8")
-                        if t and t != "null" and sum(c.isprintable() for c in t) >= len(t)*0.9 \
+                        if t and t != "null" and sum(_textlike(c) for c in t) >= len(t)*0.9 \
                            and any(c.isalnum() or unicodedata.category(c)[0] in ('S','P') for c in t) and not (t.strip().isdigit() and len(t.strip()) >= 12) and not re.fullmatch(r'[A-Za-z0-9+/]{40,}={0,2}', t):
                             out.append(t)
                     except Exception: pass
@@ -257,15 +269,25 @@ class Identities:
 
     def table(self, jids):
         """The correlation table for the jids actually seen, plus group membership -- exported so an
-        analyst can join on it rather than re-derive it from the stores."""
+        analyst can join on it rather than re-derive it from the stores.
+
+        One row per PERSON, not per address: keying on the jid listed the same contact twice, once
+        under their lid and once under their phone number, with both rows carrying the same name.
+        The other forms are listed in `jids` so a lookup by any of them still lands on one row."""
         rows = {}
         for j in jids:
             cj = canon_jid(j)
-            if cj and cj not in rows: rows[cj] = self.row(cj)
+            if not cj: continue
+            k = self.key(cj)
+            if k not in rows: rows[k] = dict(self.row(k), jids=[])
+            if cj not in rows[k]["jids"]: rows[k]["jids"].append(cj)
+        for r in rows.values(): r["jids"].sort()
         def members(ps): return [{"jid": p, "label": self.label(p, mark_me=True)} for p in ps]
-        return {"_note": "identity correlation for this export. 'source' says where each label came "
-                         "from; 'unresolved' means the profile knows no name and no number for that "
-                         "jid, and the raw jid is used as the label.",
+        return {"_note": "Identity correlation for this export: one row per PERSON, with every "
+                         "address form they appeared under in 'jids' (a phone number and a lid are "
+                         "the same person). 'source' says where the label came from, and "
+                         "'unresolved' means the profile knows no name and no number for that jid, "
+                         "so the raw jid is used as the label rather than a guess.",
                 "me": sorted(self.me),
                 "identities": [rows[k] for k in sorted(rows)],
                 "groups": {g: {"subject": v["subject"],
@@ -289,22 +311,90 @@ class Identities:
 # line into no line at all. So the filter can remove noise but can never remove a message.
 _ADDRESS = re.compile(r"\+?\d{5,}(?::\d+)?@(?:lid|c\.us|s\.whatsapp\.net|g\.us|broadcast)\Z")
 
-def message_text(pt, cap=2000):
-    """The readable text of a decrypted body: every distinct string in it, addressing stripped."""
-    lv = list(dict.fromkeys(leaves(pt)))
+# A decrypted body has TWO messages in it. Top-level field 1 is this message; top-level field 2 is
+# the message it replies to, as the client stored the quote. Scraping the whole tree therefore put
+# somebody else's words in this message's text column: measured on this store, 3,789 strings came
+# from field 2, and 1,884 of them are verbatim the own-text of another message in the same chat (the
+# rest quote messages older than the local cache, so there is nothing to match them against). The
+# worst case was a sticker reply, which has no text of its own: 194 of them were displayed with the
+# quoted message as if the sticker's sender had typed it.
+#
+# So the two are separated at the source. The quote is not discarded -- it is real evidence of what
+# was replied to -- it is just no longer attributed to the wrong person.
+def split_body(pt):
+    """-> (own, quoted) byte segments of a decrypted body. Either may be None.
+
+    Deliberately forgiving: anything unexpected falls back to (whole body, None), which is exactly
+    the old behaviour, so an unfamiliar shape loses nothing."""
+    own = quoted = None
+    i, n = 0, len(pt)
+    try:
+        while i < n:
+            tag, i = _varint(pt, i)
+            f, wt = tag >> 3, tag & 7
+            if wt == 2:
+                ln, i = _varint(pt, i); seg = pt[i:i + ln]; i += ln
+                if f == 1 and own is None: own = seg
+                elif f == 2 and quoted is None: quoted = seg
+            elif wt == 0: _, i = _varint(pt, i)
+            elif wt == 5: i += 4
+            elif wt == 1: i += 8
+            else: return pt, None
+    except Exception as e:
+        log.debug("body split failed, scraping whole body: %s", e)
+        return pt, None
+    if own is None and quoted is None:
+        return pt, None          # parsed, but nothing recognised: scrape it all rather than lose it
+    return own, quoted           # own may be None -- a body whose only content is a quote has no
+                                 # text of its own, and saying so is the entire point
+
+def _scrape(buf, cap):
+    if not buf: return ""
+    lv = list(dict.fromkeys(leaves(buf)))
     keep = [x for x in lv if not _ADDRESS.match(x.strip())]
     return " ".join(keep or lv)[:cap]
 
-def msg_row(m, when, text, ids):
-    """One chats.json record. The identity fields are ADDITIVE: `sender` stays exactly as stored and
-    the resolved name plus the lid/phone pair are added beside it, so nothing is replaced by an
-    interpretation of it."""
+def message_text(pt, cap=2000):
+    """This message's OWN text: every distinct string in its own content, addressing stripped."""
+    return _scrape(split_body(pt)[0], cap)
+
+def quoted_text(pt, cap=2000):
+    """The text of the message this one replies to, or "" -- kept apart, never merged into the above."""
+    q = split_body(pt)[1]
+    return _scrape(q, cap) if q else ""
+
+def msg_row(m, when, pt, ids):
+    """One chats.json record, built from the decrypted body in one place so no writer can derive the
+    text differently. The identity fields are ADDITIVE: `sender` stays exactly as stored and the
+    resolved name plus the lid/phone pair are added beside it, so nothing is replaced by an
+    interpretation of it. `text` is this message's own words; `quoted_text` is what it replied to."""
     e = ids.entry(m.get("sender")) or {}
-    return {"t": when, "dir": "me" if m["from_me"] else "them", "type": m["type"],
+    # Direction follows WHO SENT IT, not the stored `fromMe` flag, because on group system events the
+    # two disagree: 20 records here are flagged outgoing while their actor is someone else (a group
+    # subject change, an add, a remove), and reading those as messages I sent is simply wrong. The
+    # flag is not lost -- `id` begins with "true_" or "false_" and is carried on every row.
+    # ...but only when the profile actually told us who "me" is. On a profile missing `last-wid-md`
+    # or `WALid` every message would otherwise read as incoming, which is worse than the flag.
+    me = (ids.is_me(m.get("sender")) if (m.get("sender") and ids.me)
+          else bool(m["from_me"]))
+    return {"id": m.get("id"), "t": when, "dir": "me" if me else "them", "type": m["type"],
             "chat": m.get("chat"), "chat_name": ids.label(m.get("chat")),
             "sender": m.get("sender"), "sender_name": ids.label(m.get("sender")),
             "sender_lid": e.get("lid"), "sender_phone": e.get("pn"),
-            "sender_source": ids.source(m.get("sender")), "text": text}
+            "sender_source": ids.source(m.get("sender")),
+            "text": message_text(pt), "quoted_text": quoted_text(pt)}
+
+def _oneline(v, width=None):
+    """A label flattened to one line, for a file whose structure is lines.
+
+    A name or group subject is whatever the account holder typed, which can contain a newline or a
+    tab -- and a label is written into the chat header, the participant legend and every message
+    line, each of which must stay one line. Message TEXT is handled differently (it keeps its line
+    breaks, continued under '|'); a label has no such affordance, so it is collapsed. Nothing is
+    lost that identifies anyone: the raw jid sits beside it, and chats.json keeps the label verbatim.
+    """
+    t = " ".join(str(v or "").split())
+    return t[:width] if width and len(t) > width else t
 
 def write_transcripts(path, chats, ids):
     """transcripts.txt -- the artifact people actually read. Every line names its sender, and each
@@ -313,25 +403,41 @@ def write_transcripts(path, chats, ids):
     with open(path, "w", encoding="utf-8") as f:   # emoji/non-Latin text -> pin UTF-8 (Windows is cp1252)
         f.write("# Names resolved from the examined profile's own contact/group stores: address-book\n"
                 "# name, else WhatsApp pushname, else phone number, else the raw jid unchanged.\n"
-                "# Each chat header lists its senders and their jid forms. '->' sent, '<-' received.\n")
+                "# Each chat header lists its senders and their jid forms. '->' sent, '<-' received.\n"
+                "# A message that spans lines is continued under '|', and 're:' is the message being\n"
+                "# replied to -- quoted by the client, written by whoever is named on that line.\n")
         for c, ml in sorted(chats.items(), key=lambda kv: -len(kv[1])):
             tm = [m for m in ml if m["text"]]
             if not tm: continue
             kind = "group" if str(c).endswith("@g.us") else "1:1"
             f.write("\n===== %s  [%s]  (%s; %d msgs, %d text) =====\n"
-                    % (ids.label(c), c, kind, len(ml), len(tm)))
+                    % (_oneline(ids.label(c), 80), c, kind, len(ml), len(tm)))
             who = {}
             for m in ml:
                 s = m.get("sender")
                 if s and ids.key(s) not in who: who[ids.key(s)] = ids.row(ids.key(s))
             for cj, r in sorted(who.items(), key=lambda kv: (kv[1]["label"] or "").lower()):
                 forms = "  ".join(x for x in (r["lid"], r["phone"]) if x and x != cj)
-                f.write("  - %-26s %s%s%s\n" % (r["label"], cj, ("  " + forms) if forms else "",
+                f.write("  - %-26s %s%s%s\n" % (_oneline(r["label"], 60), cj,
+                                                 ("  " + forms) if forms else "",
                                                  "  (me)" if r["is_me"] else ""))
             for m in ml:
-                if m["text"]:
-                    f.write("[%s] %s %22s: %s\n" % (m["t"], "->" if m["dir"] == "me" else "<-",
-                                                    m.get("sender_name") or m["dir"], m["text"]))
+                if not m["text"]: continue
+                # 3.7% of messages contain newlines, and writing them raw broke the one-line-per-
+                # message structure this file promises: 2,394 continuation lines carried no
+                # timestamp and no sender, and 29 of them began with '#', which is what this file
+                # uses for its own header. Continuations are now indented under a '|' so every line
+                # is attributable and no message content can be mistaken for structure.
+                head = "[%s] %s %22s: " % (m["t"], "->" if m["dir"] == "me" else "<-",
+                                           _oneline(m.get("sender_name") or m["dir"], 40))
+                cont = " " * (len(head) - 2) + "| "
+                body = m["text"].replace("\r\n", "\n").replace("\r", "\n").split("\n")
+                f.write(head + body[0] + "\n")
+                for extra in body[1:]:
+                    f.write(cont + extra + "\n")
+                q = (m.get("quoted_text") or "").replace("\r", " ").replace("\n", " ")
+                if q:
+                    f.write(" " * (len(head) - 6) + "re: " + q[:160] + "\n")
 
 def load_firefox(origin):
     ls = {}
@@ -370,11 +476,30 @@ def load_firefox(origin):
                 try: msgs.append(_norm_msg(sclone.loads(uncompress(d))))
                 except Exception as e: skipped += 1; log.debug("firefox msg record skipped: %s", e)
             if skipped: log.debug("firefox: %d message record(s) failed to deserialize (of %d)", skipped, skipped + len(msgs))
+            msgs = _dedupe_msgs(msgs)                         # same reasoning as the Chromium path
         for n in _ID_STORES:                                  # who-is-who source records (small stores)
             stores[n] = _ff_store(c, n)
         for n in meta: meta[n] = len(stores.get(n, ()))       # counts for the terminal summary
         c.close()
     return ls, root, msgs, meta, stores
+
+def _dedupe_msgs(msgs):
+    """Drop records that are byte-for-byte the same message twice.
+
+    The Chromium reader yields superseded versions as well as live ones, newest first, and that is
+    deliberate -- an edited or re-delivered message is evidence. But 25 ids in this store appeared
+    twice with every field identical, which is not a second version of anything; it put 37 duplicate
+    rows in chats.json, repeated lines in the transcript, and 37 duplicate `key_id`s in an export
+    whose schema treats that column as unique. Only EXACT duplicates are dropped, so a version that
+    actually differs still survives, under the same id, where it can be seen.
+    """
+    out, seen = [], set()
+    for m in msgs:
+        k = (m.get("id"), m.get("t"), m.get("from_me"), m.get("type"), m.get("sender"),
+             m.get("iv"), m.get("data"))
+        if k in seen: continue
+        seen.add(k); out.append(m)
+    return out
 
 def load_chromium(profile):
     import chromium_reader as cr
@@ -384,7 +509,7 @@ def load_chromium(profile):
     if ck and isinstance(ck[0], dict) and hasattr(ck[0].get("key"), "key_data"):
         root = ck[0]["key"].key_data
     model = idb.get("model-storage", {})
-    msgs = [_norm_msg(o) for o in model.get("message", []) if isinstance(o, dict)]
+    msgs = _dedupe_msgs(_norm_msg(o) for o in model.get("message", []) if isinstance(o, dict))
     meta = {n: sum(1 for o in model.get(n, []) if isinstance(o, dict)) for n in ("contact", "group-metadata", "chat")}
     stores = {n: [o for o in model.get(n, []) if isinstance(o, dict)] for n in _ID_STORES}
     return ls, root, msgs, meta, stores
@@ -477,9 +602,8 @@ def main():
         if len(m["data"]) % 16: fail += 1; continue       # misaligned: see the note in wawf.py's cmd_decrypt
         try: pt = pk7(Cipher(algorithms.AES(key), modes.CBC(m["iv"])).decryptor().update(m["data"]))
         except Exception: fail += 1; continue
-        txt = message_text(pt)
         ok += 1
-        chats[m["chat"]].append(msg_row(m, ts(m["t"]), txt, ids))
+        chats[m["chat"]].append(msg_row(m, ts(m["t"]), pt, ids))
     print(f"[+] decrypted {ok} bodies ({fail} failed)  ->  {a.out}/")
     if ok and fail > ok:
         print("[!] most bodies failed to decrypt — companion_enc_static likely wrong for THIS profile/device.")

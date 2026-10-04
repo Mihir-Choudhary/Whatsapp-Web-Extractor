@@ -84,9 +84,17 @@ and **when nothing is known the jid is printed unchanged** — a label is never 
 "unidentified" stays visibly different from "identified". Each chat header lists its senders with
 every jid form they appear under, so any line can be traced back to an identifier.
 
+A reply quotes the message it answers, and the quote is stored *inside* the reply. It is kept in its
+own field rather than folded into the reply's text, because otherwise the transcript attributes one
+person's words to another: on a 22,121-message store that affected 4,282 messages, and for 246 of
+them — mostly sticker replies, which have no text of their own — the quoted message was the only
+thing shown. In the transcript the quote appears under the reply as `re:`; a message that spans
+lines is continued under `|`, so every line is attributable and no message content can sit where the
+file's own structure does.
+
 `chats.json` keeps `sender` exactly as stored and **adds** `sender_name`, `sender_lid`,
-`sender_phone`, `sender_source` and `chat_name` beside it — nothing is replaced by an interpretation
-of it. `identities.json` is the correlation table itself: jid ↔ lid ↔ phone ↔ name ↔ pushname, where
+`sender_phone`, `sender_source`, `chat_name` and `quoted_text` beside it — nothing is replaced by an
+interpretation of it. `identities.json` is the correlation table itself: jid ↔ lid ↔ phone ↔ name ↔ pushname, where
 each label came from, which contacts are in the address book, plus group subjects, members, **past**
 members and admins. That mapping is the one thing the browser holds and the wire format does not: a
 lid-keyed contact record carries the matching `phoneNumber`, and on disk that is the only place the
@@ -94,7 +102,21 @@ lid→phone link exists.
 
 The SQLite export carries the same correlation natively, in the Android shape a msgstore parser
 expects (`message.sender_jid_row_id` → `jid`, `chat.jid_row_id` → `jid`, `jid` → `wa_contacts`), so
-tools built for Android databases resolve senders from it without any extra work.
+tools built for Android databases resolve senders from it without any extra work. Quoted text lands
+in `message_quoted.text_data`, which is where such a parser looks for it.
+
+#### Checking an export
+
+```bash
+python3 scripts/validate_export.py D:\case\out              # transcript + JSON
+python3 scripts/validate_export.py D:\case\out D:\case\db   # ...and the database
+```
+
+Checks the artifacts against each other and against their own headers: that every sender resolves,
+that the counts in each chat header match the lines beneath it and the records in `chats.json`, that
+nothing is duplicated, that no message content sits where structure does, and that the Android
+correlation chain resolves end to end. Useful after any change to the writers, or to satisfy
+yourself that an export you were handed is internally consistent. It writes nothing.
 
 #### `raw` — decrypt, and change nothing else
 
@@ -111,6 +133,13 @@ decryption:
 |---|---|
 | `_wawf_plaintext_b64` | the decrypted bytes verbatim, so the decryption can be re-verified independently |
 | `_wawf_plaintext_fields` | the same bytes as a schema-free protobuf field tree, so you can see *which* field a string came from |
+
+Because `raw` is an image of the store, it keeps **every** record the store holds, including
+superseded versions of the same message — the browser's IndexedDB retains them and they are evidence
+of edits and re-deliveries. The derived formats are per *message*, so they drop records that are
+byte-for-byte identical to one already taken (25 ids, 37 records in the reference profile) and keep
+any version that actually differs. So `raw` legitimately shows a few more records than `chats.json`
+has rows; the difference is duplicates, not content.
 
 A `_manifest.json` records per-store counts, the derivation used, and what every marker means. The key
 is validated against 40 reference bodies before anything is written, so a wrong or stale key produces

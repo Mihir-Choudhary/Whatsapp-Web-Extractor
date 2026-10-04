@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 import wa_decrypt as WD
+from wa_decrypt import _dedupe_msgs
 
 FAIL = []
 
@@ -31,12 +32,18 @@ SALT_WS = bytes(range(100, 132))              # stands in for WAWebEncKeySalt
 ENC_STATIC = bytes(range(200, 232))           # the server-issued value, never on disk
 KEY = HKDF(algorithm=hashes.SHA256(), length=16, salt=ENC_STATIC, info=SALT_WS).derive(ROOT)
 
-def pb(*strings):
-    """A Message whose field 1 is `conversation`; later fields stand in for the rest of the tree."""
+def msg(*strings):
     out = b""
     for i, v in enumerate(strings, start=1):
         b = v.encode(); out += bytes([i << 3 | 2, len(b)]) + b
-    return bytes([0x0a, len(out)]) + out
+    return out
+
+def pb(*strings, quoted=None):
+    """A decrypted body: field 1 is this message, field 2 the message it replies to."""
+    m = msg(*strings); out = bytes([0x0a, len(m)]) + m
+    if quoted is not None:
+        q = msg(quoted); out += bytes([0x12, len(q)]) + q
+    return out
 
 def enc(pt, key=KEY):
     pad = 16 - len(pt) % 16
@@ -63,7 +70,8 @@ def store(extra=()):
     for frm, sender, text in ((False, "965000000001@lid", "hello there"),
                               (True, "133400000001@lid", "hi back"),
                               (False, "965000000001:3@lid", "and a device suffix")):
-        iv, ct = enc(pb(text, "919500000002@s.whatsapp.net"))   # body + the sender's own jid
+        # own text + the sender's own jid in the tree + a quoted message beside it
+        iv, ct = enc(pb(text, "919500000002@s.whatsapp.net", quoted="what was said before"))
         msgs.append({"id": ("true" if frm else "false") + "_120300000009@g.us_" + text[:3],
                      "chat": "120300000009@g.us", "from_me": frm, "type": "chat", "t": 1760000000,
                      "sender": sender, "iv": iv, "data": ct, "scheme": 1})
@@ -73,8 +81,8 @@ def store(extra=()):
 def run(msgs, enc_static=ENC_STATIC):
     """Drive the standalone entry point over a synthetic store; returns (out_dir, stdout, exit)."""
     WD.load = lambda profile=None, origin=None: (
-        "synthetic", LS, ROOT, msgs, {"contact": 3, "group-metadata": 1, "chat": 0},
-        WD.Identities(STORES, LS))
+        "synthetic", LS, ROOT, _dedupe_msgs(msgs),      # every real loader dedupes; so must this one
+        {"contact": 3, "group-metadata": 1, "chat": 0}, WD.Identities(STORES, LS))
     out = tempfile.mkdtemp()
     sys.argv = ["wa_decrypt.py", "--profile", "X", "--out", out,
                 "--enc-static", base64.b64encode(enc_static).decode()]
@@ -104,6 +112,9 @@ check("lid/phone pair on the row", row["sender_lid"] == "965000000001@lid"
 check("raw sender preserved", row["sender"] == "965000000001@lid")
 check("group named in the header", "Weekend plans  [120300000009@g.us]" in t)
 check("the sender's own jid is not in the message text", "@s.whatsapp.net" not in t.split("=====")[-1])
+check("a quoted message is not counted as this message's text", row["text"] == "hello there")
+check("the quote is kept in its own field", row["quoted_text"] == "what was said before")
+check("the quote reaches the transcript as context", "re: what was said before" in t)
 check("a device suffix does not split one person in two", t.count("Priya Desk") == 3)
 check("my own message marked outgoing", "->" in t and ch["120300000009@g.us"][1]["dir"] == "me")
 check("identities exported", len(ids["identities"]) == 3 and len(ids["groups"]) == 1)
@@ -127,6 +138,19 @@ check("the scheme-0 body is not counted as decrypted", "decrypted 3 bodies" in l
 check("...and does not reach the transcript",
       "would be garbage" not in open(os.path.join(out, "transcripts.txt"), encoding="utf-8").read())
 shutil.rmtree(out, ignore_errors=True)
+
+print("\nan exact duplicate record is one message, not two")
+dup = store()
+dup.append(dict(dup[0]))                       # the same record read twice, as LevelDB yields it
+out, log, code = run(dup)
+ch2 = json.load(open(os.path.join(out, "chats.json"), encoding="utf-8"))
+check("the duplicate is dropped", len(ch2["120300000009@g.us"]) == 3)
+check("...before it reaches the counts", "decrypted 3 bodies" in log)
+near = dict(dup[0]); near["t"] = 1760000001    # a record that genuinely differs is NOT a duplicate
+out2, log2, _ = run(store() + [near])
+ch3 = json.load(open(os.path.join(out2, "chats.json"), encoding="utf-8"))
+check("a record that differs is kept", len(ch3["120300000009@g.us"]) == 4)
+shutil.rmtree(out, ignore_errors=True); shutil.rmtree(out2, ignore_errors=True)
 
 print("\na body that will not decrypt is counted as failed, not dropped silently")
 out, log, code = run(store([{"id": "false_120300000009@g.us_BAD", "chat": "120300000009@g.us",

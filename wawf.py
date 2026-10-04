@@ -708,12 +708,12 @@ def cmd_decrypt(a):
             fail += 1; log.debug("misaligned body %s: %d bytes", m["id"][:24], len(m["data"])); continue
         try: pt = WD.pk7(Cipher(algorithms.AES(key), modes.CBC(m["iv"])).decryptor().update(m["data"]))
         except Exception as e: fail += 1; log.debug("decrypt fail %s: %s", m["id"][:24], e); continue
-        chats[m["chat"]].append(WD.msg_row(m, ts(m["t"]), WD.message_text(pt), ids))
+        chats[m["chat"]].append(WD.msg_row(m, ts(m["t"]), pt, ids))
         ok += 1
     for c in chats: chats[c].sort(key=lambda x: x["t"])
     # Who is who, measured rather than assumed: every sender's label and where that label came from.
     # "unresolved" is the number an examiner cares about -- jids the profile itself cannot name.
-    senders = [m["sender"] for ml in chats.values() for m in ml if m.get("sender")]
+    senders = [m["sender"] for ml in chats.values() for m in ml if m.get("sender")]  # for coverage
     cov = ids.coverage(senders)
     log.info("senders identified: %s", "  ".join(f"{k}={v:,}" for k, v in cov.most_common()) or "none")
     if cov.get("unresolved"):

@@ -28,7 +28,7 @@ from idbutil import store_id
 # ONE text builder for every export, so a message cannot read differently in two exports of the same
 # evidence. (It used to be copied here, and when the filter was found to be dropping 767 messages the
 # fix had to be made twice -- that is the failure mode this import exists to prevent.)
-from wa_decrypt import message_text
+from wa_decrypt import message_text, quoted_text
 import sclone
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
@@ -159,13 +159,14 @@ def pk7(b):
     if not b or len(b) % 16: return b
     p = b[-1]; return b[:-p] if 1 <= p <= 16 and b[-p:] == bytes([p])*p else b
 def decrypt_body(op):
-    if not isinstance(op, dict) or op.get('_scheme') != 1: return None   # MSGKEY is the scheme-1 key (scheme-0 -> garbage)
+    """-> (own text, quoted text). Both may be None."""
+    if not isinstance(op, dict) or op.get('_scheme') != 1: return (None, None)   # MSGKEY is the scheme-1 key (scheme-0 -> garbage)
     iv = as_bytes(op.get('iv')); data = as_bytes(op.get('_data'))
-    if not iv or not data: return None
-    if len(data) % 16: return None            # misaligned: CBC would decrypt part and drop the tail
+    if not iv or not data: return (None, None)
+    if len(data) % 16: return (None, None)    # misaligned: CBC would decrypt part and drop the tail
     try: pt = pk7(Cipher(algorithms.AES(MSGKEY), modes.CBC(iv)).decryptor().update(data))
-    except Exception: return None
-    return message_text(pt, 8000) or None
+    except Exception: return (None, None)
+    return (message_text(pt, 8000) or None, quoted_text(pt, 8000) or None)
 
 def ser(x):
     if isinstance(x, dict): return as_text(x.get('_serialized')) or (f"{as_text(x.get('user'))}@{as_text(x.get('server'))}" if x.get('user') else None)
@@ -245,6 +246,7 @@ def chat_rowid(jid):
 
 # ---- parse messages ----
 messages = []; call_objs = []            # capture call_log rows here to avoid a 2nd full message-store pass
+_seen_msg = set()                        # exact-duplicate guard; see where it is used
 for o in store(MSG_SID):
     if not isinstance(o, dict): continue
     if o.get('type') == 'call_log': call_objs.append(o)
@@ -260,8 +262,12 @@ for o in store(MSG_SID):
              or (sender_suffix if sender_suffix and '@' in sender_suffix else None) or ser(o.get('from')))
     typ = o.get('type') or 'chat'
     t = o.get('t') or 0
-    body = decrypt_body(o.get('msgRowOpaqueData')) if typ in (
-        'chat','image','video','document','ptt','audio','interactive','template','rich_response','poll_creation') else None
+    # `sticker` is in the list now: a sticker has no text of its own, but it can be a REPLY, and the
+    # quote it carries is the only record of what it answered. Before the own/quoted split that quote
+    # was mistaken for the sticker's own text, which is why stickers were kept out.
+    body, quoted_body = decrypt_body(o.get('msgRowOpaqueData')) if typ in (
+        'chat','image','video','document','ptt','audio','sticker','interactive','template',
+        'rich_response','poll_creation') else (None, None)
     md = None
     if o.get('mediaKey') or o.get('directPath'):
         md = {'media_key': base64.b64decode(o['mediaKey']) if o.get('mediaKey') else None,
@@ -273,7 +279,7 @@ for o in store(MSG_SID):
               'media_key_ts': o.get('mediaKeyTimestamp'), 'message_url': as_text(o.get('deprecatedMms3Url'))}
     th = o.get('thumbnail')
     ment = [ser(x) for x in (o.get('mentionedJidList') or []) if ser(x)]
-    messages.append({
+    row = {
         'webid': idv, 'chat_jid': chat_jid, 'from_me': from_me, 'key_id': key_id,
         # received: sender = author/partner (groups+broadcast use author; 1:1 partner also fine)
         'sender_jid': None if (from_me or (not is_group and not is_bcast)) else sender,   # null sender for own + 1:1 received
@@ -281,7 +287,18 @@ for o in store(MSG_SID):
         'status': ack_status(o.get('ack')), 'starred': 1 if o.get('star') or o.get('isStarred') else 0,
         'media': md, 'thumb': base64.b64decode(th) if isinstance(th, str) and th else None,
         'mentioned': ment, 'quoted_id': as_text(o.get('quotedStanzaID')), 'quoted_type': as_text(o.get('quotedType')),
-    })
+        'quoted_text': quoted_body,
+    }
+    # This store yields superseded record versions as well as live ones, so the same message can
+    # arrive twice. An identical copy is not a second message: it inflated the row count and left 37
+    # duplicate `key_id`s in a schema that treats that column as unique, which an Android parser
+    # reads as two messages. Only EXACT duplicates are dropped -- a version that genuinely differs
+    # is kept, because an edit or a re-delivery is evidence.
+    _k = (idv, row['timestamp'], row['from_me'], row['message_type'], row['sender_jid'],
+          row['text_data'], row['quoted_text'])
+    if _k in _seen_msg: continue
+    _seen_msg.add(_k)
+    messages.append(row)
     jid_id(chat_jid); chat_rowid(chat_jid)
     if messages[-1]['sender_jid']: jid_id(messages[-1]['sender_jid'])
     for mj in ment: jid_id(mj)
@@ -332,7 +349,10 @@ for c in contacts:
 owner_jid_row = jid_id(OWNER_PHONE)
 for jraw, cid in _chat_id.items():
     ch = chats.get(jraw); g = groups.get(jraw)
-    subject = as_text((g.get('subject') if g else None) or (ch.get('name') if ch else None))
+    # Android keeps `chat.subject` for groups only -- a 1:1 chat's display name lives in wa_contacts,
+    # and writing it here made the official "WhatsApp" account look like a group with a subject.
+    subject = as_text((g.get('subject') if g else None) or (ch.get('name') if ch else None)) \
+        if str(jraw).endswith('@g.us') else None
     created = g.get('creation') if g else None
     sort_ts = int((ch.get('t') if ch else 0) or 0)*1000
     archived = 1 if (ch and ch.get('archive')) else 0
@@ -356,9 +376,12 @@ for m in messages:
                     int(md['duration'])*1000 if md.get('duration') else None, md['direct_path'], md['file_hash'],
                     md['enc_file_hash'], None, md['media_key'], md.get('media_key_ts'), md.get('message_url'), md['caption'], md['media_name']))
     if m['thumb']: db.execute("INSERT INTO message_thumbnail(message_row_id,thumbnail) VALUES(?,?)", (mid, m['thumb']))
-    if m['quoted_id']:
+    # text_data used to be written as NULL here while the quoted text was being concatenated into
+    # the replying message's own text. It belongs in this column, which is where an Android parser
+    # looks to render reply context.
+    if m['quoted_id'] or m.get('quoted_text'):
         db.execute("INSERT INTO message_quoted(message_row_id,key_id,text_data,message_type,chat_row_id) VALUES(?,?,?,?,?)",
-                   (mid, m['quoted_id'], None, m['quoted_type'], chat_rowid(m['chat_jid'])))
+                   (mid, m['quoted_id'], m.get('quoted_text'), m['quoted_type'], chat_rowid(m['chat_jid'])))
     for mj in m['mentioned']:
         r = jid_id(mj)
         if r: ment_id += 1; db.execute("INSERT INTO message_mentions(_id,message_row_id,jid_row_id) VALUES(?,?,?)", (ment_id, mid, r))
