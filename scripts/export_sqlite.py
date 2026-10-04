@@ -29,6 +29,7 @@ from idbutil import store_id
 # evidence. (It used to be copied here, and when the filter was found to be dropping 767 messages the
 # fix had to be made twice -- that is the failure mode this import exists to prevent.)
 from wa_decrypt import texts as _message_texts
+from wa_decrypt import hist_type as _hist_type, stanza_of as _stanza_of, canon_jid as _canon_jid
 import sclone
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
@@ -48,7 +49,10 @@ _ap.add_argument('--enc-static', help='companion_enc_static (base64). Prefer the
 _ap.add_argument('--origin', default=None, help='Firefox web.whatsapp.com storage dir (auto-detected if omitted)')
 _ap.add_argument('--profile', default=None, help='Chromium profile dir (Chrome/Edge/Brave .../Default)')
 _ap.add_argument('--out', default='wa_sqlite', help='output directory for the SQLite DB + Media')
+_ap.add_argument('--history', default=None, metavar='FILE',
+                 help='history_recovered.json from a `wawf --history` run: its messages are appended to the ones the store held, deduped on the stanza id, and marked source=phone')
 _args = _ap.parse_args()
+HISTORY_FILE = _args.history
 # The key may arrive in the environment instead of argv -- wawf passes it that way on purpose, since a
 # child's command line is readable from the process list and this is the one secret the browser never
 # stored. argv still works for standalone use.
@@ -288,7 +292,7 @@ for o in store(MSG_SID):
         'status': ack_status(o.get('ack')), 'starred': 1 if o.get('star') or o.get('isStarred') else 0,
         'media': md, 'thumb': base64.b64decode(th) if isinstance(th, str) and th else None,
         'mentioned': ment, 'quoted_id': as_text(o.get('quotedStanzaID')), 'quoted_type': as_text(o.get('quotedType')),
-        'quoted_text': quoted_body,
+        'quoted_text': quoted_body, 'source': 'cache',
     }
     # This store yields superseded record versions as well as live ones, so the same message can
     # arrive twice; 25 ids do here. Those copies are NOT byte-identical records -- they differ in
@@ -310,6 +314,54 @@ for o in store(MSG_SID):
     if messages[-1]['sender_jid']: jid_id(messages[-1]['sender_jid'])
     for mj in ment: jid_id(mj)
 
+# ---- messages the phone served, appended to the ones the store held -------------------------
+# A `--history` run produces one dataset: the local store plus whatever the phone returned. They are
+# appended here rather than written to a second database, because an examiner wants one timeline per
+# chat -- and `message.source` says which side each row came from, since the provenance differs even
+# though the timeline does not. Dedup is on the stanza id, and the stored copy always wins.
+HIST = []
+if HISTORY_FILE:
+    try:
+        with open(HISTORY_FILE, encoding='utf-8') as fh:
+            HIST = (json.load(fh) or {}).get('messages') or []
+    except Exception as e:
+        print(f"[!] could not read recovered history from {HISTORY_FILE}: {e}")
+        HIST = []
+if HIST:
+    have = {_stanza_of(m['webid']) for m in messages}
+    # the form the store filed each chat under, so a wire jid folds onto it instead of splitting
+    byform = {}
+    for m in messages:
+        byform.setdefault(_canon_jid(m['chat_jid']), m['chat_jid'])
+        byform.setdefault(m['chat_jid'], m['chat_jid'])
+    appended = 0
+    for r in HIST:
+        sid = str(r.get('id') or '')
+        chat = r.get('chat')
+        if not sid or not chat or sid in have: continue
+        raw = _canon_jid(chat)
+        cj = byform.get(raw) or chat
+        fromme = 1 if r.get('fromMe') else 0
+        part = ser(r.get('participant'))
+        is_group = str(cj).endswith('@g.us')
+        sender = None if fromme else (part or (None if is_group else cj))
+        typ = _hist_type(r.get('type'))
+        messages.append({
+            'webid': ('true' if fromme else 'false') + '_' + str(cj) + '_' + sid,
+            'chat_jid': cj, 'from_me': fromme, 'key_id': sid,
+            'sender_jid': norm_jid(sender) if sender else None,
+            'timestamp': int(r.get('ts') or 0) * 1000, 'message_type': MTYPE.get(typ, 0),
+            'text_data': (r.get('text') or '').strip() or None,
+            'status': 0, 'starred': 0, 'media': None, 'thumb': None, 'mentioned': [],
+            'quoted_id': None, 'quoted_type': None, 'quoted_text': None, 'source': 'phone',
+        })
+        have.add(sid); appended += 1
+        jid_id(cj); chat_rowid(cj)
+        if sender: jid_id(norm_jid(sender))
+    messages.sort(key=lambda m: (m['chat_jid'], m['timestamp']))
+    print(f"[+] history: appended {appended} message(s) recovered from the phone "
+          f"({len(HIST) - appended} already in the store)")
+
 for c in contacts:
     if c.get('id'): jid_id(c['id'])
     if c.get('phoneNumber'): jid_id(c['phoneNumber'])
@@ -325,7 +377,7 @@ db.executescript("""
 CREATE TABLE jid(_id INTEGER PRIMARY KEY, user TEXT, server TEXT, agent INTEGER DEFAULT 0, device INTEGER DEFAULT 0, type INTEGER DEFAULT 0, raw_string TEXT);
 CREATE TABLE jid_map(jid_row_id INTEGER, lid_row_id INTEGER);
 CREATE TABLE chat(_id INTEGER PRIMARY KEY, jid_row_id INTEGER, subject TEXT, created_timestamp INTEGER, sort_timestamp INTEGER, display_message_row_id INTEGER, archived INTEGER DEFAULT 0, account_jid_row_id INTEGER, participation_status INTEGER);
-CREATE TABLE message(_id INTEGER PRIMARY KEY, chat_row_id INTEGER, from_me INTEGER, key_id TEXT, sender_jid_row_id INTEGER, timestamp INTEGER, received_timestamp INTEGER, message_type INTEGER, text_data TEXT, status INTEGER, sort_id INTEGER, starred INTEGER DEFAULT 0, broadcast INTEGER DEFAULT 0);
+CREATE TABLE message(_id INTEGER PRIMARY KEY, chat_row_id INTEGER, from_me INTEGER, key_id TEXT, sender_jid_row_id INTEGER, timestamp INTEGER, received_timestamp INTEGER, message_type INTEGER, text_data TEXT, status INTEGER, sort_id INTEGER, starred INTEGER DEFAULT 0, broadcast INTEGER DEFAULT 0, source TEXT DEFAULT 'cache');
 CREATE TABLE message_media(_id INTEGER PRIMARY KEY, message_row_id INTEGER, chat_row_id INTEGER, file_path TEXT, file_size INTEGER, file_length INTEGER, mime_type TEXT, width INTEGER, height INTEGER, media_duration INTEGER, direct_path TEXT, file_hash TEXT, enc_file_hash TEXT, original_file_hash TEXT, media_key BLOB, media_key_timestamp INTEGER, message_url TEXT, media_caption TEXT, media_name TEXT);
 CREATE TABLE message_thumbnail(message_row_id INTEGER, thumbnail BLOB);
 CREATE TABLE message_album(message_row_id INTEGER, image_count INTEGER, video_count INTEGER, expected_image_count INTEGER, expected_video_count INTEGER);
@@ -377,10 +429,11 @@ mid = 0; ment_id = 0
 for m in messages:
     mid += 1; WEBID2ID[m['webid']] = mid
     srow = jid_id(m['sender_jid']) if m['sender_jid'] else 0
-    db.execute("""INSERT INTO message(_id,chat_row_id,from_me,key_id,sender_jid_row_id,timestamp,received_timestamp,message_type,text_data,status,sort_id,starred,broadcast)
-                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+    db.execute("""INSERT INTO message(_id,chat_row_id,from_me,key_id,sender_jid_row_id,timestamp,received_timestamp,message_type,text_data,status,sort_id,starred,broadcast,source)
+                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                (mid, chat_rowid(m['chat_jid']), m['from_me'], m['key_id'], srow, m['timestamp'], m['timestamp'],
-                m['message_type'], m['text_data'], m['status'], mid, m['starred'], 1 if m['chat_jid'].endswith('@broadcast') else 0))
+                m['message_type'], m['text_data'], m['status'], mid, m['starred'],
+                1 if m['chat_jid'].endswith('@broadcast') else 0, m.get('source', 'cache')))
     md = m['media']
     if md:
         db.execute("""INSERT INTO message_media(message_row_id,chat_row_id,file_path,file_size,file_length,mime_type,width,height,media_duration,direct_path,file_hash,enc_file_hash,original_file_hash,media_key,media_key_timestamp,message_url,media_caption,media_name)

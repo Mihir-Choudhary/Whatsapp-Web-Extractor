@@ -49,7 +49,7 @@ msgs = [m for ml in ch.values() for m in ml]
 print("=== chats.json: %d chats, %d messages ===" % (len(ch), len(msgs)))
 
 FIELDS = {'id', 't', 'dir', 'type', 'chat', 'chat_name', 'sender', 'sender_name', 'sender_lid',
-          'sender_phone', 'sender_source', 'text', 'quoted_text'}
+          'sender_phone', 'sender_source', 'text', 'quoted_text', 'source'}
 chk("every row has exactly the documented fields",
     all(set(m) == FIELDS for m in msgs),
     next((sorted(set(m) ^ FIELDS) for m in msgs if set(m) != FIELDS), ''))
@@ -106,6 +106,14 @@ same = [m for m in msgs if m.get('text') and m.get('text') == m.get('quoted_text
 print("  ..   replies whose own words equal the words they quote: %d (people do this)" % len(same))
 print("  ..   rows with a quote: %d   rows with own text: %d"
       % (sum(1 for m in msgs if m.get('quoted_text')), sum(1 for m in msgs if m.get('text'))))
+bysrc = collections.Counter(m.get('source') for m in msgs)
+print("  ..   provenance: %s" % dict(bysrc))
+chk("every row says where it came from", not [m for m in msgs if m.get('source') not in
+                                              ('cache', 'phone')], dict(bysrc))
+# A message the phone served has no quote of its own (the extractor does not return one) and was not
+# decrypted locally, so it must not claim to have been.
+chk("a recovered row does not claim a locally decrypted quote",
+    not [m for m in msgs if m.get('source') == 'phone' and m.get('quoted_text')])
 
 print("\n=== identities.json: %d identities, %d groups ===" % (len(ids['identities']), len(ids['groups'])))
 chk("no duplicate identity rows",
@@ -241,9 +249,21 @@ if DB:
              WHERE ch.subject IS NOT NULL AND ch.subject<>'' AND j.server<>'g.us'""") == 0,
         q("""SELECT COUNT(*) FROM chat ch JOIN jid j ON j._id=ch.jid_row_id
              WHERE ch.subject IS NOT NULL AND ch.subject<>'' AND j.server<>'g.us'"""))
-    chk("group messages always carry a sender jid",
-        q("""SELECT COUNT(*) FROM message m JOIN chat ch ON ch._id=m.chat_row_id JOIN jid j ON j._id=ch.jid_row_id
-             WHERE j.server='g.us' AND m.from_me=0 AND (m.sender_jid_row_id IS NULL OR m.sender_jid_row_id=0)""") == 0)
+    # A group message read from the local store always names its author. One recovered from the
+    # phone only does when the extractor captured `key.participant` -- older pulls did not -- so the
+    # invariant holds for cached rows and the rest is reported with its provenance rather than failed.
+    _gsql = ("""SELECT COUNT(*) FROM message m JOIN chat ch ON ch._id=m.chat_row_id
+                JOIN jid j ON j._id=ch.jid_row_id WHERE j.server='g.us' AND m.from_me=0
+                  AND (m.sender_jid_row_id IS NULL OR m.sender_jid_row_id=0)""")
+    if 'source' in {r[1] for r in con.execute("PRAGMA table_info(message)")}:
+        chk("every CACHED group message carries a sender jid",
+            q(_gsql + " AND m.source='cache'") == 0, q(_gsql + " AND m.source='cache'"))
+        n = q(_gsql + " AND m.source<>'cache'")
+        if n:
+            print("  ..   recovered group messages with no sender (pulled before the extractor "
+                  "captured key.participant): %d" % n)
+    else:
+        chk("group messages always carry a sender jid", q(_gsql) == 0, q(_gsql))
     chk("timestamps are plausible",
         q("SELECT COUNT(*) FROM message WHERE timestamp<1420070400000 OR timestamp>1830000000000") == 0,
         con.execute("SELECT MIN(timestamp),MAX(timestamp) FROM message").fetchone())

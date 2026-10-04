@@ -52,7 +52,10 @@ full, copy-pasteable paths.
 
 ### Choosing the output — `--out [FORMAT:]PATH`
 
-Repeatable. `FORMAT` is `txt`, `json`, `sqlite`/`db` or `raw`; a plain path writes text **and** JSON:
+Repeatable. `FORMAT` is `txt`, `json`, `sqlite`/`db` or `raw`; a plain path writes text **and** JSON.
+A prefix that is not one of those is a typo rather than a path, and is rejected — `--out sqlit:D:\db`
+used to be accepted silently and write text into a folder named after the mistake. A real path that
+contains a colon can still be given as `./my:dir`.
 
 ```bash
 wawf <PROFILE> --out D:\case\out              # transcripts.txt + chats.json + identities.json
@@ -171,7 +174,8 @@ A Windows drive letter is never mistaken for a `FORMAT`, so `D:\case\out` works 
 | `--key FILE` | A `companion_enc_static.txt` captured earlier — decrypt without touching the network. Usually unnecessary: a copy left beside the output is found automatically. A **file**, never the key itself, so no secret reaches your shell history, process list or command auditing. |
 | `--origin DIR` | Firefox `web.whatsapp.com` storage folder instead of a profile folder. |
 | `--raw-include-keys` | With `--out raw:` — also dump `signal-storage` and `wawc_db_enc`. Those are key material; a dump including them must not travel with a case. |
-| `--history` | *Instead of decrypting:* pull chat history older than the browser cache from your phone, iteratively, resuming across runs. Needs Node (offers to install it). Phone-side and rate-limited — see below. |
+| `--history` | **Also** pull chat history older than the browser cache from your phone, iteratively, resuming across runs, and append it to the export. Needs Node (offers to install it). Phone-side and rate-limited — see below. |
+| `--fetch-media` | With `--history --out sqlite:PATH`: after the pull, ask the CDN for media the browser never cached. Networked and slow, and an expired url returns 403, so it is opt-in. |
 | `--no-audit` | Do **not** write the chain-of-custody database. It is written by default (see below). |
 
 Sender resolution is **reported, not assumed** — a run prints where every label came from, so the one
@@ -280,8 +284,48 @@ logs back in and asks your phone, per chat, for messages **older** than what's o
 toward each chat's start:
 
 ```bash
-wawf <PROFILE> --history                             # every chat, busiest first; needs Node + tools/reconnect
+wawf <PROFILE> --history                             # pull only; results land in tools/reconnect
+wawf <PROFILE> --history --out D:\case\run2          # ...and export the local store WITH them merged
+wawf <PROFILE> --history --out sqlite:D:\case\run2 --fetch-media    # ...and try the CDN for their media
 ```
+
+#### What `--history --out` produces
+
+One dataset, not two files to reconcile. The local store is decrypted **first** — so a complete
+export exists within minutes, before a pull that takes hours — and the recovered messages are
+appended to it when the pull finishes (or when you interrupt it). Every row says which side it came
+from:
+
+| `source` | meaning |
+|---|---|
+| `cache` | the message was in the browser's own storage when the profile was examined |
+| `phone` | the message was served by your phone during this run, over the network |
+
+The timeline is shared; the provenance is not, which is why it is recorded per message rather than
+per file. In the SQLite export the same distinction is the `message.source` column.
+
+**An earlier export is never written over.** A history run produces a different dataset from a plain
+one, so if the `--out` path already holds an export the new one is written beside it and the log says
+what it found and where this one went:
+
+```
+D:\case\run1 already holds a cache export (2026-10-04 13:20, 22,084 messages). This run
+produces the local store PLUS what the phone returns, which is a different dataset, so it is
+written to D:\case\run1-history and the existing one is left untouched.
+```
+
+Each output folder carries a `wawf_export.json` receipt recording which of the two it is, when it was
+made, and how many messages came from each side.
+
+Two things worth knowing. `raw` is excluded on purpose: it is a verbatim image of what is *in* the
+store, and a recovered message never was — the run says so rather than skipping it quietly. And
+media for recovered messages is **not** downloaded by default: their `mediaKey`s are exported, so
+`--fetch-media` (or `scripts/mediafetch.py --cdn` later) can fetch the bytes when you want them,
+without adding CDN failures to an already long run.
+
+Messages recovered before the extractor captured `key.participant` have no author in a group chat.
+That is shown as `(unknown)`, in the line and in the chat's participant legend; pulls from now on
+carry the sender.
 
 It runs **iteratively**: each pass re-anchors every chat on the oldest message recovered so far and pulls
 deeper, accumulating (deduped) until a pass stops finding meaningfully more. Progress is checkpointed to

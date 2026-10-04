@@ -136,14 +136,74 @@ def _example_profile():
 
 _OUT_FORMATS = ("txt", "json", "sqlite", "db", "raw")
 
+EXPORT_MANIFEST = "wawf_export.json"
+
+def _write_export_manifest(outdir, composition, counts, files):
+    """Leave a receipt in an output folder: what this export contains, and what produced it.
+
+    Two jobs. It tells a reader whether they are looking at the local store alone or the local store
+    plus messages recovered from the phone -- the artifacts themselves do not say, and the difference
+    is one of provenance, not detail. And it lets a later `--history` run NAME what is already in a
+    folder instead of silently writing over it.
+    """
+    try:
+        os.makedirs(outdir, exist_ok=True)
+        rec = {"tool": "wawf", "version": _wawf_version(), "created_utc": dt.datetime.now(dt.timezone.utc)
+               .strftime("%Y-%m-%d %H:%M:%S"), "composition": composition, "counts": counts,
+               "artifacts": sorted(f for f in files if os.path.isfile(os.path.join(outdir, f)))}
+        tmp = os.path.join(outdir, EXPORT_MANIFEST + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(rec, fh, ensure_ascii=False, indent=1)
+        os.replace(tmp, os.path.join(outdir, EXPORT_MANIFEST))
+    except Exception as e:                       # a missing receipt must never fail an export
+        log.debug("could not write %s: %s", EXPORT_MANIFEST, e)
+
+def _read_export_manifest(outdir):
+    try:
+        with open(os.path.join(outdir, EXPORT_MANIFEST), encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+_EXPORT_ARTIFACTS = ("chats.json", "transcripts.txt", "identities.json", "msgstore.db", "wa.db",
+                     "_manifest.json")
+
+def _holds_export(path):
+    """Does this folder already hold an export? The receipt if there is one, else its artifacts."""
+    m = _read_export_manifest(path)
+    if m: return m
+    try:
+        if any(os.path.isfile(os.path.join(path, f)) for f in _EXPORT_ARTIFACTS):
+            return {"composition": "unknown", "created_utc": "?", "counts": {}}
+    except Exception as e:
+        log.debug("could not inspect %s: %s", path, e)
+    return None
+
+def _wawf_version():
+    try:
+        return __doc__.strip().split("\n", 1)[0]
+    except Exception:
+        return "wawf"
+
 def _parse_out(spec):
     """'--out FORMAT:PATH' -> (format, path); a bare path -> (None, path) meaning 'all text formats'.
-    Only a KNOWN format counts as a prefix, so a Windows path like D:\\case\\out keeps its drive letter
-    instead of being read as format 'D'."""
+
+    A single-character head is always a drive letter, so `D:\\case\\out` keeps it instead of being read
+    as format 'D'. A longer head that is not a known format is a TYPO, and used to be swallowed: a
+    mistyped `--out sqlit:D:\\case\\db` silently became a path, so the run quietly wrote text and JSON
+    into a folder named after the mistake instead of the database that was asked for. It is an error
+    now. A real path that genuinely contains a colon can still be given as `./my:dir`, which has a
+    separator in the head and so is left alone.
+    """
     if ":" in spec:
         head, rest = spec.split(":", 1)
-        if head.lower() in _OUT_FORMATS and rest:
-            return ("sqlite" if head.lower() in ("sqlite", "db") else head.lower()), rest
+        low = head.lower()
+        if low in _OUT_FORMATS and rest:
+            return ("sqlite" if low in ("sqlite", "db") else low), rest
+        if len(head) > 1 and rest and not any(c in head for c in "\\/"):
+            raise SystemExit("unrecognised output format %r in --out %s\n\nFORMAT must be one of: %s\n"
+                             "If that is really a path, write it as ./%s" %
+                             (head, spec, ", ".join(_OUT_FORMATS), spec))
     return None, spec
 
 def _out_workdir(path):
@@ -276,14 +336,20 @@ def cmd_run(a):
 
     def _decrypt_all(k):
         for fmt, path in outs:
+            hf = getattr(a, "history_file", None)
             if fmt == "sqlite":
-                rc = cmd_sqlite(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=k, out=path))
+                rc = cmd_sqlite(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=k,
+                                                   out=path, history_file=hf))
             elif fmt == "raw":
+                # `raw` is a verbatim image of what is IN the store, so recovered messages have no
+                # place in it: they were never stored. Said out loud rather than quietly skipped.
+                if hf: log.info("raw: an image of the local store only -- messages recovered from the "
+                                "phone were never in it, so they are in the other formats")
                 rc = cmd_raw(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=k, out=path,
                                                 raw_include_keys=getattr(a, "raw_include_keys", False)))
             else:
                 rc = cmd_decrypt(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=k,
-                                                    out=path, only=fmt))
+                                                    out=path, only=fmt, history_file=hf))
             if rc:
                 return rc
         return 0
@@ -306,15 +372,19 @@ def cmd_run(a):
             return 3
 
     log.info("[3/3] decrypting to %d output(s) ...", len(outs))
+    hf = getattr(a, "history_file", None)
     for fmt, path in outs:
         if fmt == "sqlite":
-            rc = cmd_sqlite(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=key, out=path))
+            rc = cmd_sqlite(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=key,
+                                               out=path, history_file=hf))
         elif fmt == "raw":
+            if hf: log.info("raw: an image of the local store only -- messages recovered from the "
+                            "phone were never in it, so they are in the other formats")
             rc = cmd_raw(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=key, out=path,
                                             raw_include_keys=getattr(a, "raw_include_keys", False)))
         else:
             rc = cmd_decrypt(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=key,
-                                                out=path, only=fmt))
+                                                out=path, only=fmt, history_file=hf))
         if rc: return rc
     return 0
 
@@ -710,6 +780,21 @@ def cmd_decrypt(a):
         chats[m["chat"]].append(WD.msg_row(m, ts(m["t"]), pt, ids))
         ok += 1
     for c in chats: chats[c].sort(key=lambda x: x["t"])
+    # Messages the phone served, folded in before anything is written, so the export is ONE timeline
+    # per chat rather than two files to reconcile by hand. Dedup is on the stanza id and the cached
+    # copy wins; every row says which side it came from.
+    hist_added = 0
+    hf = getattr(a, "history_file", None)
+    if hf and os.path.isfile(hf):
+        try:
+            rec = (json.load(open(hf, encoding="utf-8")) or {}).get("messages") or []
+            hist_added, hist_skipped, touched = WD.merge_history(chats, rec, ids, ts)
+            log.info("history: +%s message(s) recovered from the phone across %d chat(s); "
+                     "%s already present in the browser's own store",
+                     f"{hist_added:,}", len(touched), f"{hist_skipped:,}")
+        except Exception as e:
+            log.error("could not merge recovered history from %s: %s", hf, e)
+            return 1
     # Who is who, measured rather than assumed: every sender's label and where that label came from.
     # "unresolved" is the number an examiner cares about -- jids the profile itself cannot name.
     senders = [m["sender"] for ml in chats.values() for m in ml if m.get("sender")]  # for coverage
@@ -747,6 +832,10 @@ def cmd_decrypt(a):
     if only != "txt":
         AUDIT.artifact(f"{a.out}/chats.json", kind="decrypted chats (JSON)", records=ok)
     AUDIT.artifact(f"{a.out}/transcripts.txt", kind="decrypted transcripts (text)", records=ok)
+    _write_export_manifest(a.out, "cache+phone" if hist_added else "cache",
+                           {"messages": sum(len(v) for v in chats.values()), "chats": len(chats),
+                            "decrypted_from_cache": ok, "recovered_from_phone": hist_added},
+                           ("chats.json", "identities.json", "transcripts.txt"))
     return 0
 
 def _wa_user_prefs(profile, origin):
@@ -1235,6 +1324,49 @@ def _pick_work_dir():
             log.debug("work dir unusable (%s): %s", c, e)
     raise SystemExit("could not create a writable folder for history output (tried: %s)" % ", ".join(cands))
 
+def _history_out_targets(a):
+    """Where a `--history --out` run writes, never over an earlier run's export.
+
+    A history run produces a DIFFERENT dataset from a plain one -- the local store plus whatever the
+    phone gave back -- so it must not land on top of an export that is already there. Rather than
+    refusing and making the user think of a new path, the new dataset is written beside the old one
+    under a `-history` name, and the log says exactly what was already there and where this one went.
+    """
+    outs = [_parse_out(spec) for spec in (a.out or [])]
+    resolved = []
+    for fmt, path in outs:
+        held = _holds_export(path)
+        if not held:
+            resolved.append((fmt, path)); continue
+        base, n = path.rstrip("\\/") + "-history", 1
+        cand = base
+        while _holds_export(cand):
+            n += 1; cand = "%s-%d" % (base, n)
+        comp = held.get("composition") or "unknown"
+        n = (held.get("counts") or {}).get("messages")
+        what = ("an export of unrecorded composition" if comp == "unknown"
+                else "a %s export" % comp)
+        when = held.get("created_utc") or "?"
+        detail = "%s, %s messages" % (when, f"{n:,}") if isinstance(n, int) else "no receipt"
+        log.info("%s already holds %s (%s). This run produces the local store PLUS what the phone "
+                 "returns, which is a different dataset, so it is written to %s and the existing one "
+                 "is left untouched.", path, what, detail, cand)
+        resolved.append((fmt, cand))
+    return resolved
+
+def _history_export(a, targets, history_file=None):
+    """Write the export(s) a `--history --out` run owns. Called twice: once before the pulls, so a
+    complete local dataset exists within minutes, and once after, with the recovered messages folded
+    in. Both write the same paths -- the auto-naming that protects an EARLIER run's export happened
+    once, before either call."""
+    if not targets: return 0
+    ns = argparse.Namespace(profile=a.profile, origin=a.origin, out=["%s:%s" % (f, p) if f else p
+                                                                     for f, p in targets],
+                            key=getattr(a, "key", None), verbose=getattr(a, "verbose", False),
+                            raw_include_keys=getattr(a, "raw_include_keys", False),
+                            history_file=history_file)
+    return cmd_run(ns)
+
 def cmd_history(a):
     """On-demand history sync: pull messages OLDER than the browser cache from WhatsApp's servers, per
     chat, going back toward each chat's start — ITERATIVELY: each pass re-anchors on the oldest message
@@ -1352,6 +1484,20 @@ def cmd_history(a):
     n = _resume_master(accum, anchors_path, master)
     if n: log.info("resuming: %s messages recovered on prior runs — continuing older than those.", f"{n:,}")
 
+    # --out now applies to a history run. The dataset it produces is the local store PLUS whatever
+    # the phone returns, so it is written to its own folder (see _history_out_targets) and an earlier
+    # run's export is never touched. The local half is written FIRST: the pulls take hours, and there
+    # is no reason to have nothing on disk until they finish.
+    targets = _history_out_targets(a) if getattr(a, "out", None) else []
+    if targets:
+        log.info("──── decrypting the local store first, before pulling anything ────")
+        rc = _history_export(a, targets)
+        if rc:
+            log.error("the local decrypt failed (%d), so there would be nothing to append the "
+                      "recovered messages to. Fix that first; nothing has been requested from the "
+                      "phone yet.", rc)
+            return rc
+
     MIN_NEW, MAX_PASSES = 40, 25                             # stop when a pass adds < MIN_NEW; hard safety cap
     # Exit 7 from the Node client means its cooldown breaker stopped the pass: ten unanswered requests
     # inside WhatsApp's own 7200-second window. That is not a failure and must not be treated as one.
@@ -1411,11 +1557,39 @@ def cmd_history(a):
             _deepen_anchors(anchors_path, master)            # go deeper next pass
     except KeyboardInterrupt:
         log.warning("interrupted — checkpointing %s recovered messages before exit.", f"{len(master):,}")
-        _checkpoint(accum); _checkpoint(pass_out); raise
+        _checkpoint(accum); _checkpoint(pass_out)
+        if targets and master:
+            log.info("writing the merged export with what was recovered before the interruption ...")
+            try: _history_export(a, targets, history_file=pass_out)
+            except Exception as e: log.error("could not write the merged export: %s", e)
+        raise
 
     by = _checkpoint(pass_out); _checkpoint(accum)           # final full accumulated set -> both files
     AUDIT.artifact(pass_out, kind="recovered history (older than the browser cache)", records=len(master))
     AUDIT.artifact(accum, kind="history resume ledger (cumulative across runs)", records=len(master))
+    if master and targets:
+        log.info("──── appending %s recovered message(s) to the export ────", f"{len(master):,}")
+        rc = _history_export(a, targets, history_file=pass_out)
+        if rc:
+            log.error("the recovered messages are safe in %s, but the merged export failed (%d). "
+                      "Re-run with the same --out to try again; nothing has to be pulled twice.",
+                      pass_out, rc)
+            return rc
+        if getattr(a, "fetch_media", False):
+            for fmt, path in targets:
+                if fmt != "sqlite": continue
+                db = os.path.join(path, "msgstore.db")
+                if not os.path.isfile(db):
+                    log.warning("--fetch-media: no msgstore.db in %s to work from", path); continue
+                log.info("--fetch-media: asking the CDN for media the browser never cached "
+                         "(NETWORKED; a url whose signature has expired returns 403 and is skipped)")
+                _sub("mediafetch.py", ["--db", db, "--cdn"] +
+                     (["--profile", a.profile] if a.profile else []) +
+                     (["--origin", a.origin] if a.origin else []))
+        elif any(f == "sqlite" for f, _ in targets):
+            log.info("media for the recovered messages is not downloaded: their mediaKeys ARE in "
+                     "message_media, and --fetch-media (or scripts/mediafetch.py --cdn) will try the "
+                     "CDN for the bytes.")
     if master:
         log.info("HISTORY DONE: recovered %s messages older than the cache, across %d chats -> %s",
                  f"{len(master):,}", len(by), pass_out)
@@ -1448,7 +1622,29 @@ def cmd_sqlite(a):
             cand = os.path.join(a.profile, "storage/default/https+++web.whatsapp.com")
             if os.path.isdir(cand): origin = cand
         if origin: extra += ["--origin", origin]
-    return _sub("export_sqlite.py", extra, secret_env={"WAWF_ENC_STATIC": a.enc_static})
+    hf = getattr(a, "history_file", None)
+    if hf and os.path.isfile(hf): extra += ["--history", hf]
+    rc = _sub("export_sqlite.py", extra, secret_env={"WAWF_ENC_STATIC": a.enc_static})
+    if rc == 0:
+        # Same receipt as the text/JSON side, so a later --history run can name what it found here
+        # instead of calling it an export of unknown composition.
+        counts = {}
+        try:
+            import sqlite3 as _sq
+            con = _sq.connect("file:%s?mode=ro" % os.path.join(a.out, "msgstore.db"), uri=True)
+            counts["messages"] = con.execute("SELECT COUNT(*) FROM message").fetchone()[0]
+            counts["chats"] = con.execute("SELECT COUNT(*) FROM chat").fetchone()[0]
+            try:
+                counts["recovered_from_phone"] = con.execute(
+                    "SELECT COUNT(*) FROM message WHERE source<>'cache'").fetchone()[0]
+            except Exception:
+                pass
+            con.close()
+        except Exception as e:
+            log.debug("could not count the exported database for the receipt: %s", e)
+        _write_export_manifest(a.out, "cache+phone" if counts.get("recovered_from_phone") else "cache",
+                               counts, ("msgstore.db", "wa.db"))
+    return rc
 
 def _win_utf8_console():
     """Windows consoles default to a legacy codepage that renders our em dashes / arrows / box characters as
@@ -1498,8 +1694,13 @@ def main():
         "\n"
         "OPTIONAL EXTRAS\n"
         "  --key companion_enc_static.txt    already have the at-rest key? use it and skip the reconnect\n"
-        "  --history             instead of decrypting, pull chat history OLDER than the browser\n"
-        "                        cache from your phone (networked, needs Node; phone must answer)\n"
+        "  --history             ALSO pull chat history OLDER than the browser cache from your\n"
+        "                        phone, and append it to the export (networked, needs Node, takes\n"
+        "                        hours; the phone must answer). With --out it decrypts the local\n"
+        "                        store first, then appends what the phone returns -- one timeline\n"
+        "                        per chat, written beside an earlier export, never over it.\n"
+        "  --fetch-media         with --history --out sqlite:PATH, also ask the CDN for media the\n"
+        "                        browser never cached (networked, slow, expired urls give 403)\n"
         "  --no-audit            do NOT write the chain-of-custody database (written by default)\n"
         "\n"
         "EXAMPLES\n"
@@ -1535,13 +1736,22 @@ def main():
     g = p.add_argument_group("optional actions (instead of the default decrypt job)")
     g.add_argument("--history", action="store_true",
                    help="pull chat history older than the browser cache from your phone. NETWORKED and "
-                        "phone-dependent; needs Node (offers to install it). Results are saved and resume.")
+                        "phone-dependent; needs Node (offers to install it). Results are saved and resume. "
+                        "With --out, the local store is decrypted first and the recovered messages are "
+                        "appended to it, so the export is one timeline per chat with every row saying "
+                        "whether it came from the cache or the phone; it is written beside any export "
+                        "already at that path rather than over it.")
     # The memory scan (--memory / --live / --memimage / --deep) is NOT exposed. The code is intact --
     # `cmd_memory` below, `scripts/wa_forensic.py`, and the key-from-RAM research behind them -- it is
     # the CLI surface that is withdrawn, because the mode could only validate candidates against a
     # FIREFOX store and there is no scenario yet where it beats the two routes that always work: a
     # normal run captures the key over the network, and `--key` decrypts offline with a key captured
     # earlier. Restoring it is these four add_argument lines plus the dispatch branch, both marked.
+    g.add_argument("--fetch-media", action="store_true",
+                   help="with --history --out sqlite:PATH: after the pull, ask the CDN for media the "
+                        "browser never cached. NETWORKED and slow, and a url whose signature has "
+                        "expired returns 403, so this is opt-in; without it the mediaKeys are still "
+                        "exported and scripts/mediafetch.py --cdn can fetch later.")
     g.add_argument("--yes", action="store_true",
                    help="auto-confirm prompts (installing Node for --history)")
 

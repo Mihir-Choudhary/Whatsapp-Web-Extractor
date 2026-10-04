@@ -496,7 +496,12 @@ def msg_row(m, when, pt, ids):
             "sender": m.get("sender"), "sender_name": ids.label(m.get("sender")),
             "sender_lid": e.get("lid"), "sender_phone": e.get("pn"),
             "sender_source": ids.source(m.get("sender")),
-            "text": own, "quoted_text": quoted}
+            "text": own, "quoted_text": quoted,
+            # Where this message came from. A cached message was in the browser's own storage when
+            # the profile was examined; a recovered one was served by the phone during a `--history`
+            # pull, over the network, at the time of the run. Same timeline, different provenance,
+            # and an export that merges them has to say which is which.
+            "source": "cache"}
 
 # ONE cap for every place a label is written. Capping per call site (40 on a message line, 60 in the
 # legend, 80 in a header) rendered the same person two different ways in one file and made a line
@@ -519,6 +524,93 @@ def _oneline(v, width=None):
     # chats.json and identities.json.
     return (t[:width - 1] + "\u2026") if width and len(t) > width else t
 
+# The phone returns a message as {chat, id, fromMe, participant, ts, text, type}: the stanza id
+# alone rather than the composite the store uses, the wire jid rather than the form the store filed
+# the chat under, and the protobuf field name rather than the store's type word. Normalised here so
+# a recovered message and a cached one are the same kind of thing in the export.
+_HIST_TYPE = {"conversation": "chat", "extendedtextmessage": "chat", "imagemessage": "image",
+              "videomessage": "video", "audiomessage": "audio", "pttmessage": "ptt",
+              "documentmessage": "document", "stickermessage": "sticker",
+              "contactmessage": "vcard", "contactsarraymessage": "vcard",
+              "locationmessage": "location", "livelocationmessage": "location",
+              "reactionmessage": "reaction", "pollcreationmessage": "poll_creation",
+              "protocolmessage": "protocol", "senderkeydistributionmessage": "e2e_notification"}
+
+def hist_type(t):
+    """The protobuf field name the phone used -> the type word the local store uses."""
+    k = str(t or "").strip()
+    if not k or k == "?": return "unknown"
+    lk = k.lower()
+    if lk in _HIST_TYPE: return _HIST_TYPE[lk]
+    return k[:-7].lower() if lk.endswith("message") else lk
+
+def stanza_of(mid):
+    """The stanza id inside a stored composite id (`false_<chat>_<stanza>[_<jid>]`), or the id itself.
+
+    The two sides name a message differently: the store uses the composite, the phone returns only
+    the stanza. The stanza is what they share, so it is what dedup has to compare -- and comparing
+    the composites would fail anyway, because the chat jid inside them is not always the same form.
+    """
+    s = str(mid or "")
+    parts = s.split("_")
+    return parts[2] if len(parts) >= 3 else s
+
+def hist_row(r, ids, when, chat_key=None):
+    """One chats.json record from a message the PHONE served, in the same shape as a cached one."""
+    chat = chat_key or canon_jid(r.get("chat")) or r.get("chat")
+    fromme = bool(r.get("fromMe"))
+    # In a group the sender is `participant`; in a 1:1 it is the chat itself, which is the same rule
+    # the local store follows. For my own messages it is me.
+    part = r.get("participant")
+    if fromme:
+        sender = (sorted(ids.me)[0] if ids.me else None)
+        if part: sender = canon_jid(part)
+    else:
+        sender = canon_jid(part) if part else (None if str(chat).endswith("@g.us") else chat)
+    e = (ids.entry(sender) or {}) if sender else {}
+    me = ids.is_me(sender) if (sender and ids.me) else fromme
+    return {"id": ("true" if fromme else "false") + "_" + str(chat) + "_" + str(r.get("id")),
+            "t": when, "dir": "me" if me else "them", "type": hist_type(r.get("type")),
+            "chat": chat, "chat_name": ids.label(chat),
+            "sender": sender, "sender_name": ids.label(sender) if sender else "(unknown)",
+            "sender_lid": e.get("lid"), "sender_phone": e.get("pn"),
+            "sender_source": ids.source(sender) if sender else "unresolved",
+            "text": (r.get("text") or "").strip(), "quoted_text": "",
+            "source": "phone"}
+
+def merge_history(chats, recovered, ids, ts):
+    """Fold messages the phone served into an export built from the local store.
+
+    Dedup is on the stanza id, and the CACHED copy wins: it was read from the device's own storage
+    rather than reconstructed from what the phone chose to send back. A recovered chat arrives as a
+    wire jid, which may not be the form the store filed that chat under -- `@s.whatsapp.net` where
+    the store has `@lid` -- so it is mapped through the identity before being filed, or the same
+    conversation would split into two chats in the output.
+
+    Returns (added, skipped_already_present, chats_touched).
+    """
+    have = {stanza_of(m.get("id")) for ml in chats.values() for m in ml}
+    bykey = {}                                  # identity key of a chat -> the key the store used
+    for c in chats:
+        bykey.setdefault(ids.key(c), c)
+        bykey.setdefault(canon_jid(c), c)
+    added = skipped = 0
+    touched = set()
+    for r in recovered or ():
+        sid = str(r.get("id") or "")
+        if not sid or not r.get("chat"):
+            continue
+        if sid in have:
+            skipped += 1
+            continue
+        raw = canon_jid(r.get("chat"))
+        key = bykey.get(ids.key(raw)) or bykey.get(raw) or raw
+        chats.setdefault(key, []).append(hist_row(r, ids, ts(r.get("ts")), chat_key=key))
+        have.add(sid); added += 1; touched.add(key)
+    for c in touched:
+        chats[c].sort(key=lambda x: x["t"])
+    return added, skipped, touched
+
 def write_transcripts(path, chats, ids):
     """transcripts.txt -- the artifact people actually read. Every line names its sender, and each
     chat header lists its senders with every jid form they appear under, so any line can be traced
@@ -539,9 +631,17 @@ def write_transcripts(path, chats, ids):
                     % (_oneline(ids.label(c), _LABEL_MAX), c, kind, len(ml), len(tm)))
             who = {}
             for m in ml:
-                s = m.get("sender")
-                if s and ids.key(s) not in who: who[ids.key(s)] = ids.row(ids.key(s))
-            for cj, r in sorted(who.items(), key=lambda kv: (kv[1]["label"] or "").lower()):
+                # A message with NO sender still gets a legend entry. Skipping it left the line
+                # reading "(unknown)" with nothing in the legend to match it against -- in a file
+                # whose promise is that every line's sender is listed above it. It happens for real:
+                # a group message recovered from the phone before the extractor captured
+                # `key.participant` has no author at all, and that absence is itself worth stating.
+                k = ids.key(m["sender"]) if m.get("sender") else ""
+                if k not in who: who[k] = ids.row(m["sender"]) if m.get("sender") else None
+            for cj, r in sorted(who.items(), key=lambda kv: ((kv[1] or {}).get("label") or "~").lower()):
+                if r is None:
+                    f.write("  - %s  (no sender recorded in the message)\n" % "(unknown)".ljust(24))
+                    continue
                 forms = "  ".join(x for x in (r["lid"], r["phone"]) if x and x != cj)
                 f.write("  - %s  %s%s%s\n" % (_oneline(r["label"], _LABEL_MAX).ljust(24), cj,
                                                ("  " + forms) if forms else "",
