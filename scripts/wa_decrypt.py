@@ -569,14 +569,57 @@ def hist_row(r, ids, when, chat_key=None):
         sender = canon_jid(part) if part else (None if str(chat).endswith("@g.us") else chat)
     e = (ids.entry(sender) or {}) if sender else {}
     me = ids.is_me(sender) if (sender and ids.me) else fromme
+    # `pushName` is the name the sender chose for themselves, which the phone sends alongside the
+    # message. It is used only where the profile has nothing better: with no jid at all it is the
+    # only identification there is, and with a jid the profile cannot name it beats a bare number.
+    # The address book still wins, as everywhere else.
+    push = _txt(r.get("pushName"))
+    src = ids.source(sender) if sender else None
+    if sender and src != "unresolved":
+        name, src = ids.label(sender), src
+    elif push:
+        name, src = push, "history-pushname"
+    elif sender:
+        name, src = ids.label(sender), src
+    else:
+        name, src = "(unknown)", "unresolved"
     return {"id": ("true" if fromme else "false") + "_" + str(chat) + "_" + str(r.get("id")),
             "t": when, "dir": "me" if me else "them", "type": hist_type(r.get("type")),
             "chat": chat, "chat_name": ids.label(chat),
-            "sender": sender, "sender_name": ids.label(sender) if sender else "(unknown)",
+            "sender": sender, "sender_name": name,
             "sender_lid": e.get("lid"), "sender_phone": e.get("pn"),
-            "sender_source": ids.source(sender) if sender else "unresolved",
+            "sender_source": src,
             "text": (r.get("text") or "").strip(), "quoted_text": "",
             "source": "phone"}
+
+def bank_history(master, msgs):
+    """Fold one pass's messages into the accumulated ledger. -> (new, enriched)
+
+    The old rule was "if this id is not already banked, add it" -- which is right for counting what
+    is NEW and wrong for everything else. A message banked by a run whose extractor did not capture
+    the group sender could never gain one, even when a later pull served the same message again with
+    it: the incoming copy was dropped whole. 29,864 messages in this project's own ledger have no
+    sender for exactly that reason.
+
+    So a banked record is now ENRICHED: fields it is missing are filled from the new copy, and
+    fields it already has are left alone, because the older copy is the one the rest of the ledger
+    (and the anchors) were built from. `False` and `0` are values, not absences.
+    """
+    EMPTY = (None, "", [], {})
+    new = enriched = 0
+    for m in msgs or ():
+        i = m.get("id")
+        if not i: continue
+        cur = master.get(i)
+        if cur is None:
+            master[i] = m; new += 1; continue
+        filled = False
+        for k, v in m.items():
+            if any(v is e for e in EMPTY) or v in ("",): continue
+            if any(cur.get(k) is e for e in EMPTY) or cur.get(k) == "":
+                cur[k] = v; filled = True
+        if filled: enriched += 1
+    return new, enriched
 
 def merge_history(chats, recovered, ids, ts):
     """Fold messages the phone served into an export built from the local store.

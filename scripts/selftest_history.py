@@ -23,7 +23,7 @@ try: sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 except Exception: pass
 
 from wa_decrypt import (Identities, canon_jid, hist_type, stanza_of, hist_row, merge_history,
-                        msg_row, write_transcripts)
+                        bank_history, msg_row, write_transcripts)
 
 FAIL = []
 def check(name, got, want):
@@ -101,6 +101,27 @@ noone = hist_row({"chat": "120300000009@g.us", "id": "S4", "fromMe": False, "par
 check("a group message with no participant does not invent a sender", noone["sender"], None)
 check("...and says so rather than guessing", noone["sender_name"], "(unknown)")
 
+# The phone also sends `pushName`, the name the sender chose for themselves. When their jid is
+# missing, or is one the profile cannot name, that is the only identification there is -- and it
+# beats printing "(unknown)" or a bare number.
+named = hist_row({"chat": "120300000009@g.us", "id": "S5", "fromMe": False, "participant": None,
+                  "pushName": "Dev", "ts": 1760000005, "text": "hi", "type": "conversation"},
+                 IDS, ts(1760000005))
+check("a nameless sender is labelled by the name they gave", named["sender_name"], "Dev")
+check("...with the provenance of that name", named["sender_source"], "history-pushname")
+check("...and no jid is invented for them", named["sender"], None)
+
+stranger = hist_row({"chat": "120300000009@g.us", "id": "S6", "fromMe": False,
+                     "participant": "999900009999@lid", "pushName": "Sam",
+                     "ts": 1760000006, "text": "hi", "type": "conversation"}, IDS, ts(1760000006))
+check("a jid the profile cannot name falls back to the name they gave",
+      stranger["sender_name"], "Sam")
+check("...and keeps the jid, which is real", stranger["sender"], "999900009999@lid")
+known = hist_row({"chat": "120300000009@g.us", "id": "S7", "fromMe": False,
+                  "participant": "965000000001@lid", "pushName": "Whatever They Typed",
+                  "ts": 1760000007, "text": "hi", "type": "conversation"}, IDS, ts(1760000007))
+check("the address book still wins over a self-chosen name", known["sender_name"], "Priya Desk")
+
 print("\nthe merge")
 def local():
     """An export of the local store: one group chat and one 1:1, filed under the forms it uses."""
@@ -161,6 +182,28 @@ again = merge_history(rows, REC, IDS, ts)
 check("nothing added the second time", again[0], 0)
 check("everything recognised as already present", again[1], 4)
 check("total unchanged", sum(len(v) for v in rows.values()), 5)
+
+print("\nbanking a pass: new messages added, banked ones enriched")
+# A run that banked a message before the extractor captured the group sender must be able to GAIN
+# one when a later pull serves the same message again. "First copy wins" made that impossible.
+ledger = {"S1": {"id": "S1", "chat": "120300000009@g.us", "fromMe": False, "ts": 1759000000,
+                 "text": "older group message", "type": "conversation"}}          # no participant
+served = [{"id": "S1", "chat": "120300000009@g.us", "fromMe": False, "ts": 1759000000,
+           "text": "older group message", "type": "conversation",
+           "participant": "888800000003@lid", "pushName": "Nikhil"},               # same msg, richer
+          {"id": "S2", "chat": "120300000009@g.us", "fromMe": False, "ts": 1759000001,
+           "text": "brand new", "type": "conversation", "participant": "965000000001@lid"}]
+new_n, enriched_n = bank_history(ledger, served)
+check("the genuinely new message is added", new_n, 1)
+check("the banked one is counted as enriched, not as new", enriched_n, 1)
+check("...and it now has the sender it lacked", ledger["S1"]["participant"], "888800000003@lid")
+check("...and the name that came with it", ledger["S1"]["pushName"], "Nikhil")
+check("a field the banked copy already had is NOT overwritten",
+      ledger["S1"]["text"], "older group message")
+check("banking the same pass twice changes nothing", bank_history(ledger, served), (0, 0))
+check("fromMe=False is not mistaken for a missing value",
+      bank_history({"S3": {"id": "S3", "fromMe": False}}, [{"id": "S3", "fromMe": True}]), (0, 0))
+check("a record with no id is ignored", bank_history({}, [{"chat": "x@g.us"}]), (0, 0))
 
 print("\nthe merged export still writes a transcript")
 import tempfile

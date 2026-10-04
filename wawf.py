@@ -329,10 +329,20 @@ def cmd_run(a):
         if not _read_key_file(a.key):
             return 3
 
-    log.info("[1/3] recovering device credentials from the profile ...")
-    creds_path = os.path.join(workdir, "creds_in.json")
-    if cmd_creds(argparse.Namespace(profile=a.profile, origin=a.origin, out=creds_path, _internal=True)):
-        return 3
+    # --creds is documented as "an existing creds_in.json to reuse instead of recovering credentials
+    # again", and the default run ignored it completely: it always re-ran the recovery, which is the
+    # minutes-long read of the browser storage that the flag exists to skip.
+    creds_path = getattr(a, "creds", None)
+    if creds_path:
+        if not os.path.isfile(creds_path):
+            log.error("--creds: no such file: %s", creds_path)
+            return 4
+        log.info("[1/3] using the credentials in %s (no recovery needed)", os.path.abspath(creds_path))
+    else:
+        log.info("[1/3] recovering device credentials from the profile ...")
+        creds_path = os.path.join(workdir, "creds_in.json")
+        if cmd_creds(argparse.Namespace(profile=a.profile, origin=a.origin, out=creds_path, _internal=True)):
+            return 3
 
     key = _find_key(a, workdir, outs)
     # Record provenance HERE, where it is actually known. It used to be inferred further down as
@@ -1209,15 +1219,19 @@ def _deepen_anchors(anchors_path, master):
     with open(tmp, "w", encoding="utf-8") as f: json.dump({"anchors": newanchors, "ondisk_ids": sorted(ondisk)}, f)  # corrupt
     os.replace(tmp, anchors_path)                          # the anchors.json the node client reads next pass
 
-def _resume_master(accum, anchors_path, master):
+def _resume_master(accum, anchors_path, master, deepen=True):
     """Reload messages recovered on prior `wawf history` runs (from the accumulated ledger) into `master`
     and push the freshly-built anchors past them, so a new run continues older than prior runs instead of
     re-requesting the same window. Returns how many prior messages were reloaded (0 if none / on error)."""
     if not os.path.exists(accum): return 0
     try:
-        for m in (json.load(open(accum, encoding="utf-8")).get("messages") or []):
-            if m.get("id"): master[m["id"]] = m
-        if master: _deepen_anchors(anchors_path, master)
+        WD, _ = _imp()
+        WD.bank_history(master, json.load(open(accum, encoding="utf-8")).get("messages"))
+        # Deepening is what makes a second run continue OLDER than the first instead of re-asking
+        # the same window. `--history-refetch` is the case where re-asking is the entire point: the
+        # messages are banked but missing fields an older extractor never captured (the group
+        # sender), and the only way to fill them is to have the phone serve them again.
+        if master and deepen: _deepen_anchors(anchors_path, master)
         return len(master)
     except Exception as e:
         log.warning("could not reload prior history (%s) — starting fresh.", e)
@@ -1250,29 +1264,62 @@ def _prompt_yes(question, assume_yes=False):
         return False
 
 def _find_node():
-    """A bundled Node (standalone .exe), else node(.exe) on PATH, else a known install location (a freshly
-    winget-installed Node is not yet on this process's PATH). Returns the node path or None."""
-    import shutil
-    # standalone build: Node is packaged inside the .exe under node/ (the spec bundles the bare binary, but
-    # accept bin/node too in case a whole Node dist is bundled instead).
-    for b in ([os.path.join(HERE, "node", "node.exe")] if sys.platform == "win32"
-              else [os.path.join(HERE, "node", "node"), os.path.join(HERE, "node", "bin", "node")]):
-        if os.path.isfile(b): return b
+    """Any usable Node, from the places it actually lives. The path, or None.
+
+    Offering to INSTALL Node is a last resort -- it modifies the machine -- so this looks everywhere
+    a copy plausibly is before concluding there is none. PATH alone is not enough: a portable Node
+    unzipped beside the tool is the normal arrangement on a locked-down examination machine, and a
+    version manager (nvm, nvs, scoop, chocolatey, winget) puts it somewhere PATH may not mention in
+    this process. WAWF_NODE points straight at a binary when all else fails.
+    """
+    import shutil, glob
+    exe = "node.exe" if sys.platform == "win32" else "node"
+    cands = []
+    env = os.environ.get("WAWF_NODE")
+    if env: cands += [env, os.path.join(env, exe), os.path.join(env, "bin", exe)]
+    # bundled inside the standalone build, or unzipped next to the tool / the reconnect client
+    roots = [HERE, os.path.dirname(os.path.abspath(sys.argv[0] or ".")), os.getcwd()]
+    rec = _find_reconnect_dir() if "_find_reconnect_dir" in globals() else None
+    if rec: roots.append(rec)
+    for r in roots:
+        cands += [os.path.join(r, "node", exe), os.path.join(r, "node", "bin", exe),
+                  os.path.join(r, exe)]
+        cands += sorted(glob.glob(os.path.join(r, "node-v*", exe)), reverse=True)
+    for c in cands:
+        if c and os.path.isfile(c): return c
     n = shutil.which("node")
     if n: return n
-    for c in [r"C:\Program Files\nodejs\node.exe", r"C:\Program Files (x86)\nodejs\node.exe",
-              os.path.expandvars(r"%LOCALAPPDATA%\Programs\nodejs\node.exe")]:
+    more = [r"C:\Program Files\nodejs\node.exe", r"C:\Program Files (x86)\nodejs\node.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\nodejs\node.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Links\node.exe"),
+            os.path.expandvars(r"%USERPROFILE%\scoop\apps\nodejs\current\node.exe"),
+            os.path.expandvars(r"%ChocolateyInstall%\bin\node.exe"),
+            r"C:\ProgramData\chocolatey\bin\node.exe"]
+    more += sorted(glob.glob(os.path.expandvars(r"%APPDATA%\nvm\v*\node.exe")), reverse=True)
+    more += sorted(glob.glob(os.path.expandvars(r"%LOCALAPPDATA%\nvs\node\*\*\node.exe")), reverse=True)
+    for c in more:
         if os.path.isfile(c): return c
     return None
 
-def _ensure_node(assume_yes=False):
+def _ensure_node(assume_yes=False, install_ok=False):
     """Return a path to node, offering to install Node.js if it's missing. None if unavailable."""
+    _ensure_node._explicit = bool(install_ok)
     node = _find_node()
     if node: return node
     if sys.platform != "win32":
         log.error("Node.js is required for history sync. Install it from https://nodejs.org and re-run."); return None
-    if not _prompt_yes("history sync needs Node.js, which isn't installed. Install it now via winget?", assume_yes):
-        log.error("Node.js is required — install it from https://nodejs.org, then re-run `wawf history`."); return None
+    # Deliberately NOT covered by --yes. Everything else --yes waves through happens inside this
+    # tool's own folder; this one installs software on the examiner's machine, with an elevation
+    # prompt, as a side effect of asking for chat history. That needs to be asked for by name.
+    if not _prompt_yes("history sync needs Node.js, and none was found. Install it now via winget?",
+                       getattr(_ensure_node, "_explicit", False)):
+        log.error("Node.js is required for --history. Three ways, cheapest first:\n"
+                  "  * unzip a portable Node beside this tool (a node-v*/ folder, or node/node.exe) "
+                  "-- nothing is installed and nothing needs elevation\n"
+                  "  * point WAWF_NODE at an existing node binary\n"
+                  "  * install it: https://nodejs.org, or re-run with --install-node to do it via "
+                  "winget (modifies this machine, asks for elevation)")
+        return None
     log.info("installing Node.js LTS via winget (a UAC prompt may appear) ...")
     try:
         subprocess.run(["winget", "install", "--id", "OpenJS.NodeJS.LTS", "-e",
@@ -1424,7 +1471,8 @@ def cmd_history(a):
                   "in the .exe. Run wawf from the repo, or keep the .exe inside the repo (its dist/ folder is "
                   "fine) so tools/reconnect sits alongside it.")
         return 2
-    node = _ensure_node(getattr(a, "yes", False))        # find Node, or offer to install it
+    # --install-node, not --yes: see the note in _ensure_node
+    node = _ensure_node(getattr(a, "yes", False), getattr(a, "install_node", False))
     if not node: return 2
     node_dir = os.path.dirname(node)                     # make node/npm resolvable for this run's subprocesses
     if node_dir and node_dir not in os.environ.get("PATH", "").split(os.pathsep):
@@ -1525,8 +1573,16 @@ def cmd_history(a):
     # RESUME across separate `wawf history` runs: step [3/4] just rebuilt anchors.json fresh from what's on
     # disk (i.e. back at the browser-cache boundary), so reload everything recovered on prior runs and push
     # the anchors + on-disk id set past it — otherwise run 2 would re-request run 1's window and overwrite it.
-    n = _resume_master(accum, anchors_path, master)
-    if n: log.info("resuming: %s messages recovered on prior runs — continuing older than those.", f"{n:,}")
+    refetch = bool(getattr(a, "history_refetch", False))
+    n = _resume_master(accum, anchors_path, master, deepen=not refetch)
+    if n and not refetch:
+        log.info("resuming: %s messages recovered on prior runs — continuing older than those.", f"{n:,}")
+    elif n:
+        log.warning("--history-refetch: re-asking for the %s messages already recovered, to fill in "
+                    "fields an earlier run did not capture (the group sender, which older versions of "
+                    "the extractor dropped). This spends the same rate-limit budget as fetching new "
+                    "history and finds nothing new by design; run it without the flag to go deeper "
+                    "instead.", f"{n:,}")
 
     # --out now applies to a history run. The dataset it produces is the local store PLUS whatever
     # the phone returns, so it is written to its own folder (see _history_out_targets) and an earlier
@@ -1572,12 +1628,11 @@ def cmd_history(a):
             except Exception:
                 log.error("pass %d produced no output (node exit=%s; connection failed / phone not serving) "
                           "— stopping.", p, rc); break
-            new = 0
-            for m in (passd.get("messages") or []):
-                i = m.get("id")
-                if i and i not in master: master[i] = m; new += 1
+            WD, _ = _imp()
+            new, enriched = WD.bank_history(master, passd.get("messages"))
             by = _checkpoint(accum)                          # checkpoint the accumulated set every pass
-            log.info("pass %d: +%d new  ·  total recovered: %d across %d chats", p, new, len(master), len(by))
+            log.info("pass %d: +%d new%s  ·  total recovered: %d across %d chats", p, new,
+                     (", %d enriched" % enriched) if enriched else "", len(master), len(by))
             if rc == COOLDOWN_RC:
                 _deepen_anchors(anchors_path, master)        # bank progress before the wait
                 if COOLDOWN and cooldowns_used < MAX_COOLDOWNS:
@@ -1592,9 +1647,14 @@ def cmd_history(a):
                             "(%d used). Re-run later to continue deeper; progress is saved.",
                             p, cooldowns_used)
                 break
-            if new < MIN_NEW:
+            # In a refetch the phone is being asked for messages we already have, so "new" is 0 by
+            # design and the loop would stop after one pass. What counts as progress there is how
+            # many banked records gained a field.
+            progress = new + (enriched if refetch else 0)
+            if progress < MIN_NEW:
                 if master:
-                    log.info("converged — last pass added < %d new messages. Stopping.", MIN_NEW)
+                    log.info("converged — last pass %s < %d. Stopping.",
+                             "enriched" if refetch else "added", MIN_NEW)
                 else:                                        # never say "converged" when nothing ever arrived
                     log.warning("pass %d came back empty — the phone answered none of the requests. Stopping.", p)
                 break
@@ -1775,7 +1835,11 @@ def main():
                         "automatically. A FILE rather than the key itself, so no secret reaches your "
                         "shell history, process list or command auditing.")
     p.add_argument("--creds", metavar="FILE",
-                   help="an existing creds_in.json to reuse instead of recovering credentials again")
+                   help="an existing creds_in.json to reuse instead of recovering credentials again "
+                        "(skips the minutes-long read of the browser storage). It must describe the "
+                        "SAME device the profile holds: credentials exported before the browser "
+                        "re-paired name a device that no longer exists and the login is refused -- "
+                        "scripts/check_identity.py says which you have.")
 
     g = p.add_argument_group("optional actions (instead of the default decrypt job)")
     g.add_argument("--history", action="store_true",
@@ -1791,13 +1855,23 @@ def main():
     # FIREFOX store and there is no scenario yet where it beats the two routes that always work: a
     # normal run captures the key over the network, and `--key` decrypts offline with a key captured
     # earlier. Restoring it is these four add_argument lines plus the dispatch branch, both marked.
+    g.add_argument("--install-node", action="store_true",
+                   help="allow --history to INSTALL Node.js via winget if none is found. Not covered "
+                        "by --yes, because it modifies this machine and asks for elevation; a "
+                        "portable Node unzipped beside the tool, or WAWF_NODE, needs neither.")
+    g.add_argument("--history-refetch", action="store_true",
+                   help="with --history: re-ask for history already recovered instead of going "
+                        "deeper, to fill in fields an earlier run did not capture (the group sender). "
+                        "Finds nothing new by design and spends the same rate-limit budget.")
     g.add_argument("--fetch-media", action="store_true",
                    help="with --history --out sqlite:PATH: after the pull, ask the CDN for media the "
                         "browser never cached. NETWORKED and slow, and a url whose signature has "
                         "expired returns 403, so this is opt-in; without it the mediaKeys are still "
                         "exported and scripts/mediafetch.py --cdn can fetch later.")
     g.add_argument("--yes", action="store_true",
-                   help="auto-confirm prompts (installing Node for --history)")
+                   help="auto-confirm prompts that only affect this tool's own folder (such as "
+                        "`npm install` in tools/reconnect). It does NOT authorise installing Node.js "
+                        "system-wide -- that is --install-node.")
 
     g = p.add_argument_group("chain of custody")
     # NOTE: a plain flag, NOT nargs='?'. An optional-value option would swallow the PROFILE positional.

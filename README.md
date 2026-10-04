@@ -175,7 +175,9 @@ A Windows drive letter is never mistaken for a `FORMAT`, so `D:\case\out` works 
 | `--origin DIR` | Firefox `web.whatsapp.com` storage folder instead of a profile folder. |
 | `--raw-include-keys` | With `--out raw:` — also dump `signal-storage` and `wawc_db_enc`. Those are key material; a dump including them must not travel with a case. |
 | `--history` | **Also** pull chat history older than the browser cache from your phone, iteratively, resuming across runs, and append it to the export. Needs Node (offers to install it). Phone-side and rate-limited — see below. |
-| `--fetch-media` | With `--history --out sqlite:PATH`: after the pull, ask the CDN for media the browser never cached. Networked and slow, and an expired url returns 403, so it is opt-in. |
+| `--fetch-media` | With `--history --out sqlite:PATH`: after the pull, ask the CDN for media the browser never cached. Networked, and it downloads real bytes — a large account can be a lot of them. Urls whose signature has already expired are skipped without a request. |
+| `--history-refetch` | With `--history`: re-ask for history already recovered, to fill in fields an earlier run did not capture (the group sender). Finds nothing new by design. |
+| `--install-node` | Allow `--history` to install Node.js via winget when none is found. **Not** covered by `--yes`: it modifies the machine and asks for elevation. A portable Node unzipped beside the tool, or `WAWF_NODE` pointing at one, needs neither. |
 | `--no-audit` | Do **not** write the chain-of-custody database. It is written by default (see below). |
 
 Sender resolution is **reported, not assumed** — a run prints where every label came from, so the one
@@ -323,9 +325,26 @@ media for recovered messages is **not** downloaded by default: their `mediaKey`s
 `--fetch-media` (or `scripts/mediafetch.py --cdn` later) can fetch the bytes when you want them,
 without adding CDN failures to an already long run.
 
-Messages recovered before the extractor captured `key.participant` have no author in a group chat.
-That is shown as `(unknown)`, in the line and in the chat's participant legend; pulls from now on
-carry the sender.
+A group message recovered from the phone carries its sender in the history protobuf
+(`key.participant`, or `participant` on the message itself), and the sender's own display name in
+`pushName`. Earlier versions of the extractor captured none of them, so messages banked by those
+runs have no author and show as `(unknown)` — in the line and in the chat's participant legend, so
+the file never claims to know who spoke when it does not.
+
+To fill those in, ask the phone for that history again:
+
+```bash
+wawf <PROFILE> --history --history-refetch --out D:\case\run3
+```
+
+That re-requests history you already have instead of going deeper, and fields the banked records are
+missing get filled in from what comes back. It finds nothing new by design, and spends the same
+rate-limit budget as fetching new history, so it is a deliberate flag rather than something a normal
+run does.
+
+Where the profile cannot name a recovered sender at all, the name they chose for themselves is used
+(`sender_source: history-pushname`) — better than a bare number, and still never a guess: the
+address book wins where it has an entry.
 
 It runs **iteratively**: each pass re-anchors every chat on the oldest message recovered so far and pulls
 deeper, accumulating (deduped) until a pass stops finding meaningfully more. Progress is checkpointed to
@@ -377,6 +396,11 @@ checkpointed after every page, so stopping it costs nothing.
 
 Needs Node + `cd tools/reconnect && npm install` — the Signal/E2E stack isn't ported to Python, so
 `--history` is **not** in the standalone binary.
+
+Node is looked for in the places it actually lives: beside the tool (a `node-v*/` folder or
+`node/node.exe`), on `PATH`, in the standard install directories, in nvm / nvs / scoop / chocolatey /
+winget, and wherever `WAWF_NODE` points. Unzipping the official portable build next to the tool is
+the least invasive option on an examination machine — nothing is installed and nothing is elevated.
 
 ### Other diagnostics
 

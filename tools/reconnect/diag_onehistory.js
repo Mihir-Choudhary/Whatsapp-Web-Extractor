@@ -135,7 +135,12 @@ const brief = node => {
     if (d && (d.messages || []).length) {
       notified = notified || { at: rel(), count: d.messages.length };
       for (const w of d.messages) {
-        if (w && w.key && w.key.id) recovered.push({ chat: w.key.remoteJid, id: w.key.id,
+        // The WHOLE key, not a chosen subset: which field carries the group sender is exactly the
+        // kind of question this tool exists to answer, and the proto has `participant` while this
+        // Baileys adds `participantPn` and `participantLid` -- so a diagnostic that pre-selects one
+        // of them cannot tell you which the account actually uses.
+        if (w && w.key && w.key.id) recovered.push({ key: w.key, pushName: w.pushName || null,
+                                                     chat: w.key.remoteJid, id: w.key.id,
           fromMe: !!w.key.fromMe, ts: Number(w.messageTimestamp) || 0 });
       }
       console.error(`  ${rel().padStart(7)}  ***  messaging-history.set with ${d.messages.length} message(s)`);

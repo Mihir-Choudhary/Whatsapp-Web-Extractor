@@ -70,8 +70,9 @@ function txt(m){ if(!m) return ''; const c=m.conversation||m.extendedTextMessage
   ||m.imageMessage?.caption||m.videoMessage?.caption||m.documentMessage?.caption; return c||''; }
 function flatten(hs){ const out=[]; for(const conv of (hs.conversations||[])){ for(const hm of (conv.messages||[])){
   const w=hm.message; if(!w||!w.key) continue; out.push({chat:conv.id||w.key.remoteJid, id:w.key.id,
-    // key.participant is the group sender; without it a recovered group message has no author
-    fromMe:!!w.key.fromMe, participant:w.key.participant||null,
+    // The group sender, from either place the protobuf carries it, plus the name the sender gave
+    // themselves. Without these a recovered group message has no author at all.
+    fromMe:!!w.key.fromMe, participant:(w.key&&w.key.participant)||w.participant||null, pushName:w.pushName||null,
     ts:Number(w.messageTimestamp)||0, text:txt(w.message), type:w.message?Object.keys(w.message)[0]:'?'}); } } return out; }
 function histNotif(message){ // dig through device/ephemeral wrappers
   let m=message; for(let i=0;i<4&&m;i++){ if(m.protocolMessage?.historySyncNotification) return m.protocolMessage.historySyncNotification;
@@ -354,7 +355,7 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     if(r==='duplicate') return;               // same chunk via the other listener; already banked
     if(!r){
       const late=(d.messages||[]).map(w=>({ chat:w.key&&w.key.remoteJid, id:w.key&&w.key.id,
-        fromMe:!!(w.key&&w.key.fromMe), participant:(w.key&&w.key.participant)||null,
+        fromMe:!!(w.key&&w.key.fromMe), participant:(w.key&&w.key.participant)||w.participant||null, pushName:w.pushName||null,
         ts:Number(w.messageTimestamp)||0, text:txt(w.message),
         type:w.message?Object.keys(w.message)[0]:'?' })).filter(x=>x.id);
       if(late.length){
@@ -366,7 +367,7 @@ function histNotif(message){ // dig through device/ephemeral wrappers
       return;
     }
     const msgs=(d.messages||[]).map(w=>({ chat:w.key&&w.key.remoteJid, id:w.key&&w.key.id, fromMe:!!(w.key&&w.key.fromMe),
-      participant:(w.key&&w.key.participant)||null,
+      participant:(w.key&&w.key.participant)||w.participant||null, pushName:w.pushName||null,
       ts:Number(w.messageTimestamp)||0, text:txt(w.message), type:w.message?Object.keys(w.message)[0]:'?' })).filter(m=>m.chat&&m.id);
     console.error('  [messaging-history.set] '+msgs.length+' msgs for session '+sid);
     r(msgs);
