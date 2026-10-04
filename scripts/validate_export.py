@@ -25,9 +25,15 @@ if len(sys.argv) < 2:
     sys.exit("usage: validate_export.py <out_dir> [<sqlite_dir>]")
 OUT = sys.argv[1]
 DB = sys.argv[2] if len(sys.argv) > 2 else None
-for f in ("chats.json", "identities.json", "transcripts.txt"):
-    if not os.path.isfile(os.path.join(OUT, f)):
-        sys.exit("not an export directory (no %s in %s)" % (f, OUT))
+# `--out txt:PATH` and `--out json:PATH` are legitimate exports that hold only part of the set, so
+# the rule is "at least one artifact", and each section below runs only if its input is there.
+HAVE = {f for f in ("chats.json", "identities.json", "transcripts.txt")
+        if os.path.isfile(os.path.join(OUT, f))}
+if not HAVE:
+    sys.exit("not an export directory (none of chats.json / identities.json / transcripts.txt in %s)" % OUT)
+if "chats.json" in HAVE and "identities.json" not in HAVE:
+    sys.exit("chats.json is here but identities.json is not -- they are written together, so this "
+             "export is incomplete: %s" % OUT)
 FAIL = []
 
 def chk(name, ok, detail=''):
@@ -42,10 +48,12 @@ def canon(j):
     u, _, s = j.rpartition('@')
     return u.split(':')[0] + '@' + ('c.us' if s in ('c.us', 's.whatsapp.net') else s)
 
-ch = json.load(io.open(os.path.join(OUT, 'chats.json'), encoding='utf-8'))
-ids = json.load(io.open(os.path.join(OUT, 'identities.json'), encoding='utf-8'))
-txt = io.open(os.path.join(OUT, 'transcripts.txt'), encoding='utf-8').read()
+ch = json.load(io.open(os.path.join(OUT, 'chats.json'), encoding='utf-8')) if 'chats.json' in HAVE else {}
+ids = (json.load(io.open(os.path.join(OUT, 'identities.json'), encoding='utf-8'))
+       if 'identities.json' in HAVE else {"me": [], "identities": [], "groups": {}})
+txt = io.open(os.path.join(OUT, 'transcripts.txt'), encoding='utf-8').read() if 'transcripts.txt' in HAVE else None
 msgs = [m for ml in ch.values() for m in ml]
+print("=== present: %s ===" % ", ".join(sorted(HAVE)))
 print("=== chats.json: %d chats, %d messages ===" % (len(ch), len(msgs)))
 
 FIELDS = {'id', 't', 'dir', 'type', 'chat', 'chat_name', 'sender', 'sender_name', 'sender_lid',
@@ -115,98 +123,122 @@ chk("every row says where it came from", not [m for m in msgs if m.get('source')
 chk("a recovered row does not claim a locally decrypted quote",
     not [m for m in msgs if m.get('source') == 'phone' and m.get('quoted_text')])
 
-print("\n=== identities.json: %d identities, %d groups ===" % (len(ids['identities']), len(ids['groups'])))
-chk("no duplicate identity rows",
-    len({r['jid'] for r in ids['identities']}) == len(ids['identities']))
-mine_forms = {j for r in ids['identities'] if r.get('is_me')
-              for j in (r.get('jids') or [r.get('jid')])}
-# `me` holds every form the profile named; `jids` lists only the forms that actually appear in
-# this export. My phone form is often never an `author`, so equality would fail on a sound export.
-chk("every address marked as me is one of mine", mine_forms <= me, sorted(mine_forms - me))
-chk("source=address-book implies a name",
-    not [r for r in ids['identities'] if r['source'] == 'address-book' and not r['name']])
-chk("source=pushname implies a pushname",
-    not [r for r in ids['identities'] if r['source'] == 'pushname' and not r['pushname']])
-chk("source=unresolved implies nothing is known",
-    not [r for r in ids['identities'] if r['source'] == 'unresolved' and (r['name'] or r['pushname'] or r['phone'])])
-chk("a label is never empty", not [r for r in ids['identities'] if not r['label']])
-chk("one row per person, not per address",
-    max(collections.Counter(r['phone'] for r in ids['identities'] if r['phone']).values(), default=0) == 1,
-    [r['jid'] for r in ids['identities'] if r['phone'] and
-     collections.Counter(x.get('phone') for x in ids['identities'])[r['phone']] > 1][:2])
-allforms = [j for r in ids['identities'] for j in r.get('jids', [])]
-chk("each address form belongs to exactly one person", len(allforms) == len(set(allforms)))
-chk("every sender's address form is listed on its person",
-    not {canon(m.get('sender')) for m in withsender} - set(allforms))
-chk("group jids are labelled by subject, not by a phone number",
-    not [r for r in ids['identities'] if r['jid'].endswith('@g.us') and r['label'].startswith('+')])
-print("  ..   label sources: %s" % dict(collections.Counter(r['source'] for r in ids['identities'])))
+def check_identities():
+    """Everything the correlation table must satisfy. Skipped when identities.json is not
+    part of this export -- `--out txt:PATH` writes only a transcript, and checks run
+    against an empty stub are either vacuous or, in one case, wrong: "one row per person"
+    read an empty table as a violation."""
+    print("\n=== identities.json: %d identities, %d groups ===" % (len(ids['identities']), len(ids['groups'])))
+    chk("no duplicate identity rows",
+        len({r['jid'] for r in ids['identities']}) == len(ids['identities']))
+    mine_forms = {j for r in ids['identities'] if r.get('is_me')
+                  for j in (r.get('jids') or [r.get('jid')])}
+    # `me` holds every form the profile named; `jids` lists only the forms that actually appear in
+    # this export. My phone form is often never an `author`, so equality would fail on a sound export.
+    chk("every address marked as me is one of mine", mine_forms <= me, sorted(mine_forms - me))
+    chk("source=address-book implies a name",
+        not [r for r in ids['identities'] if r['source'] == 'address-book' and not r['name']])
+    chk("source=pushname implies a pushname",
+        not [r for r in ids['identities'] if r['source'] == 'pushname' and not r['pushname']])
+    chk("source=unresolved implies nothing is known",
+        not [r for r in ids['identities'] if r['source'] == 'unresolved' and (r['name'] or r['pushname'] or r['phone'])])
+    chk("a label is never empty", not [r for r in ids['identities'] if not r['label']])
+    chk("one row per person, not per address",
+        max(collections.Counter(r['phone'] for r in ids['identities'] if r['phone']).values(), default=0) == 1,
+        [r['jid'] for r in ids['identities'] if r['phone'] and
+         collections.Counter(x.get('phone') for x in ids['identities'])[r['phone']] > 1][:2])
+    allforms = [j for r in ids['identities'] for j in r.get('jids', [])]
+    chk("each address form belongs to exactly one person", len(allforms) == len(set(allforms)))
+    chk("every sender's address form is listed on its person",
+        not {canon(m.get('sender')) for m in withsender} - set(allforms))
+    chk("group jids are labelled by subject, not by a phone number",
+        not [r for r in ids['identities'] if r['jid'].endswith('@g.us') and r['label'].startswith('+')])
+    print("  ..   label sources: %s" % dict(collections.Counter(r['source'] for r in ids['identities'])))
 
-print("\n=== transcripts.txt ===")
-HDR = re.compile(r'^===== (.*?)  \[(.+?)\]  \((group|1:1); (\d+) msgs, (\d+) with text\) =====$')
-MSG = re.compile(r'^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\] (->|<-) +(.*?): (.*)$')
-blocks = []; cur = None; stray = []
-for ln in txt.split('\n'):
-    m = HDR.match(ln)
-    if m:
-        cur = {'name': m.group(1), 'jid': m.group(2), 'kind': m.group(3), 'msgs': int(m.group(4)),
-               'text': int(m.group(5)), 'lines': [], 'legend': [], 'cont': 0, 're': 0}
-        blocks.append(cur); continue
-    if cur is None:
-        if ln and not ln.startswith('#'): stray.append(ln)
-        continue
-    if ln.startswith('  - '): cur['legend'].append(ln[4:]); continue
-    mm = MSG.match(ln)
-    if mm: cur['lines'].append(mm.groups()); continue
-    if ln.lstrip().startswith('| '): cur['cont'] += 1; continue
-    if ln.lstrip().startswith('re: '): cur['re'] += 1; continue
-    if ln.strip(): stray.append(ln)
-print("  ..   %d chat blocks, %d message lines, %d continuation lines, %d quote lines"
-      % (len(blocks), sum(len(b['lines']) for b in blocks), sum(b['cont'] for b in blocks),
-         sum(b['re'] for b in blocks)))
-chk("no unclassifiable line", not stray, stray[:2])
-# Every chat with any message gets a block, and every message in it gets a line -- a message with
-# no text of its own is shown as its type, not omitted.
-chk("one block per chat", len(blocks) == len([c for c, ml in ch.items() if ml]))
-chk("no duplicate blocks", len({b['jid'] for b in blocks}) == len(blocks))
-chk("header msg count matches chats.json",
-    not [b for b in blocks if b['msgs'] != len(ch.get(b['jid'], []))])
-chk("header 'with text' count matches chats.json",
-    not [b for b in blocks if b['text'] != len([m for m in ch.get(b['jid'], []) if m.get('text')])])
-# Lines are 1:1 with messages and in the same order, so they can be PAIRED rather than matched on
-# (timestamp, sender) -- which is ambiguous, because two messages a second apart share a timestamp
-# at this resolution. Pairing by position, the invariant is: a message with no text of its own is
-# shown as its type, never as a blank line.
-mismatched = []
-for b in blocks:
-    rows = ch.get(b['jid'], [])
-    if len(rows) != len(b['lines']): continue          # already reported above
-    for l, m in zip(b['lines'], rows):
-        want = "(%s)" % (m.get('type') or 'unknown')
-        if not m.get('text') and l[3] != want:
-            mismatched.append((b['jid'], l[0], l[3], want))
-chk("a message with no text of its own is shown as its type", not mismatched, mismatched[:2])
-chk("...and a line's timestamp matches the message it pairs with",
-    not [1 for b in blocks for l, m in zip(b['lines'], ch.get(b['jid'], []))
-         if len(ch.get(b['jid'], [])) == len(b['lines']) and l[0] != m.get('t')])
-chk("every message has a line", not [b for b in blocks if b['msgs'] != len(b['lines'])],
-    [(b['jid'], b['msgs'], len(b['lines'])) for b in blocks if b['msgs'] != len(b['lines'])][:2])
-chk("no message is silently dropped from the transcript",
-    sum(len(b['lines']) for b in blocks) == len(msgs),
-    "%d lines vs %d messages" % (sum(len(b['lines']) for b in blocks), len(msgs)))
-chk("blocks ordered busiest first",
-    [b['msgs'] for b in blocks] == sorted((b['msgs'] for b in blocks), reverse=True))
-chk("lines ordered by time", all([l[0] for l in b['lines']] == sorted(l[0] for l in b['lines']) for b in blocks))
-miss = [(b['name'], l[2]) for b in blocks for l in b['lines']
-        if l[2] not in {x.split('  ')[0].strip() for x in b['legend']}]
-chk("every line's sender is in its chat legend", not miss, miss[:2])
-chk("no legend row duplicated inside a block",
-    all(len(b['legend']) == len({x.split('  ')[0].strip() for x in b['legend']}) for b in blocks))
-chk("no content line sits at column 0 where structure lives",
-    not [l for l in txt.split('\n') if l[:1] not in ('', '#', '[', ' ', '=')], )
-chk("no stray carriage return", '\r' not in txt)
-print("  ..   astral-plane characters present (emoji survived): %s"
-      % any(ord(c) > 0xFFFF for c in txt))
+if not ids.get("identities") and "identities.json" not in HAVE:
+    print("\n=== identities.json: not in this export (txt was the only requested format) ===")
+else:
+    check_identities()
+
+def check_transcript():
+    """Everything the transcript must satisfy. Skipped when txt was not a requested
+    format -- `--out json:PATH` is a legitimate export with no transcript in it."""
+    print("\n=== transcripts.txt ===")
+    HDR = re.compile(r'^===== (.*?)  \[(.+?)\]  \((group|1:1); (\d+) msgs, (\d+) with text\) =====$')
+    MSG = re.compile(r'^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\] (->|<-) +(.*?): (.*)$')
+    blocks = []; cur = None; stray = []
+    for ln in txt.split('\n'):
+        m = HDR.match(ln)
+        if m:
+            cur = {'name': m.group(1), 'jid': m.group(2), 'kind': m.group(3), 'msgs': int(m.group(4)),
+                   'text': int(m.group(5)), 'lines': [], 'legend': [], 'cont': 0, 're': 0}
+            blocks.append(cur); continue
+        if cur is None:
+            if ln and not ln.startswith('#'): stray.append(ln)
+            continue
+        if ln.startswith('  - '): cur['legend'].append(ln[4:]); continue
+        mm = MSG.match(ln)
+        if mm: cur['lines'].append(mm.groups()); continue
+        if ln.lstrip().startswith('| '): cur['cont'] += 1; continue
+        if ln.lstrip().startswith('re: '): cur['re'] += 1; continue
+        if ln.strip(): stray.append(ln)
+    print("  ..   %d chat blocks, %d message lines, %d continuation lines, %d quote lines"
+          % (len(blocks), sum(len(b['lines']) for b in blocks), sum(b['cont'] for b in blocks),
+             sum(b['re'] for b in blocks)))
+    chk("no unclassifiable line", not stray, stray[:2])
+    # Every chat with any message gets a block, and every message in it gets a line -- a message with
+    # no text of its own is shown as its type, not omitted.
+    if ch:
+        chk("one block per chat", len(blocks) == len([c for c, ml in ch.items() if ml]))
+    chk("no duplicate blocks", len({b['jid'] for b in blocks}) == len(blocks))
+    if ch:
+        chk("header msg count matches chats.json",
+            not [b for b in blocks if b['msgs'] != len(ch.get(b['jid'], []))])
+    if ch:
+        chk("header 'with text' count matches chats.json",
+            not [b for b in blocks if b['text'] != len([m for m in ch.get(b['jid'], []) if m.get('text')])])
+    # Lines are 1:1 with messages and in the same order, so they can be PAIRED rather than matched on
+    # (timestamp, sender) -- which is ambiguous, because two messages a second apart share a timestamp
+    # at this resolution. Pairing by position, the invariant is: a message with no text of its own is
+    # shown as its type, never as a blank line.
+    mismatched = []
+    for b in (blocks if ch else []):
+        rows = ch.get(b['jid'], [])
+        if len(rows) != len(b['lines']): continue          # already reported above
+        for l, m in zip(b['lines'], rows):
+            want = "(%s)" % (m.get('type') or 'unknown')
+            if not m.get('text') and l[3] != want:
+                mismatched.append((b['jid'], l[0], l[3], want))
+    chk("a message with no text of its own is shown as its type", not mismatched, mismatched[:2])
+    chk("...and a line's timestamp matches the message it pairs with",
+        not [1 for b in (blocks if ch else []) for l, m in zip(b['lines'], ch.get(b['jid'], []))
+             if len(ch.get(b['jid'], [])) == len(b['lines']) and l[0] != m.get('t')])
+    chk("every message has a line", not [b for b in blocks if b['msgs'] != len(b['lines'])],
+        [(b['jid'], b['msgs'], len(b['lines'])) for b in blocks if b['msgs'] != len(b['lines'])][:2])
+    if ch:
+        chk("no message is silently dropped from the transcript",
+            sum(len(b['lines']) for b in blocks) == len(msgs),
+            "%d lines vs %d messages" % (sum(len(b['lines']) for b in blocks), len(msgs)))
+    chk("blocks ordered busiest first",
+        [b['msgs'] for b in blocks] == sorted((b['msgs'] for b in blocks), reverse=True))
+    chk("lines ordered by time", all([l[0] for l in b['lines']] == sorted(l[0] for l in b['lines']) for b in blocks))
+    if not ch:
+        print("  ..   chats.json is not in this export, so the cross-checks against it are skipped")
+    miss = [(b['name'], l[2]) for b in blocks for l in b['lines']
+            if l[2] not in {x.split('  ')[0].strip() for x in b['legend']}]
+    chk("every line's sender is in its chat legend", not miss, miss[:2])
+    chk("no legend row duplicated inside a block",
+        all(len(b['legend']) == len({x.split('  ')[0].strip() for x in b['legend']}) for b in blocks))
+    chk("no content line sits at column 0 where structure lives",
+        not [l for l in txt.split('\n') if l[:1] not in ('', '#', '[', ' ', '=')], )
+    chk("no stray carriage return", '\r' not in txt)
+    print("  ..   astral-plane characters present (emoji survived): %s"
+          % any(ord(c) > 0xFFFF for c in txt))
+
+if txt is None:
+    print("\n=== transcripts.txt: not in this export (txt was not a requested format) ===")
+else:
+    check_transcript()
 
 if DB:
     print("\n=== sqlite export ===")

@@ -201,31 +201,59 @@ def _parse_out(spec):
         if low in _OUT_FORMATS and rest:
             return ("sqlite" if low in ("sqlite", "db") else low), rest
         if len(head) > 1 and rest and not any(c in head for c in "\\/"):
-            raise SystemExit("unrecognised output format %r in --out %s\n\nFORMAT must be one of: %s\n"
-                             "If that is really a path, write it as ./%s" %
-                             (head, spec, ", ".join(_OUT_FORMATS), spec))
+            _usage("unrecognised output format %r in --out %s\n\nFORMAT must be one of: %s\n"
+                   "If that is really a path, write it as ./%s" %
+                   (head, spec, ", ".join(_OUT_FORMATS), spec))
     return None, spec
 
 def _out_workdir(path):
     """The folder an --out target lives in (the target itself when it names a folder)."""
     return path if (os.path.isdir(path) or not os.path.splitext(path)[1]) else (os.path.dirname(path) or ".")
 
+def _usage(msg):
+    """A usage error: say what is wrong, then exit 2.
+
+    `raise SystemExit("text")` prints the text but exits 1, and the documented contract is
+    `0 ok · 1 error · 2 bad usage · 3 wrong key · 4 file not found` -- so every bad-usage path was
+    returning the code for "something went wrong" instead, which a script cannot tell apart from a
+    failed decrypt.
+    """
+    log.error("%s", msg)
+    raise SystemExit(2)
+
 def _require_source(a, cmd="<command>"):
     """Every data command needs an explicit profile (or Firefox --origin). Nothing is guessed: which
     profile gets examined is always the user's choice. Fail with the paths to look in, not a bare usage line."""
-    if getattr(a, "profile", None) or getattr(a, "origin", None): return
-    raise SystemExit("no profile given. Pass the browser profile directory to examine, or --origin for a "
-                     "Firefox\nweb.whatsapp.com storage dir. Profiles are NOT auto-detected.\n\n"
-                     "Profile locations on this system:\n" + _profile_help() +
-                     "\n\nExample:\n  wawf " + cmd + " <profile-dir>")
+    prof, orig = getattr(a, "profile", None), getattr(a, "origin", None)
+    if not prof and not orig:
+        _usage("no profile given. Pass the browser profile directory to examine, or --origin for a "
+               "Firefox\nweb.whatsapp.com storage dir. Profiles are NOT auto-detected.\n\n"
+               "Profile locations on this system:\n" + _profile_help() +
+               "\n\nExample:\n  wawf " + cmd + " <profile-dir>")
+    # Checked HERE, not discovered three minutes later inside a storage reader. Pointing at a path
+    # that does not exist used to surface as `OperationalError: unable to open database file`, which
+    # says nothing about the profile being wrong -- and only after an audit database had been created
+    # for a run that could never work.
+    for what, path in (("--origin", orig), ("profile", prof)):
+        if path and not os.path.isdir(path):
+            _usage("no such %s directory:\n  %s\n\nProfile locations on this system:\n%s"
+                   % (what, path, _profile_help()))
+    if prof and not orig:
+        chromium = os.path.isdir(os.path.join(prof, "IndexedDB"))
+        firefox = os.path.isdir(os.path.join(prof, "storage", "default", "https+++web.whatsapp.com"))
+        if not chromium and not firefox:
+            _usage("that directory is not a browser profile with WhatsApp Web storage:\n  %s\n\n"
+                   "Expected either an IndexedDB folder (Chrome/Edge/Brave/Opera) or\n"
+                   "storage/default/https+++web.whatsapp.com (Firefox) inside it.\n\n"
+                   "Profile locations on this system:\n%s" % (prof, _profile_help()))
 
 def _require_session(ls, what="that profile"):
     """A browser can hold WhatsApp Web storage without being a logged-in session (site merely visited, or
     logged out). Say so plainly instead of dying with a KeyError deep inside the key derivation."""
     missing = [k for k in ("last-wid-md", "WAWebEncKeySalt", "WANoiseInfo") if k not in ls]
     if missing:
-        raise SystemExit("%s has WhatsApp Web storage but is not a logged-in session (missing: %s). Log in to "
-                         "web.whatsapp.com in that browser, or pass a different profile." % (what, ", ".join(missing)))
+        _usage("%s has WhatsApp Web storage but is not a logged-in session (missing: %s). Log in to "
+               "web.whatsapp.com in that browser, or pass a different profile." % (what, ", ".join(missing)))
 
 # ---------------- subcommands ----------------
 def _load_wa(a):
@@ -290,6 +318,16 @@ def cmd_run(a):
     outs = [_parse_out(s) for s in (a.out or [])] or [(None, "wawf_out")]
     workdir = _out_workdir(outs[0][1])
     os.makedirs(workdir, exist_ok=True)
+
+    # A named --key is checked BEFORE the expensive part. Reading the browser storage takes minutes
+    # on a real profile, and a typo in the path used to be reported only after all of it -- the run
+    # did four minutes of work to tell the user a filename was wrong.
+    if getattr(a, "key", None):
+        if not os.path.isfile(a.key):
+            log.error("--key: no such file: %s", a.key)
+            return 3
+        if not _read_key_file(a.key):
+            return 3
 
     log.info("[1/3] recovering device credentials from the profile ...")
     creds_path = os.path.join(workdir, "creds_in.json")
@@ -817,6 +855,12 @@ def cmd_decrypt(a):
     if only == "json":
         log.info("decrypted %d bodies (%d failed) -> %s/ (chats.json + identities.json)", ok, fail, a.out)
         AUDIT.artifact(f"{a.out}/chats.json", kind="decrypted chats (JSON)", records=ok)
+        # the same receipt the other formats leave: this branch returned before writing one, so a
+        # json-only export was the one kind a later --history run could not describe
+        _write_export_manifest(a.out, "cache+phone" if hist_added else "cache",
+                               {"messages": sum(len(v) for v in chats.values()), "chats": len(chats),
+                                "decrypted_from_cache": ok, "recovered_from_phone": hist_added},
+                               ("chats.json", "identities.json"))
         return 0
     WD.write_transcripts(f"{a.out}/transcripts.txt", chats, ids)
     # name what was actually written: with --out txt:PATH the JSON side is skipped, and a log line
@@ -1782,6 +1826,12 @@ def main():
         a.cmd, action = "history", cmd_history
     else:
         a.cmd, action = "decrypt", cmd_run
+    # Inputs are checked BEFORE a case database is opened. Every command here needs a profile and
+    # valid --out formats, and with the audit on by default a mistyped path was leaving a
+    # chain-of-custody file behind for a run that never started -- in the working directory, which
+    # for anyone running from a clone is the repository.
+    _require_source(a, "")
+    for _spec in (a.out or []): _parse_out(_spec)
     global AUDIT
     if not getattr(a, "no_audit", False):            # the trail is written unless asked not to
         AUDIT = audit.open_db(_audit_db_path(a), record_secrets=getattr(a, "audit_secrets", False))

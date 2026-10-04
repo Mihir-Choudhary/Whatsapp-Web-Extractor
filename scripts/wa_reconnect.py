@@ -10,7 +10,7 @@ Networked: this opens a real connection to WhatsApp and registers device activit
 authorized investigation only. Exit: 0 captured · 2 login rejected (QR/failure) · 3 opened but no key ·
 4 stream closed · 5 timeout · 6 bad input/creds.
 """
-import sys, os, json, base64, struct, argparse, re, time, zlib, urllib.request
+import sys, os, json, base64, struct, argparse, re, time, zlib, hashlib, urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _wa_tokens import TAGS, SINGLE_BYTE_TOKENS, DOUBLE_BYTE_TOKENS
@@ -261,6 +261,36 @@ def decode_binary_node(buf):
     return NodeReader(buf).node()
 
 
+def audit_attrs(attrs, limit=6):
+    """Stanza attributes for the audit trail, with key material replaced by its fingerprint.
+
+    One of these attributes IS the at-rest key -- `companion_enc_static` arrives as an attribute of
+    the post-login <success> stanza, which is the whole reason this script exists. Recording the
+    stanza verbatim therefore wrote the key into the case database in plain base64, even though the
+    crypto trail right beside it was carefully storing only a fingerprint, and even though the
+    database is documented as "not a secret store" unless --audit-secrets is given. With the audit
+    now on by default, every ordinary run did it.
+
+    The fingerprint is kept rather than dropping the attribute: that the key arrived in THAT stanza,
+    at that moment, is exactly what an examiner wants the trail to show -- and it can be checked
+    against the key file without the trail holding the secret.
+    """
+    # `is not True` on purpose: when auditing is off, A is NoAudit, whose __getattr__ hands back a
+    # lambda for every name -- so a plain truth test on an attribute it does not define reads as
+    # "secrets allowed" and would defeat this. Only a real audit that was asked for secrets gets them.
+    allow = getattr(A, "record_secrets", False) is True
+    out = {}
+    for k in list(attrs or {})[:limit]:
+        v = attrs[k]
+        if KEY_RE.search(k) and not allow:
+            try:
+                out[k] = "<redacted: sha256 %s>" % hashlib.sha256(base64.b64decode(v)).hexdigest()
+            except Exception:
+                out[k] = "<redacted>"
+        else:
+            out[k] = v
+    return out
+
 def scan_for_key(node, hits):
     if not isinstance(node, dict): return
     for k, v in (node.get("attrs") or {}).items():
@@ -373,7 +403,7 @@ def run(creds, out_path, timeout=30, log=lambda *a: None, print_key=False):
                 tag = node.get("tag")
                 log("recv <%s> %s" % (tag, {k: node["attrs"][k] for k in list(node.get("attrs", {}))[:4]}))
                 A.net("in", endpoint=WS_URL, protocol="noise/websocket", kind="stanza <%s>" % tag,
-                      detail={"attrs": {k: node["attrs"][k] for k in list(node.get("attrs", {}))[:6]}})
+                      detail={"attrs": audit_attrs(node.get("attrs"))})
                 hits = []; scan_for_key(node, hits)
                 if hits:
                     captured = hits[0][1]
