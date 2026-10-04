@@ -978,6 +978,18 @@ def _sub(script, extra, secret_env=None):
     return rc
 
 def cmd_memory(a):
+    # The scan finds candidate keys in RAM and then VALIDATES each against ciphertext from the
+    # profile -- and that reader is the Firefox one (`idb/*.sqlite`). Given a Chromium profile there
+    # is nothing to validate against, and the child reported "Could not locate a Firefox WhatsApp
+    # Web profile; pass --origin or --profile", which reads like the path was wrong when the real
+    # answer is that this mode does not cover that engine. Said here, before spawning anything.
+    if getattr(a, "profile", None) and not getattr(a, "origin", None) \
+            and os.path.isdir(os.path.join(a.profile, "IndexedDB")):
+        log.error("the memory scan validates candidate keys against a FIREFOX WhatsApp Web store, "
+                  "and that is a Chromium profile. Either point --origin at a Firefox "
+                  "storage/default/https+++web.whatsapp.com folder, or just run `wawf <PROFILE>`, "
+                  "which captures the key over the network instead.")
+        return 2
     extra = []
     if a.live: extra.append("--live")
     if a.memimage: extra += ["--memimage", a.memimage]
@@ -987,6 +999,9 @@ def cmd_memory(a):
     _k = getattr(a, "enc_static", None) or (_read_key_file(a.key) if getattr(a, "key", None)
                                             and os.path.isfile(a.key) else None)
     if a.origin: extra += ["--origin", a.origin]
+    # ...and the profile, which was never forwarded: the child then looked for a profile of its own
+    # and told the user to pass the very thing they had passed.
+    elif getattr(a, "profile", None): extra += ["--profile", a.profile]
     if a.yes: extra.append("--yes")
     return _sub("wa_forensic.py", extra, secret_env={"WAWF_ENC_STATIC": _k})
 

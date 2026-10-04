@@ -72,11 +72,14 @@ one that printed "me / them" would be unusable. Both are resolved against the ex
 `contact` and `group-metadata` stores:
 
 ```
-===== Weekend plans  [120363000000000000@g.us]  (group; 412 msgs, 390 text) =====
-  - Dev                        244358000000001@lid  919300000001@c.us
-  - Riya                       133461000000002@lid  919300000002@c.us  (me)
+===== Weekend plans  [120363000000000000@g.us]  (group; 412 msgs, 377 with text) =====
+  - Dev                       244358000000001@lid  919300000001@c.us
+  - Riya                      133461000000002@lid  919300000002@c.us  (me)
 [2026-07-03 00:50:37] ->                   Riya: I wanted to try golf at least once
 [2026-07-03 00:51:02] <-                    Dev: next weekend?
+[2026-07-03 00:51:40] <-                    Dev: (sticker)
+                                           re: I wanted to try golf at least once
+[2026-07-03 00:52:03] ->                   Riya: booking it
 ```
 
 A name comes from the address book first, then the contact's own `pushname`, then their phone number,
@@ -91,6 +94,16 @@ them — mostly sticker replies, which have no text of their own — the quoted 
 thing shown. In the transcript the quote appears under the reply as `re:`; a message that spans
 lines is continued under `|`, so every line is attributable and no message content can sit where the
 file's own structure does.
+
+**Every message gets a line**, including the ones with no text of their own — caption-less media, a
+revoked message, a call log — shown as the type the store recorded: `(sticker)`, `(image)`,
+`(revoked)`. Omitting them hid 2,374 records of a 22,084-message export from the readable artifact,
+and with them the `re:` quote on a sticker reply, which is exactly the case the own/quoted split
+exists for. The chat header counts both: `N msgs, M with text`.
+
+Bidi controls (`U+202E` and friends) are stripped on the way into the transcript, because they
+re-order how a line renders and this file's whole premise is that every line is attributable.
+`chats.json` keeps the characters the store held.
 
 `chats.json` keeps `sender` exactly as stored and **adds** `sender_name`, `sender_lid`,
 `sender_phone`, `sender_source`, `chat_name` and `quoted_text` beside it — nothing is replaced by an
@@ -159,7 +172,7 @@ A Windows drive letter is never mistaken for a `FORMAT`, so `D:\case\out` works 
 | `--origin DIR` | Firefox `web.whatsapp.com` storage folder instead of a profile folder. |
 | `--raw-include-keys` | With `--out raw:` — also dump `signal-storage` and `wawc_db_enc`. Those are key material; a dump including them must not travel with a case. |
 | `--history` | *Instead of decrypting:* pull chat history older than the browser cache from your phone, iteratively, resuming across runs. Needs Node (offers to install it). Phone-side and rate-limited — see below. |
-| `--memory (--live \| --memimage FILE)` | *Instead of reconnecting:* find the key in RAM / swap / hibernation. `--live` is Linux-only (reads `/proc`, needs root); `--memimage` works anywhere. |
+| `--memory (--live \| --memimage FILE)` | *Instead of reconnecting:* find the key in RAM / swap / hibernation. Needs a **Firefox** WhatsApp Web store to validate candidates against (`--origin`), because that is the reader this mode uses; on a Chromium profile it says so and stops. `--live` is additionally Linux-only (reads `/proc`, needs root). |
 | `--audit` | Write a chain-of-custody database beside the output (see below). |
 
 Sender resolution is **reported, not assumed** — a run prints where every label came from, so the one
@@ -231,12 +244,18 @@ all, and it keeps working after the device has been revoked, because decryption 
 wawf <PROFILE> --key companion_enc_static.txt --out D:\case\out
 ```
 
-**C. Take the key from memory** instead of the network — RAM dump, swap, or hibernation file:
+**C. Take the key from memory** instead of the network — RAM dump, swap, or hibernation file. A
+candidate found in memory is only accepted once it decrypts ciphertext from the store, and the
+reader behind that check is the Firefox one, so this mode needs a Firefox origin:
 
 ```bash
-wawf <PROFILE> --memimage dump.raw --out D:\case\out     # any OS
-wawf <PROFILE> --memory --out D:\case\out                # this machine's live browser (Linux, root)
+wawf --origin .../storage/default/https+++web.whatsapp.com --memimage dump.raw --out D:\case\out
+wawf --origin .../storage/default/https+++web.whatsapp.com --memory --out D:\case\out   # Linux, root
 ```
+
+Pointed at a Chromium profile it reports that and stops rather than searching for a Firefox profile
+of its own. For Chromium, capture the key with a normal `wawf <PROFILE>` run, or decrypt offline with
+a `--key` file.
 
 **D. No key at all.** Still useful: metadata, contacts, timestamps, media keys — everything except
 message text.
