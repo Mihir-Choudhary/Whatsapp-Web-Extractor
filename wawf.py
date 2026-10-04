@@ -1176,6 +1176,43 @@ def cmd_reconnect(a):
         log.info("at-rest key captured -> %s", os.path.abspath(a.out))
     return rc
 
+def _senderless_chats(master):
+    """The chats holding recovered messages with no sender -- the only ones a refetch has to ask.
+
+    A sender-less message is one an older extractor banked before it captured `key.participant`. In a
+    1:1 chat the sender is the chat itself and in my own messages it is me, so only group messages
+    can be missing one, which is why this is a small fraction of the chats recovered.
+    """
+    out = set()
+    for m in master.values():
+        chat = str(m.get("chat") or "")
+        if not chat or not chat.endswith("@g.us"): continue
+        if m.get("fromMe"): continue
+        if m.get("participant") or m.get("pushName"): continue
+        out.add(chat)
+    return out
+
+def _target_anchors(anchors_path, chats):
+    """Keep only the anchors for `chats`, so a refetch spends its request budget on what is broken.
+
+    Re-asking every chat that has ever been recovered is the same sweep as the original -- hours of
+    requests inside a window WhatsApp rate-limits -- when the messages missing a sender are in a
+    handful of group chats. Returns (kept, dropped); restores nothing, because the next ordinary run
+    rebuilds anchors from the profile anyway.
+    """
+    a = json.load(open(anchors_path, encoding="utf-8"))
+    anchors = list(a.get("anchors") or [])
+    keep = [x for x in anchors
+            if str(x.get("chat")) in chats or str(x.get("chat_id")) in chats]
+    if not keep:
+        return 0, len(anchors)
+    a["anchors"] = keep
+    tmp = anchors_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(a, fh)
+    os.replace(tmp, anchors_path)
+    return len(keep), len(anchors) - len(keep)
+
 def _deepen_anchors(anchors_path, master):
     """Re-anchor each chat on the OLDEST message recovered so far and add all recovered ids to the
     on-disk set, so the next history pass continues further back instead of re-pulling the same window.
@@ -1578,11 +1615,20 @@ def cmd_history(a):
     if n and not refetch:
         log.info("resuming: %s messages recovered on prior runs — continuing older than those.", f"{n:,}")
     elif n:
-        log.warning("--history-refetch: re-asking for the %s messages already recovered, to fill in "
-                    "fields an earlier run did not capture (the group sender, which older versions of "
-                    "the extractor dropped). This spends the same rate-limit budget as fetching new "
-                    "history and finds nothing new by design; run it without the flag to go deeper "
-                    "instead.", f"{n:,}")
+        gaps = _senderless_chats(master)
+        missing = sum(1 for m in master.values()
+                      if str(m.get("chat") or "").endswith("@g.us") and not m.get("fromMe")
+                      and not (m.get("participant") or m.get("pushName")))
+        if not gaps:
+            log.info("--history-refetch: every recovered message already names its sender — nothing "
+                     "to fill in. Run without the flag to fetch history deeper instead.")
+            return 0
+        kept, dropped = _target_anchors(anchors_path, gaps)
+        log.warning("--history-refetch: %s recovered message(s) in %d group chat(s) have no sender, "
+                    "because the extractor that banked them did not capture it. Re-asking those %d "
+                    "chat(s) only (%d other chat(s) set aside), so the request budget goes where the "
+                    "gap is. Nothing new is found by design; the phone must answer for this to fill "
+                    "anything in.", f"{missing:,}", len(gaps), kept, dropped)
 
     # --out now applies to a history run. The dataset it produces is the local store PLUS whatever
     # the phone returns, so it is written to its own folder (see _history_out_targets) and an earlier

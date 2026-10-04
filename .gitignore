@@ -37,6 +37,9 @@ history_*.json
 # next one gets forgotten -- onehistory_recovered.json was committable for exactly that reason.
 # Match on the naming instead of the filename.
 *recovered*.json
+# Decrypted history chunks: the primary artifact a --history run downloads, kept so a corrected
+# mapper can re-read them offline. They ARE message content, so they never go near a commit.
+history_chunks/
 *_recovered.json
 onehistory_recovered.json
 

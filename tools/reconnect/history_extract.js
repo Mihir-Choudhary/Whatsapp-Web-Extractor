@@ -59,6 +59,29 @@ function fetchBlobOnce(ref){ return new Promise((res,rej)=>{
   req.setTimeout(20000, ()=>req.destroy(new Error('socket timeout')));   // don't let a stalled CDN socket hang forever
 }); }
 async function fetchBlob(ref){ let e; for(let i=0;i<3;i++){ try{ return await fetchBlobOnce(ref); }catch(err){ e=err; await sleep(800); } } throw e; }
+// Keep every decrypted chunk. The chunk is the primary artifact -- the phone uploaded it, we
+// downloaded it once, and its CDN url expires within weeks -- while everything written elsewhere is
+// a MAPPING of it. When this extractor was missing a field (the group sender, for 29,864 messages
+// banked by earlier runs), the only way to get it back was to ask the phone again, which depends on
+// a window WhatsApp rate-limits. Had the chunks been kept, a corrected mapper could have re-read
+// them offline. Stored gzipped, which is roughly the size of the encrypted blob it came from.
+const CHUNKDIR = path.join(path.dirname(OUT), 'history_chunks');
+let chunksKept = 0, chunkBytes = 0;
+function keepChunk(inflated, hn){
+  try{
+    if(!fs.existsSync(CHUNKDIR)) fs.mkdirSync(CHUNKDIR, {recursive:true});
+    // named by the content hash, so the same chunk arriving twice (we listen on two events) is
+    // written once and a re-run does not duplicate it
+    const h = crypto.createHash('sha256').update(inflated).digest('hex').slice(0,32);
+    const f = path.join(CHUNKDIR, h + '.pb.gz');
+    if(!fs.existsSync(f)){
+      const gz = zlib.gzipSync(inflated);
+      fs.writeFileSync(f, gz);
+      chunksKept++; chunkBytes += gz.length;
+    }
+  }catch(e){ console.error('  chunk keep failed (not fatal):', e.message); }
+}
+
 function decryptHistory(blob, mediaKey){
   const exp=Buffer.from(crypto.hkdfSync('sha256', mediaKey, Buffer.alloc(32), Buffer.from('WhatsApp History Keys'), 112));
   const iv=exp.subarray(0,16), ck=exp.subarray(16,48);
@@ -330,6 +353,7 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     // promise to be filed correctly -- download it, bank it, and say so.
     let msgs=null;                  // null = download/decode error (distinct from [] = genuine empty page)
     try{ const blob=await fetchBlob(hn); const inf=decryptHistory(blob, Buffer.from(hn.mediaKey));
+         keepChunk(inf, hn);
          msgs=flatten(B.proto.HistorySync.decode(inf)); }
     catch(e){ console.error('  blob err', e.message); }
     if(!r){
@@ -604,6 +628,10 @@ function histNotif(message){ // dig through device/ephemeral wrappers
       // Exit 7 means "stopped by the cooldown breaker, not finished". The caller can then wait out
       // WhatsApp's cooldown and resume from the checkpoint rather than treating the pass as a failure;
       // a full sweep of a few hundred chats cannot fit inside one cooldown window.
+      if(chunksKept) console.error(`[*] kept ${chunksKept} decrypted history chunk(s), `
+        + `${(chunkBytes/1048576).toFixed(1)} MiB, in ${CHUNKDIR} — the primary artifact, so a `
+        + `corrected mapper can re-read them offline (rehydrate_history.js) instead of asking the `
+        + `phone again`);
       console.error(cooldownTripped
         ? '[*] stopped by the cooldown breaker — resume after the cooldown to continue deeper'
         : '[*] pagination complete');

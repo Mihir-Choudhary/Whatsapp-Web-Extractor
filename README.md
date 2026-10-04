@@ -331,16 +331,30 @@ A group message recovered from the phone carries its sender in the history proto
 runs have no author and show as `(unknown)` — in the line and in the chat's participant legend, so
 the file never claims to know who spoke when it does not.
 
-To fill those in, ask the phone for that history again:
+There are two ways to fill those in. **Offline first**, if the chunks are there:
+
+```bash
+cd tools/reconnect && node rehydrate_history.js --dry-run   # what would change
+cd tools/reconnect && node rehydrate_history.js             # apply it
+```
+
+A history chunk is the primary artifact — the phone uploaded it, the run downloaded it once, and its
+CDN url expires within weeks — while everything in `history_recovered.json` is a *mapping* of it. So
+runs keep every decrypted chunk in `history_chunks/`, and `rehydrate_history.js` re-reads them with
+the current mapper, filling fields the run that downloaded them did not capture. No network, and it
+only fills: a field the banked record already has is never overwritten.
+
+Chunks are kept from 2026-10-04 onward. A ledger banked before that has none, so its missing senders
+have to come from the phone:
 
 ```bash
 wawf <PROFILE> --history --history-refetch --out D:\case\run3
 ```
 
-That re-requests history you already have instead of going deeper, and fields the banked records are
-missing get filled in from what comes back. It finds nothing new by design, and spends the same
-rate-limit budget as fetching new history, so it is a deliberate flag rather than something a normal
-run does.
+That re-requests history you already have instead of going deeper, and asks **only the chats that
+are missing something** — on this project's own ledger that was 20 group chats out of 249, a 92%
+smaller request budget, which matters because the phone has to answer and WhatsApp rate-limits it.
+It finds nothing new by design.
 
 Where the profile cannot name a recovered sender at all, the name they chose for themselves is used
 (`sender_source: history-pushname`) — better than a bare number, and still never a guess: the
@@ -405,6 +419,7 @@ the least invasive option on an examination machine — nothing is installed and
 ### Other diagnostics
 
 ```bash
+node tools/reconnect/rehydrate_history.js --dry-run   # re-read kept chunks; what would change?
 node tools/reconnect/diag_health.js    # 60s: CONNECT / REGISTERED / SERVED, reported separately
 node tools/reconnect/diag_abprops.js   # which features the server has enabled for this client
 python3 scripts/check_identity.py --profile <PROFILE> --dir tools/reconnect
