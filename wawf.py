@@ -1665,6 +1665,7 @@ def cmd_history(a):
     COOLDOWN = int(os.environ.get("WAWF_COOLDOWN_SEC", 7200))
     MAX_COOLDOWNS = int(os.environ.get("WAWF_MAX_COOLDOWNS", 6))
     cooldowns_used = 0
+    served_any = False                                   # did the phone serve anything, any pass?
     try:
         for p in range(1, MAX_PASSES + 1):
             log.info("──── history pass %d ────", p)
@@ -1685,6 +1686,11 @@ def cmd_history(a):
                 log.error("pass %d produced no output (node exit=%s; connection failed / phone not serving) "
                           "— stopping.", p, rc); break
             WD, _ = _imp()
+            # What the phone actually served this pass, as distinct from what was NEW in it: a pass
+            # can be served hundreds of messages and have none of them be new (a refetch), or be
+            # served nothing at all (throttled). Those mean opposite things to the user.
+            served = len(passd.get("messages") or [])
+            served_any = served_any or served > 0
             new, enriched = WD.bank_history(master, passd.get("messages"))
             by = _checkpoint(accum)                          # checkpoint the accumulated set every pass
             log.info("pass %d: +%d new%s  ·  total recovered: %d across %d chats", p, new,
@@ -1708,11 +1714,26 @@ def cmd_history(a):
             # many banked records gained a field.
             progress = new + (enriched if refetch else 0)
             if progress < MIN_NEW:
-                if master:
-                    log.info("converged — last pass %s < %d. Stopping.",
-                             "enriched" if refetch else "added", MIN_NEW)
-                else:                                        # never say "converged" when nothing ever arrived
-                    log.warning("pass %d came back empty — the phone answered none of the requests. Stopping.", p)
+                # "Converged" means we reached the start of the history the phone will give us. It is
+                # NOT what happened when the phone answered nothing -- and that distinction decides
+                # whether a user should re-run later or stop asking. The old test was `if master`,
+                # which is the ACCUMULATED ledger: once any earlier run had recovered anything, a
+                # pass that was served nothing at all still reported "converged", i.e. "your history
+                # is exhausted". The client even stops after the first few silent chats, deliberately,
+                # to stay under the failure limit -- so a run can try 4 chats out of 253, be told
+                # nothing, and announce that the history had run out.
+                if served == 0:
+                    log.warning("pass %d: the phone answered NONE of the requests, so nothing was "
+                                "served this run. This is NOT the end of your history — it is the "
+                                "throttling described above. %s messages recovered previously are "
+                                "intact, and a later run continues from them.", p, f"{len(master):,}")
+                elif not master:
+                    log.warning("pass %d came back empty — the phone answered none of the requests. "
+                                "Stopping.", p)
+                else:
+                    log.info("converged — the phone served %d message(s) but %s < %d, so there is "
+                             "little left to get at this depth. Stopping.", served,
+                             "enriched" if refetch else "new", MIN_NEW)
                 break
             _deepen_anchors(anchors_path, master, only=refetch_only)   # go deeper next pass
     except KeyboardInterrupt:
@@ -1753,6 +1774,11 @@ def cmd_history(a):
     if master:
         log.info("HISTORY DONE: recovered %s messages older than the cache, across %d chats -> %s",
                  f"{len(master):,}", len(by), pass_out)
+        if not served_any:
+            log.warning("NOTE: this run was served nothing new — every message above came from "
+                        "earlier runs. The phone declined every request this time, which is the "
+                        "throttling described above and not a limit on what it holds. Re-running "
+                        "later is the normal way to get further.")
         log.warning("NOTE: this is NOT necessarily everything. What you get is whatever your phone chose to "
                     "serve — it commonly returns only part of what it holds, and the rest may come on a later "
                     "run. Re-run `wawf history` to continue deeper from here (progress is saved and deduped); "
