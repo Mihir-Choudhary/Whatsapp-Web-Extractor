@@ -576,7 +576,48 @@ function histNotif(message){ // dig through device/ephemeral wrappers
       // processing (processNodeWithBuffer) and around each app-state sync.
       const pump=setInterval(()=>{ try{ if(sock.ev.isBuffering()) sock.ev.flush(); }catch(e){} },1500);
       if(pump.unref) pump.unref();
-      await sleep(4000);
+
+      // WAIT FOR THE CONNECTION TO SETTLE BEFORE ASKING FOR ANYTHING.
+      //
+      // A cold NetLog capture of WhatsApp Web (2026-10-06, three days since the last session) shows
+      // what a connect actually looks like. Login completes 686 ms after the socket opens (215-byte
+      // handshake out at +9.714s, serverHello in at +9.984s, the first encrypted stanza right
+      // behind it). Then the primary streams the catch-up: 721,901 bytes over 560 inbound frames
+      // spread across roughly THIRTY SECONDS, in waves of 15/32/65/97/57/94/72/52/84 KB, each wave
+      // answered by a burst of per-message receipts (146 of them, ~534 bytes each; 83 receipt
+      // frames inside one second at +28s). Only then does the connection go quiet -- a few hundred
+      // bytes a second of keepalive.
+      //
+      // The one on-demand history request in that capture went out at +61.6s: 52 s after login and
+      // 21 s after the last bulk wave, onto a fully settled connection, and it was answered in
+      // 1.509 s. Much of those 52 s is a human finding a chat and clicking, so this is NOT evidence
+      // that the reference client deliberately waits -- but it IS the condition under which the
+      // request that worked was made. We fired ours after a flat 4-second sleep, i.e. in the middle
+      // of the inbound flood with hundreds of kilobytes still arriving and the offline queue not
+      // drained. Aligning the condition is cheap. It is not a proven fix and is not claimed as one.
+      //
+      // Wait for QUIET_MS with no inbound stanza, bounded by SETTLE_MAX_MS so a large account
+      // cannot stall a run, and never shorter than the 4 s this replaced.
+      const QUIET=Number(process.env.SETTLE_QUIET_MS||3000);
+      const SETTLE_MAX=Number(process.env.SETTLE_MAX_MS||90000);
+      let lastIn=Date.now(), inboundSeen=0, offlineDone=false;
+      const bump=()=>{ lastIn=Date.now(); inboundSeen++; };
+      for(const tag of ['CB:message','CB:notification','CB:receipt','CB:ack','CB:iq']){
+        try{ sock.ws.on(tag, bump); }catch(e){}
+      }
+      // Baileys' own "offline queue fully handled" marker, recorded for the log line only -- not a
+      // gate, because the comment above explains why it can never arrive when a payload will not
+      // decrypt. The quiet period is what actually releases us.
+      try{ sock.ws.on('CB:ib', node=>{ bump();
+        try{ if((node.content||[]).some(c=>c&&c.tag==='offline')) offlineDone=true; }catch(e){} }); }catch(e){}
+      const settleStart=Date.now();
+      await sleep(4000);                                  // the floor this replaced
+      while(Date.now()-settleStart < SETTLE_MAX && Date.now()-lastIn < QUIET){
+        await sleep(250);
+      }
+      console.error(`[i] connection settled in ${((Date.now()-settleStart)/1000).toFixed(1)}s `
+        +`(${inboundSeen} inbound stanza(s), offline marker ${offlineDone?'seen':'not seen'}) — the `
+        +`reference client's one observed on-demand request was made on a settled connection`);
       // Rebuild the Signal session with our own primary device from a freshly fetched prekey
       // bundle before asking it for anything. The copy in the browser profile is a snapshot of a
       // live ratchet the phone has since advanced, so its replies would arrive on a chain we
