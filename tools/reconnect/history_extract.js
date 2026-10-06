@@ -108,7 +108,21 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   const A=JSON.parse(fs.readFileSync(mustFind('anchors.json')));
   if(!A||!Array.isArray(A.anchors)||!Array.isArray(A.ondisk_ids)) throw new Error("anchors.json malformed: need {anchors:[...], ondisk_ids:[...]}");
   for(const a of A.anchors){ if(!a.chat||!a.oldest_id||a.oldest_ts==null) throw new Error("anchors.json entry missing chat/oldest_id/oldest_ts: "+JSON.stringify(a).slice(0,80)); }
-  const ondisk=new Set(A.ondisk_ids); const targets=A.anchors.slice(0,TOP);
+  const ondisk=new Set(A.ondisk_ids);
+  // `more_on_primary === false` means the primary has nothing older for this chat. build_anchors sets
+  // it from primaryHasMoreMessagesReadyToLoad(), and the deepen step now also sets it when the phone
+  // itself answers "start reached". Asking those chats again cannot produce a message, and it is not
+  // free: an unanswered request counts toward history_sync_on_demand_failure_limit, and the probe
+  // below judges the whole run by its first few chats. Measured on this project's own ledger: the
+  // phone said "start reached" for 103 of 253 chats, nothing recorded it, and they stayed at the
+  // FRONT of the queue -- so later runs spent the probe on drained chats and reported the phone as
+  // unresponsive, having asked 4 chats out of 253.
+  const askable=A.anchors.filter(a=>a.more_on_primary!==false);
+  const drained=A.anchors.length-askable.length;
+  if(drained) console.error(`[i] skipping ${drained} chat(s) the primary has nothing older for`);
+  const targets=askable.slice(0,TOP);
+  // Chats the phone explicitly ended this run, reported back so the anchors remember it.
+  const startReached=new Set();
   const bb=b=>Buffer.from(b,'base64');
   const creds=B.initAuthCreds();
   creds.noiseKey={private:bb(inp.noise_priv),public:bb(inp.noise_pub)};
@@ -327,7 +341,8 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   const writeOut=()=>{ try{
     const arr=[...all.values()]; const nw=arr.filter(m=>!ondisk.has(m.id));
     const byChat={}; for(const m of nw) byChat[m.chat]=(byChat[m.chat]||0)+1;
-    fs.writeFileSync(OUT+'.tmp', JSON.stringify({recovered_total:arr.length, new_not_on_disk:nw.length, by_chat:byChat, messages:nw},null,1));
+    fs.writeFileSync(OUT+'.tmp', JSON.stringify({recovered_total:arr.length, new_not_on_disk:nw.length,
+      by_chat:byChat, start_reached:[...startReached], messages:nw},null,1));
     fs.renameSync(OUT+'.tmp', OUT);
     return {tot:arr.length, nw:nw.length, chats:Object.keys(byChat).length};
   }catch(e){ console.error('  [checkpoint err]', e.message); return null; } };
@@ -485,11 +500,33 @@ function histNotif(message){ // dig through device/ephemeral wrappers
       const _me = ownDevice ? ownDevice.state.creds.me : {id:inp.me_id,lid:inp.lid};
       try{
         const selfJids=[...new Set([_me.lid,_me.id].filter(Boolean).map(B.jidNormalizedUser))];
-        // force=false: only fetch a prekey bundle if we genuinely have no session. Forcing a fresh
-        // handshake on EVERY connect (~56 times over three days) burns one of the peer's one-time
-        // prekeys each time and makes us look like a client that cannot hold a session.
-        const fetched=await sock.assertSessions(selfJids,false);
-        console.error(fetched?'[i] no session with our own device — negotiated one'
+        // force: renegotiate the session with our own primary even when we already have one.
+        //
+        // This was force=false for a while, reasoning that a fresh handshake on every connect
+        // (~56 times over three days of development) burns one of the peer's one-time prekeys and
+        // makes us look like a client that cannot hold a session. Both halves of that are true and
+        // neither survives the measurement: the session we were "reusing" was unusable. One run,
+        // 60 seconds, every failure on the ONE address 123456789012345.0 -- our own primary:
+        //   1686 x "Bad MAC", then, after further divergence,
+        //     45 x "MessageCounterError: Key used already or never filled"
+        // which is precisely a chain index we have already consumed. The phone's replies arrive on
+        // that session, so none of them could be read, and an unreadable reply is indistinguishable
+        // from no reply: the run logged "no response" for every chat and the tool reported the phone
+        // as throttling. A chat that had served 451 messages the run before returned nothing.
+        //
+        // It is nevertheless OFF by default, because forcing it was then measured and did NOT help:
+        //   reused session  -> 1686 Bad MAC,  45 MessageCounterError, 0 chats served
+        //   forced new one  -> 2223 Bad MAC,  57 MessageCounterError, 0 chats served
+        // and that result makes sense. assertSessions rebuilds the session we SEND on, and sending
+        // was never broken: the server acks our request in 0.2s. What is broken is the phone's
+        // SENDING chain to this device, and a peer's chain can only be reset by the peer, prompted
+        // by our retry receipts. Renegotiating our own direction costs a one-time prekey and moves
+        // nothing. FORCE_SELF_SESSION=1 turns it on, for re-measuring.
+        const forceSelf=process.env.FORCE_SELF_SESSION==='1';
+        const fetched=await sock.assertSessions(selfJids,forceSelf);
+        console.error(fetched?(forceSelf?'[i] renegotiated the Signal session with our own device '
+                                        +'— replies arrive on a ratchet we hold end to end'
+                                        :'[i] no session with our own device — negotiated one')
                              :'[i] reusing the existing Signal session with our own device');
         if(Object.keys(appStateKeys).length){
           try{ await sock.resyncAppState(B.ALL_WA_PATCH_NAMES,true);
@@ -590,7 +627,13 @@ function histNotif(message){ // dig through device/ephemeral wrappers
             break; }
           if(pg===0) served++;
           noteSuccess();
-          if(!msgs.length){ console.error(`  ${a.chat.slice(0,22)} page${pg}: empty (start reached)`); break; }
+          if(!msgs.length){ console.error(`  ${a.chat.slice(0,22)} page${pg}: empty (start reached)`);
+            // An ANSWER, not a silence: the phone located the anchor and had nothing before it. That
+            // is the one unambiguous end-of-history signal we get, so persist it rather than
+            // rediscovering it every run. (Silence is different and deliberately not recorded here:
+            // an unanswered request can also be a reply we failed to decrypt.)
+            startReached.add(a.chat); if(a.chat_id) startReached.add(a.chat_id);
+            writeOut(); break; }
           for(const m of msgs) all.set(m.id,m);
           got+=msgs.length; msgs.sort((x,y)=>x.ts-y.ts); const o=msgs[0];
           const newc=msgs.filter(m=>!ondisk.has(m.id)).length;
@@ -617,9 +660,12 @@ function histNotif(message){ // dig through device/ephemeral wrappers
           // device query instead of inferring from silence.
           console.error(`
 [!] the first ${PROBE} chats returned NOTHING -- stopping rather than grinding through `
-            +`${targets.length} chats. This does not by itself mean the device was revoked. Run `
-            +`tools/reconnect/diag_health.js: it reports CONNECT / REGISTERED / SERVED separately, `
-            +`and only a REGISTERED failure means the linked device is gone.`);
+            +`${targets.length} chats. Read this as a fact about THOSE ${PROBE} chats: it is `
+            +`${PROBE}/${targets.length} of the queue, it does not mean the phone is unresponsive, `
+            +`and it does not by itself mean the device was revoked. A chat the phone has ended `
+            +`answers "start reached" once and is then skipped, so the head of the queue improves `
+            +`each run. Run tools/reconnect/diag_health.js: it reports CONNECT / REGISTERED / `
+            +`SERVED separately, and only a REGISTERED failure means the linked device is gone.`);
           break;
         }
         if(probed%10===0 || probed===targets.length) progress(probed, targets.length);

@@ -138,6 +138,38 @@ check("...keeping its wire form and more_on_primary",
       (g["chat"], g["more_on_primary"]), ("1203@g.us", True))
 
 print()
+print("_deepen_anchors: the phone's 'start reached' is recorded, and drained chats go last")
+# This is the bug that produced "the phone answered NONE of the requests". An empty page is the
+# phone ANSWERING that it has nothing older -- the one unambiguous end-of-history signal there is.
+# Nothing recorded it, so 103 of 253 chats kept more_on_primary=True, and the old ordering ("chats
+# we just went deeper on first") put exactly those drained chats at the HEAD of the queue. The
+# client probes its first few chats and then stops, so every later run spent the probe on chats
+# already known to be finished and reported the phone as unresponsive -- having asked 4 of 253.
+json.dump({"anchors": [
+    {"chat": "ended@g.us", "chat_id": "ended@g.us", "more_on_primary": True,
+     "oldest_id": "E0", "oldest_ts": 1_760_000_000, "oldest_fromMe": False},
+    {"chat": "live@s.whatsapp.net", "chat_id": "live@lid", "more_on_primary": True,
+     "oldest_id": "L0", "oldest_ts": 1_760_000_000, "oldest_fromMe": False},
+    {"chat": "bylid@s.whatsapp.net", "chat_id": "bylid@lid", "more_on_primary": True,
+     "oldest_id": "M0", "oldest_ts": 1_760_000_000, "oldest_fromMe": False}],
+    "ondisk_ids": []}, open(ap, "w", encoding="utf-8"))
+wawf._deepen_anchors(ap, {
+    "E1": {"id": "E1", "chat": "ended@g.us", "ts": 1_759_000_000, "fromMe": False},
+    "L1": {"id": "L1", "chat": "live@s.whatsapp.net", "ts": 1_759_000_000, "fromMe": False}},
+    start_reached={"ended@g.us", "bylid@lid"})       # one matched by `chat`, one by its `chat_id`
+a = json.load(open(ap, encoding="utf-8"))
+order = [str(x["chat"]) for x in a["anchors"]]
+by = {str(x["chat"]): x for x in a["anchors"]}
+check("the chat the phone ended is marked", by["ended@g.us"]["more_on_primary"], False)
+check("matched by chat_id too", by["bylid@s.whatsapp.net"]["more_on_primary"], False)
+check("a chat that still answers is untouched", by["live@s.whatsapp.net"]["more_on_primary"], True)
+check("an askable chat leads the queue, so the probe samples a live one", order[0],
+      "live@s.whatsapp.net")
+check("both drained chats sit at the end",
+      sorted(order[-2:]), ["bylid@s.whatsapp.net", "ended@g.us"])
+check("being ended does not throw the anchor away", by["ended@g.us"]["oldest_id"], "E1")
+
+print()
 if fails:
     print(f"FAILED ({len(fails)}): " + ", ".join(fails))
     sys.exit(1)

@@ -40,6 +40,12 @@ const argv = process.argv.slice(2);
 const arg = (f, d) => { const i = argv.indexOf(f); return i >= 0 ? argv[i + 1] : d; };
 const WAIT = Number(arg('--wait', 60)) * 1000;
 const WANT = arg('--chat', null);
+// --as re-addresses the SAME anchor under a different jid, which is the only way to test whether the
+// ADDRESSING form is what decides being served, holding the anchor (chat, oldest id/ts) constant.
+// build_anchors puts the wire `@s.whatsapp.net` form in `chat` and the local id in `chat_id`; for a
+// LID-migrated 1:1 chat those differ, and measured over the 6 chats one run happened to ask in both
+// forms, PN-addressed returned 3 messages in total while LID-addressed returned 1,157.
+const AS = arg('--as', null);
 
 const red = s => String(s == null ? '' : s).replace(/\d{5,}/g, m => m.slice(0, 4) + '*'.repeat(m.length - 4));
 const bb = b => Buffer.from(b, 'base64');
@@ -86,6 +92,7 @@ const brief = node => {
 
 (async () => {
   console.error(`[one] device :${inp.device}  announcing ${version.join('.')}`);
+  if (AS) console.error(`[one] ADDRESSING IT AS: ${red(AS)}  (anchor's own chat is ${red(a.chat)})`);
   console.error(`[one] asking ONE chat: ${red(a.chat)}`
     + (a.chat_id && a.chat_id !== a.chat ? `  (local id ${red(a.chat_id)})` : '')
     + `  oldest_ts=${a.oldest_ts}`);
@@ -189,7 +196,7 @@ const brief = node => {
 
     const selfLid = creds.me && creds.me.lid ? B.jidNormalizedUser(creds.me.lid) : null;
     const tsMs = a.oldest_ts > 1e12 ? a.oldest_ts : a.oldest_ts * 1000;
-    const req = { chatJid: a.chat, oldestMsgId: a.oldest_id, oldestMsgFromMe: !!a.oldest_fromMe,
+    const req = { chatJid: AS || a.chat, oldestMsgId: a.oldest_id, oldestMsgFromMe: !!a.oldest_fromMe,
       onDemandMsgCount: 50, oldestMsgTimestampMs: tsMs, supportInlineResponse: true };
     const pdo = { historySyncOnDemandRequest: req,
       peerDataOperationRequestType: B.proto.Message.PeerDataOperationRequestType.HISTORY_SYNC_ON_DEMAND };
