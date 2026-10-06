@@ -1602,6 +1602,27 @@ def cmd_history(a):
                 "hours at a time when the limit trips. Progress is checkpointed after every page, so "
                 "stopping it costs nothing and re-running simply continues deeper. An empty pass is a "
                 "known outcome, not a failure.")
+    # Which registration the run uses decides whether on-demand history keeps working at all, and
+    # it was previously visible only as one informational line from the Node client. Riding the
+    # profile's registration works while its Signal snapshot is still near the primary's ratchet and
+    # decays after that, with a symptom -- every request silent -- that reads as a phone problem.
+    if not os.path.isdir(os.path.join(rec, "wawf_device")):
+        log.warning("MODE: this run rides the BROWSER PROFILE's registration, because this tool has "
+                    "not been paired as its own device. On-demand history is a REQUEST TO THE LIVE "
+                    "PRIMARY PHONE -- it is not recoverable from the image, and the profile's Signal "
+                    "material is a snapshot of a ratchet the phone keeps advancing. It serves history "
+                    "while that snapshot is still current and then stops, and nothing on disk can "
+                    "repair it. Everything else this tool extracts (cached messages, contacts, media, "
+                    "identities, app-state) comes from the files and is unaffected.")
+        log.warning("TO MAKE HISTORY KEEP WORKING: pair this tool as its own linked device, once -- "
+                    "`node tools/reconnect/pair.js`. It then holds its own Noise key, Signal identity "
+                    "and prekeys, so the session is ours to keep current and nothing this tool does "
+                    "can degrade the subject's own linked device. It needs lawful access to the "
+                    "UNLOCKED PHONE once: companion linking requires approval on the primary, and no "
+                    "tool can re-link from disk artifacts alone -- if one could, anyone holding a copy "
+                    "of an old profile could attach to the account permanently. FORENSIC NOTICE: it "
+                    "creates a NEW device, visible in the phone's Linked Devices list and notified to "
+                    "the account holder. That is an overt act and belongs in the case notes.")
     log.warning("FOR THE BEST CHANCE: keep WhatsApp open on your phone with a stable network, and "
                 "CLOSE every web.whatsapp.com tab -- a live web session competes for the same linked "
                 "device. If a run comes back empty, do not immediately retry: that burns the failure "

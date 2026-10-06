@@ -419,6 +419,7 @@ the least invasive option on an examination machine — nothing is installed and
 ### Other diagnostics
 
 ```bash
+node tools/reconnect/pair.js           # one-time: link the tool as its OWN device (needs the phone)
 node tools/reconnect/rehydrate_history.js --dry-run   # re-read kept chunks; what would change?
 node tools/reconnect/diag_health.js    # 60s: CONNECT / REGISTERED / SERVED, reported separately
 node tools/reconnect/diag_abprops.js   # which features the server has enabled for this client

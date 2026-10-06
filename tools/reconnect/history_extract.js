@@ -188,6 +188,26 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   // Only meaningful when riding the browser profile's registration. With our own paired device the
   // profile's session count is irrelevant -- ownDevice.state carries its own keys.
   if(!ownDevice&&!rt.stats.sessions&&!rt.stats.carried) console.error('[!] no Signal sessions recovered -- inbound messages will NOT decrypt; re-run the credential export against the browser profile');
+  // Browser-profile mode WORKS, and then stops working, and the difference is not visible anywhere
+  // else. The profile's Signal material is a SNAPSHOT of a ratchet the primary keeps advancing: it
+  // serves history while it is still close to the primary's current chain, and decays as the
+  // primary sends messages this device never decrypted. Miss one DH ratchet step and nothing after
+  // it is readable -- and because nothing in that chain can be re-derived from disk, the decay is
+  // not repairable from the profile. Measured here: the browser last wrote its IndexedDB 2026-10-03,
+  // history served 142 pages on 2026-10-05, and from 2026-10-05 18:48 onward every request came back
+  // silent while every decrypt failure in the run was on one address -- the account's own primary.
+  // This was then read as the phone throttling us, which sent the analyst to look at the phone.
+  if(!ownDevice) console.error(
+    '[!] MODE: riding the BROWSER PROFILE\'s registration. On-demand history works from this only\n'
+   +'    while the profile\'s Signal snapshot is still near the primary\'s current ratchet, and it\n'
+   +'    decays with time since WhatsApp Web last ran -- the replies stop being decryptable and the\n'
+   +'    symptom is indistinguishable from the phone not answering. It is not repairable from disk.\n'
+   +'    For history that keeps working, pair this tool as its OWN device once:\n'
+   +'        node tools/reconnect/pair.js\n'
+   +'    That needs lawful access to the unlocked phone ONCE (companion linking requires approval on\n'
+   +'    the primary -- no tool can re-link from disk artifacts alone), creates a NEW device visible\n'
+   +'    in Linked Devices, and must be recorded in the case notes. Afterwards the session is ours to\n'
+   +'    repair and nothing this tool does touches the subject\'s own linked device.');
   // Announce the build THIS profile's browser runs, taken from its own WAVersionBase, in preference to
   // Baileys' default of asking a third-party endpoint (fetchLatestBaileysVersion) and falling back to a
   // hardcoded constant. Not cosmetic: WhatsApp gates on-demand history on an AB prop
@@ -317,8 +337,19 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   // either. Record it as unrecoverable and move on.
   const MAX_DECRYPT_ATTEMPTS=Number(process.env.MAX_DECRYPT_ATTEMPTS||3);
   const unrecoverable=[]; const reportedUndecryptable=new Set();
+  // Undecryptable traffic FROM OUR OWN ACCOUNT's primary, counted separately from everything else.
+  // This is the number that distinguishes a quiet phone from a ratchet we have lost: the primary is
+  // the only peer whose replies carry history, so a pile of unreadable stanzas from it explains an
+  // empty run, and a pile from other contacts does not.
+  const _selfUsers=new Set([ownDevice?(ownDevice.state.creds.me||{}).lid:inp.lid,
+                            ownDevice?(ownDevice.state.creds.me||{}).id :inp.me_id]
+    .filter(Boolean).map(x=>String(x).split('@')[0].split(':')[0]));
+  const selfFail={total:0, peer:0};
   sock.ev.on('messages.upsert',u=>{ for(const m of (u.messages||[])){
     if(m.messageStubType!==B.proto.WebMessageInfo.StubType.CIPHERTEXT||!m.key) continue;
+    if(_selfUsers.has(String(m.key.remoteJid||'').split('@')[0].split(':')[0])){
+      selfFail.total++; if(peerIds.has(m.key.id)) selfFail.peer++;
+    }
     if(peerIds.has(m.key.id)){
       Promise.resolve(sock.sendReceipt(m.key.remoteJid,undefined,[m.key.id],'peer_msg')).catch(()=>{});
       continue;
@@ -678,6 +709,27 @@ function histNotif(message){ // dig through device/ephemeral wrappers
         + `${(chunkBytes/1048576).toFixed(1)} MiB, in ${CHUNKDIR} — the primary artifact, so a `
         + `corrected mapper can re-read them offline (rehydrate_history.js) instead of asking the `
         + `phone again`);
+      // Nothing served, and we can say WHY rather than leave the analyst guessing at the phone.
+      // The primary is the only peer whose replies carry history, so unreadable stanzas from it are
+      // the explanation; unreadable stanzas from anyone else are unrelated noise.
+      if(!served){
+        if(selfFail.peer>0) console.error(
+          `\n[DIAGNOSIS] ${selfFail.peer} repl(ies) from the account's own primary arrived and could `
+         +`NOT be decrypted. The phone IS answering; this device cannot read the answers, because the `
+         +`Signal ratchet it holds has diverged from the primary's.`);
+        else if(selfFail.total>0) console.error(
+          `\n[DIAGNOSIS] no reply arrived, and ${selfFail.total} stanza(s) from the account's own `
+         +`primary could not be decrypted on this connection. That is a lost ratchet, not a quiet `
+         +`phone: the primary is re-sending a backlog this device has no keys for, and a request `
+         +`whose reply would travel the same broken chain is not answered usefully.`);
+        else console.error(
+          `\n[DIAGNOSIS] no reply arrived and nothing from the primary failed to decrypt, so the `
+         +`session is healthy and the chats asked simply were not served. Re-run later.`);
+        if(!ownDevice&&(selfFail.total>0||selfFail.peer>0)) console.error(
+          `            Not repairable from the profile: the missing ratchet steps were never on disk.\n`
+         +`            Pair this tool as its own device once (node tools/reconnect/pair.js) and the\n`
+         +`            session becomes ours to keep current, independent of the browser.`);
+      }
       console.error(cooldownTripped
         ? '[*] stopped by the cooldown breaker — resume after the cooldown to continue deeper'
         : '[*] pagination complete');
