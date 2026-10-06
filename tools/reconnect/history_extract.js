@@ -79,7 +79,64 @@ function keepChunk(inflated, hn){
       fs.writeFileSync(f, gz);
       chunksKept++; chunkBytes += gz.length;
     }
-  }catch(e){ console.error('  chunk keep failed (not fatal):', e.message); }
+    return true;                   // we hold the artifact; releasing the server copy is now safe
+  }catch(e){ console.error('  chunk keep failed (not fatal):', e.message); return false; }
+}
+
+// RELEASE THE CONSUMED CHUNK, the way the reference client does.
+//
+// From a cold NetLog capture of WhatsApp Web (2026-10-06, no browser session for three days): one
+// click on "load earlier messages" produced, 1.509s after the request went out,
+//   GET    /v/t62.31111-24/<name>.enc?ccb=11-4&oh=<sig>&oe=<exp>&_nc_sid=..&hash=<b64url fileEncSha256>
+//            &mms-type=md-msg-hist                       -> 200, 5370 bytes
+//   OPTIONS /mms/md-msg-hist/<b64url fileEncSha256>=?...  -> 200 (the browser's CORS preflight)
+//   DELETE  /mms/md-msg-hist/<b64url fileEncSha256>=?token=<same, url-encoded>
+//            &d_md=<b64url directPath, unpadded>&auth=<media_conn auth>  -> 200
+// The DELETE is issued ONLY for mms-type=md-msg-hist: the md-app-state blob and every media,
+// sticker and thumbnail fetch in the same capture were left in place. So it is not generic CDN
+// housekeeping -- it is how a companion says "this history chunk is consumed".
+//
+// We never sent it. 142 pages were downloaded across earlier runs and every one of those chunks was
+// left outstanding. Whether the primary gates further on-demand requests on outstanding chunks is
+// NOT established here -- what is established is that the reference client always releases them and
+// we never did, which makes us the anomaly on the one request whose refusal we cannot see a reason
+// for. The preflight is a browser requirement and is skipped; node is not subject to CORS.
+//
+// FORENSIC NOTE: this deletes a server-side object -- but one the phone created seconds earlier in
+// response to OUR request, and only after the decrypted chunk is on disk in history_chunks/, so the
+// evidence is retained locally first. Leaving it instead is itself a deviation from the reference
+// client. HIST_CHUNK_DELETE=0 disables it.
+let mediaAuth = null;              // cached media_conn auth token (ttl is minutes, a run is longer)
+let released = 0, releaseFailed = 0;
+async function releaseChunk(sock, hn, signedUrl){
+  if(process.env.HIST_CHUNK_DELETE === '0') return;
+  try{
+    if(!hn || !hn.fileEncSha256 || !hn.directPath) return;
+    if(!mediaAuth){
+      const mc = await sock.refreshMediaConn();
+      mediaAuth = mc && mc.auth;
+      if(!mediaAuth) return;
+      // prefer the PoP host the chunk itself came from; fall back to the media_conn host list
+      if(!releaseChunk._host && mc && mc.hosts && mc.hosts.length) releaseChunk._host = mc.hosts[0].hostname;
+    }
+    const b64url = b => Buffer.from(b).toString('base64').replace(/\+/g,'-').replace(/\//g,'_');
+    const hash = b64url(hn.fileEncSha256);                       // padding kept, as in the capture
+    const d_md = b64url(Buffer.from(hn.directPath,'utf8')).replace(/=+$/,'');   // unpadded
+    let host = releaseChunk._host;
+    if(signedUrl){ const m = /^https:\/\/([^/]+)\//.exec(signedUrl); if(m) host = m[1]; }
+    if(!host) return;
+    const qs = 'token=' + encodeURIComponent(hash) + '&d_md=' + d_md
+             + '&auth=' + encodeURIComponent(mediaAuth);
+    const target = 'https://' + host + '/mms/md-msg-hist/' + hash + '?' + qs;
+    const code = await new Promise(res=>{
+      const req = https.request(target, {method:'DELETE', headers:CDN_HEADERS}, r=>{ r.resume(); res(r.statusCode); });
+      req.on('error', ()=>res(0));
+      req.setTimeout(10000, ()=>req.destroy());
+      req.end();
+    });
+    if(code === 200) released++;
+    else { releaseFailed++; if(releaseFailed <= 3) console.error('  chunk release -> HTTP ' + code); }
+  }catch(e){ releaseFailed++; if(releaseFailed <= 3) console.error('  chunk release failed:', e.message); }
 }
 
 function decryptHistory(blob, mediaKey){
@@ -399,8 +456,10 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     // promise to be filed correctly -- download it, bank it, and say so.
     let msgs=null;                  // null = download/decode error (distinct from [] = genuine empty page)
     try{ const blob=await fetchBlob(hn); const inf=decryptHistory(blob, Buffer.from(hn.mediaKey));
-         keepChunk(inf, hn);
-         msgs=flatten(B.proto.HistorySync.decode(inf)); }
+         const held=keepChunk(inf, hn);
+         msgs=flatten(B.proto.HistorySync.decode(inf));
+         // only after the chunk is decoded AND on disk: release the server copy, as the browser does
+         if(held) await releaseChunk(sock, hn, hn && hn.url); }
     catch(e){ console.error('  blob err', e.message); }
     if(!r){
       if(msgs&&msgs.length){
@@ -730,6 +789,10 @@ function histNotif(message){ // dig through device/ephemeral wrappers
          +`            Pair this tool as its own device once (node tools/reconnect/pair.js) and the\n`
          +`            session becomes ours to keep current, independent of the browser.`);
       }
+      if(released || releaseFailed)
+        console.error(`[*] released ${released} consumed history chunk(s) back to the CDN`
+          + (releaseFailed ? `, ${releaseFailed} release(s) failed` : '')
+          + ' — what the reference client does after reading each one');
       console.error(cooldownTripped
         ? '[*] stopped by the cooldown breaker — resume after the cooldown to continue deeper'
         : '[*] pagination complete');
