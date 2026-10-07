@@ -180,6 +180,9 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   const targets=askable.slice(0,TOP);
   // Chats the phone explicitly ended this run, reported back so the anchors remember it.
   const startReached=new Set();
+  // ...and which chats answered at all versus stayed silent on their first page. The caller keeps a
+  // running count per chat, so one that is silent run after run stops leading the queue.
+  const silentChats=new Set(), answeredChats=new Set();
   const bb=b=>Buffer.from(b,'base64');
   const creds=B.initAuthCreds();
   creds.noiseKey={private:bb(inp.noise_priv),public:bb(inp.noise_pub)};
@@ -430,7 +433,8 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     const arr=[...all.values()]; const nw=arr.filter(m=>!ondisk.has(m.id));
     const byChat={}; for(const m of nw) byChat[m.chat]=(byChat[m.chat]||0)+1;
     fs.writeFileSync(OUT+'.tmp', JSON.stringify({recovered_total:arr.length, new_not_on_disk:nw.length,
-      by_chat:byChat, start_reached:[...startReached], messages:nw},null,1));
+      by_chat:byChat, start_reached:[...startReached], silent_chats:[...silentChats],
+      answered_chats:[...answeredChats], messages:nw},null,1));
     fs.renameSync(OUT+'.tmp', OUT);
     return {tot:arr.length, nw:nw.length, chats:Object.keys(byChat).length};
   }catch(e){ console.error('  [checkpoint err]', e.message); return null; } };
@@ -753,10 +757,10 @@ function histNotif(message){ // dig through device/ephemeral wrappers
         for(let pg=0; pg<MAXPAGES; pg++){
           const msgs=await requestPage(key, ts);
           if(msgs===null){ console.error(`  ${a.chat.slice(0,22)} page${pg}: no response`);
-            if(pg===0){ probeSilent++; silent++; }
+            if(pg===0){ probeSilent++; silent++; silentChats.add(a.chat); writeOut(); }
             noteFailure();
             break; }
-          if(pg===0) served++;
+          if(pg===0){ served++; answeredChats.add(a.chat); }
           noteSuccess();
           if(!msgs.length){ console.error(`  ${a.chat.slice(0,22)} page${pg}: empty (start reached)`);
             // An ANSWER, not a silence: the phone located the anchor and had nothing before it. That

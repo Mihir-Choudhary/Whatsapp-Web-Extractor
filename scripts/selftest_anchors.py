@@ -170,6 +170,51 @@ check("both drained chats sit at the end",
 check("being ended does not throw the anchor away", by["ended@g.us"]["oldest_id"], "E1")
 
 print()
+print("chat state: outcomes survive the anchors being rebuilt from the profile")
+# The first version of the end-of-history fix recorded "ended" only inside anchors.json. wawf rebuilds
+# that file from the browser profile at the start of every run, so the marks were gone before the
+# client started: a real run asked the same four finished chats again and stopped. The outcomes now
+# live in their own file and are re-applied to whatever build_anchors produces.
+sp = os.path.join(os.path.dirname(ap), "chat_state_selftest.json")
+if os.path.exists(sp): os.remove(sp)
+st = wawf._load_chat_state(sp)
+check("a missing state file is an empty state", (st["ended"], st["silent"]), (set(), {}))
+wawf._note_pass(st, {"start_reached": ["ended@g.us"], "silent_chats": ["mute@g.us", "flaky@g.us"],
+                     "answered_chats": ["good@g.us"]})
+wawf._note_pass(st, {"silent_chats": ["mute@g.us"], "answered_chats": ["flaky@g.us"]})
+check("silence accumulates run over run", st["silent"].get("mute@g.us"), 2)
+check("any answer clears the silent count", "flaky@g.us" in st["silent"], False)
+wawf._save_chat_state(sp, st)
+st2 = wawf._load_chat_state(sp)
+check("round-trips through disk", (st2["ended"], st2["silent"]), ({"ended@g.us"}, {"mute@g.us": 2}))
+
+# a FRESHLY REBUILT anchors file: nothing marked, in the order build_anchors happened to emit
+json.dump({"anchors": [
+    {"chat": "mute@g.us", "chat_id": "mute@g.us", "more_on_primary": True,
+     "oldest_id": "M0", "oldest_ts": 1_760_000_000, "oldest_fromMe": False},
+    {"chat": "ended@g.us", "chat_id": "ended@g.us", "more_on_primary": True,
+     "oldest_id": "E0", "oldest_ts": 1_760_000_000, "oldest_fromMe": False},
+    {"chat": "good@g.us", "chat_id": "good@g.us", "more_on_primary": True,
+     "oldest_id": "G0", "oldest_ts": 1_760_000_000, "oldest_fromMe": False}],
+    "ondisk_ids": []}, open(ap, "w", encoding="utf-8"))
+ledger = os.path.join(os.path.dirname(ap), "ledger_selftest.json")
+json.dump({"messages": [{"id": "G1", "chat": "good@g.us", "ts": 1_759_000_000, "fromMe": False}]},
+          open(ledger, "w", encoding="utf-8"))
+wawf._resume_master(ledger, ap, {}, deepen=True, chat_state=st2)
+a = json.load(open(ap, encoding="utf-8"))
+order = [str(x["chat"]) for x in a["anchors"]]
+by = {str(x["chat"]): x for x in a["anchors"]}
+check("the ended chat is marked again after a rebuild", by["ended@g.us"]["more_on_primary"], False)
+check("queue: answerable first, repeatedly-silent next, ended last",
+      order, ["good@g.us", "mute@g.us", "ended@g.us"])
+wawf._resume_master(ledger, ap, {}, deepen=False, chat_state=st2)      # the --history-refetch path
+a = json.load(open(ap, encoding="utf-8"))
+check("...and on the refetch path, which does not deepen",
+      [str(x["chat"]) for x in a["anchors"]][-1], "ended@g.us")
+for f in (sp, ledger):
+    if os.path.exists(f): os.remove(f)
+
+print()
 if fails:
     print(f"FAILED ({len(fails)}): " + ", ".join(fails))
     sys.exit(1)

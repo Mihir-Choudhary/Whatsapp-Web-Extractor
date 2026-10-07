@@ -1213,7 +1213,41 @@ def _target_anchors(anchors_path, chats):
     os.replace(tmp, anchors_path)
     return len(keep), len(anchors) - len(keep)
 
-def _deepen_anchors(anchors_path, master, only=None, start_reached=()):
+def _load_chat_state(path):
+    """Per-chat outcomes that must survive a run: {"ended": [jid, ...], "silent": {jid: n}}.
+
+    anchors.json cannot hold them. It is rebuilt from the browser profile at the start of every run,
+    so anything recorded only there is gone before the client starts -- which is exactly what
+    happened to the first version of this fix: 103 chats were marked as ended, the next run rebuilt
+    the file with none marked, and the client probed the same four finished chats again.
+    """
+    try:
+        d = json.load(open(path, encoding="utf-8"))
+        return {"ended": set(map(str, d.get("ended") or ())),
+                "silent": {str(k): int(v) for k, v in (d.get("silent") or {}).items()}}
+    except Exception:
+        return {"ended": set(), "silent": {}}
+
+
+def _save_chat_state(path, st):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"ended": sorted(st["ended"]), "silent": st["silent"]}, f, indent=1)
+    os.replace(tmp, path)
+
+
+def _note_pass(st, passd):
+    """Fold one pass's per-chat outcomes into the state. An answer of any kind clears the silent
+    count: silence is only a reason to demote a chat while it is unbroken."""
+    for c in passd.get("start_reached") or ():
+        st["ended"].add(str(c))
+    for c in passd.get("answered_chats") or ():
+        st["silent"].pop(str(c), None)
+    for c in passd.get("silent_chats") or ():
+        st["silent"][str(c)] = st["silent"].get(str(c), 0) + 1
+
+
+def _deepen_anchors(anchors_path, master, only=None, start_reached=(), silent=None):
     """Re-anchor each chat on the OLDEST message recovered so far and add all recovered ids to the
     on-disk set, so the next history pass continues further back instead of re-pulling the same window.
 
@@ -1276,13 +1310,18 @@ def _deepen_anchors(anchors_path, master, only=None, start_reached=()):
     # every later run on drained chats and reported the phone as unresponsive after asking 4 of 253.
     live = [x for x in anchors if x.get("more_on_primary") is not False]
     done = [x for x in anchors if x.get("more_on_primary") is False]
-    newanchors = ([x for x in live if id(x) in deepest] + [x for x in live if id(x) not in deepest]
-                  + done)
+    live = [x for x in live if id(x) in deepest] + [x for x in live if id(x) not in deepest]
+    # Among chats that can still answer, the ones that have been silent run after run go behind the
+    # rest (stable, so the order above is kept within equal counts). One chat on this ledger was
+    # silent in six runs out of six and led the queue every time.
+    sil = silent or {}
+    live.sort(key=lambda x: max(sil.get(str(x.get("chat")), 0), sil.get(str(x.get("chat_id")), 0)))
+    newanchors = live + done
     tmp = anchors_path + ".tmp"                            # atomic write: a failed/interrupted write must not
     with open(tmp, "w", encoding="utf-8") as f: json.dump({"anchors": newanchors, "ondisk_ids": sorted(ondisk)}, f)  # corrupt
     os.replace(tmp, anchors_path)                          # the anchors.json the node client reads next pass
 
-def _resume_master(accum, anchors_path, master, deepen=True):
+def _resume_master(accum, anchors_path, master, deepen=True, chat_state=None):
     """Reload messages recovered on prior `wawf history` runs (from the accumulated ledger) into `master`
     and push the freshly-built anchors past them, so a new run continues older than prior runs instead of
     re-requesting the same window. Returns how many prior messages were reloaded (0 if none / on error)."""
@@ -1294,7 +1333,11 @@ def _resume_master(accum, anchors_path, master, deepen=True):
         # the same window. `--history-refetch` is the case where re-asking is the entire point: the
         # messages are banked but missing fields an older extractor never captured (the group
         # sender), and the only way to fill them is to have the phone serve them again.
-        if master and deepen: _deepen_anchors(anchors_path, master)
+        cs = chat_state or {"ended": set(), "silent": {}}
+        if master and deepen:
+            _deepen_anchors(anchors_path, master, start_reached=cs["ended"], silent=cs["silent"])
+        elif cs["ended"] or cs["silent"]:                    # refetch: no deepening, state still applies
+            _deepen_anchors(anchors_path, {}, start_reached=cs["ended"], silent=cs["silent"])
         return len(master)
     except Exception as e:
         log.warning("could not reload prior history (%s) — starting fresh.", e)
@@ -1659,7 +1702,13 @@ def cmd_history(a):
     # the anchors + on-disk id set past it — otherwise run 2 would re-request run 1's window and overwrite it.
     refetch = bool(getattr(a, "history_refetch", False))
     refetch_only = None                                  # the chats a refetch confines itself to
-    n = _resume_master(accum, anchors_path, master, deepen=not refetch)
+    # Per-chat outcomes from earlier runs, re-applied to the freshly rebuilt anchors.
+    state_path = os.path.join(work, "history_chat_state.json")
+    chat_state = _load_chat_state(state_path)
+    if chat_state["ended"] or chat_state["silent"]:
+        log.info("from earlier runs: %d chat(s) the phone has ended (skipped), %d chat(s) silent on "
+                 "their last attempt (asked last).", len(chat_state["ended"]), len(chat_state["silent"]))
+    n = _resume_master(accum, anchors_path, master, deepen=not refetch, chat_state=chat_state)
     if n and not refetch:
         log.info("resuming: %s messages recovered on prior runs — continuing older than those.", f"{n:,}")
     elif n:
@@ -1709,7 +1758,7 @@ def cmd_history(a):
     MAX_COOLDOWNS = int(os.environ.get("WAWF_MAX_COOLDOWNS", 6))
     cooldowns_used = 0
     served_any = False                                   # did the phone serve anything, any pass?
-    ended_chats = set()                                  # chats the phone answered "start reached" for
+    ended_chats = chat_state["ended"]                    # chats the phone answered "start reached" for
     try:
         for p in range(1, MAX_PASSES + 1):
             log.info("──── history pass %d ────", p)
@@ -1737,14 +1786,15 @@ def cmd_history(a):
             served_any = served_any or served > 0
             # Chats the phone itself ended this pass. Accumulated across passes because the anchors
             # are rewritten every pass and a chat ended in pass 1 must stay ended in pass 3.
-            ended_chats.update(str(c) for c in (passd.get("start_reached") or ()))
+            _note_pass(chat_state, passd)
+            _save_chat_state(state_path, chat_state)
             new, enriched = WD.bank_history(master, passd.get("messages"))
             by = _checkpoint(accum)                          # checkpoint the accumulated set every pass
             log.info("pass %d: +%d new%s  ·  total recovered: %d across %d chats", p, new,
                      (", %d enriched" % enriched) if enriched else "", len(master), len(by))
             if rc == COOLDOWN_RC:
                 _deepen_anchors(anchors_path, master, only=refetch_only,
-                                start_reached=ended_chats)                 # bank before the wait
+                                start_reached=ended_chats, silent=chat_state["silent"])                 # bank before the wait
                 if COOLDOWN and cooldowns_used < MAX_COOLDOWNS:
                     cooldowns_used += 1
                     log.warning("pass %d was stopped by the cooldown breaker (%d/%d). WhatsApp Web waits "
@@ -1782,7 +1832,7 @@ def cmd_history(a):
                                 "under WhatsApp's own unanswered-request limit). That is a statement "
                                 "about those chats, NOT about the phone and NOT the end of your "
                                 "history. %s messages recovered previously are intact. %s",
-                                p, min(_PROBE_CHATS, len(targets or ())) or _PROBE_CHATS,
+                                p, len(passd.get("silent_chats") or ()) or _PROBE_CHATS,
                                 _PROBE_CHATS, f"{len(master):,}",
                                 ("%d chat(s) the phone has ended are now recorded and will be "
                                  "skipped next run." % len(ended_chats)) if ended_chats else
@@ -1796,7 +1846,7 @@ def cmd_history(a):
                              "enriched" if refetch else "new", MIN_NEW)
                 break
             _deepen_anchors(anchors_path, master, only=refetch_only,
-                            start_reached=ended_chats)                     # go deeper next pass
+                            start_reached=ended_chats, silent=chat_state["silent"])                     # go deeper next pass
     except KeyboardInterrupt:
         log.warning("interrupted — checkpointing %s recovered messages before exit.", f"{len(master):,}")
         _checkpoint(accum); _checkpoint(pass_out)
@@ -1838,10 +1888,11 @@ def cmd_history(a):
         if not served_any:
             log.warning("NOTE: this run was served nothing new — every message above came from "
                         "earlier runs. Before reading that as throttling, note the client stops "
-                        "after its first PROBE_CHATS=%s chats: a run can ask 4 chats out of %d and "
-                        "report silence. Chats the phone has ended are skipped from now on, which "
-                        "puts answerable chats at the head of the queue for the next run.",
-                        _PROBE_CHATS, len(targets or ()) or 0)
+                        "after its first PROBE_CHATS=%s chats, so a run can ask a handful of chats "
+                        "out of hundreds and report silence. Chats the phone has ended are skipped "
+                        "and chats that stayed silent are asked last from now on (%s), which puts "
+                        "other chats at the head of the queue for the next run.",
+                        _PROBE_CHATS, os.path.basename(state_path))
         log.warning("NOTE: this is NOT necessarily everything. What you get is whatever your phone chose to "
                     "serve — it commonly returns only part of what it holds, and the rest may come on a later "
                     "run. Re-run `wawf history` to continue deeper from here (progress is saved and deduped); "
