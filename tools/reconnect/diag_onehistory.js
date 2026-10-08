@@ -46,6 +46,13 @@ const WANT = arg('--chat', null);
 // LID-migrated 1:1 chat those differ, and measured over the 6 chats one run happened to ask in both
 // forms, PN-addressed returned 3 messages in total while LID-addressed returned 1,157.
 const AS = arg('--as', null);
+// --quiet-peer: send the phone NOTHING but the history request. On every message it cannot decrypt,
+// Baileys sends the phone a retry receipt and, on the first retry, a placeholder-resend request -- a
+// peer-data-operation message on the same channel as our history request. Measured during a 15-minute
+// listen: one every ~5 s, 21 in the first 90 s, with 812 decrypt failures behind them. WhatsApp Web
+// decrypts everything and sends none. This switch (maxMsgRetryCount: 0) tests whether those requests
+// are what delays the phone's answer to ours.
+const QUIET_PEER = argv.includes('--quiet-peer');
 
 const red = s => String(s == null ? '' : s).replace(/\d{5,}/g, m => m.slice(0, 4) + '*'.repeat(m.length - 4));
 const bb = b => Buffer.from(b, 'base64');
@@ -102,7 +109,9 @@ const brief = node => {
   const sock = makeWASocket({ version, auth: { creds, keys: rt.keys }, logger: quiet,
     printQRInTerminal: false, markOnlineOnConnect: true, syncFullHistory: false,
     shouldSyncHistoryMessage: h => { try { return !!h && h.syncType === B.proto.Message.HistorySyncNotification.HistorySyncType.ON_DEMAND; } catch (e) { return false; } },
-    getMessage: async () => undefined, browser: ['Forensic', 'Recovery', '1.0'] });
+    getMessage: async () => undefined, browser: ['Forensic', 'Recovery', '1.0'],
+    ...(QUIET_PEER ? { maxMsgRetryCount: 0 } : {}) });
+  if (QUIET_PEER) console.error('[one] --quiet-peer: no retry receipts, no placeholder resends -- only the history request goes to the phone');
 
   // EVERY inbound stanza, before Baileys' tag dispatch.
   sock.ws.on('frame', node => {

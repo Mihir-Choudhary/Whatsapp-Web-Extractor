@@ -54,7 +54,12 @@ function fetchBlobOnce(ref){ return new Promise((res,rej)=>{
   const target=(signed&&/^https:\/\/[^/]*\.whatsapp\.net\//.test(signed)&&/[?&]oh=/.test(signed))
     ? signed : ("https://mmg.whatsapp.net"+direct);
   const req=https.get(target,{headers:CDN_HEADERS},
-    r=>{ if(r.statusCode!==200){ r.resume(); return rej(new Error('HTTP '+r.statusCode)); } const c=[]; r.on('data',d=>c.push(d)); r.on('end',()=>res(Buffer.concat(c))); });
+    r=>{ if(r.statusCode!==200){ r.resume(); return rej(new Error('HTTP '+r.statusCode)); } const c=[]; r.on('data',d=>c.push(d));
+         // Last-Modified is when the PHONE uploaded this answer. That is the only timestamp we get for
+         // when the phone acted on a request, and it is what distinguishes "answered immediately but
+         // delivered late" from "the phone only got round to it hours later" -- and lets the moment be
+         // matched to whatever happened then (WhatsApp Web being opened, the phone being unlocked).
+         r.on('end',()=>{ const b=Buffer.concat(c); b.uploadedAt=r.headers['last-modified']||null; res(b); }); });
   req.on('error',rej);
   req.setTimeout(20000, ()=>req.destroy(new Error('socket timeout')));   // don't let a stalled CDN socket hang forever
 }); }
@@ -477,7 +482,9 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     // The chunk is still valid evidence and every message in it carries its own chat, so it needs no
     // promise to be filed correctly -- download it, bank it, and say so.
     let msgs=null;                  // null = download/decode error (distinct from [] = genuine empty page)
-    try{ const blob=await fetchBlob(hn); const inf=decryptHistory(blob, Buffer.from(hn.mediaKey));
+    let uploadedAt=null;
+    try{ const blob=await fetchBlob(hn); uploadedAt=blob.uploadedAt;
+         const inf=decryptHistory(blob, Buffer.from(hn.mediaKey));
          const held=keepChunk(inf, hn);
          const hs=B.proto.HistorySync.decode(inf);
          noteConversations(hs.conversations);
@@ -485,6 +492,8 @@ function histNotif(message){ // dig through device/ephemeral wrappers
          // only after the chunk is decoded AND on disk: release the server copy, as the browser does
          if(held) await releaseChunk(sock, hn, hn && hn.url); }
     catch(e){ console.error('  blob err', e.message); }
+    if(uploadedAt) console.error(`  [answer] session ${sid}: the phone uploaded it at ${new Date(uploadedAt).toISOString()}`
+      +` (received ${new Date().toISOString()})`);
     if(!r){
       lateReplies++;
       if(msgs&&msgs.length){
