@@ -183,6 +183,24 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   // ...and which chats answered at all versus stayed silent on their first page. The caller keeps a
   // running count per chat, so one that is silent run after run stops leading the queue.
   const silentChats=new Set(), answeredChats=new Set();
+  // Replies that arrived with no request waiting for them: answers to requests this run already
+  // timed out on, or to requests from EARLIER runs. On 2026-10-08 the first thing a connection
+  // received was four ON_DEMAND replies to the four requests of a run the day before -- the phone
+  // had answered all of them, after that run had timed out at 10 s, given up and disconnected, and
+  // the server had held the answers until the next connection. Those used to be banked but otherwise
+  // ignored; they are answers, and are now counted as such.
+  let lateReplies=0, lateMessages=0;
+  // Fold one reply's conversations into the per-chat outcomes. Only the phone's own statement that
+  // nothing older remains (endOfHistoryTransferType 1, COMPLETE_AND_NO_MORE_MESSAGE_REMAIN_ON_PRIMARY)
+  // ends a chat. An EMPTY reply does not: three of those four late replies carried 0 messages with
+  // type 2, COMPLETE_ON_DEMAND_SYNC_BUT_MORE_MSG_REMAIN_ON_PRIMARY -- the phone saying it has more.
+  const noteConversations=(convs)=>{
+    for(const c of (convs||[])){
+      const id=c&&c.id; if(!id) continue;
+      answeredChats.add(id); silentChats.delete(id);
+      if(Number(c.endOfHistoryTransferType)===1) startReached.add(id);
+    }
+  };
   const bb=b=>Buffer.from(b,'base64');
   const creds=B.initAuthCreds();
   creds.noiseKey={private:bb(inp.noise_priv),public:bb(inp.noise_pub)};
@@ -461,16 +479,23 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     let msgs=null;                  // null = download/decode error (distinct from [] = genuine empty page)
     try{ const blob=await fetchBlob(hn); const inf=decryptHistory(blob, Buffer.from(hn.mediaKey));
          const held=keepChunk(inf, hn);
-         msgs=flatten(B.proto.HistorySync.decode(inf));
+         const hs=B.proto.HistorySync.decode(inf);
+         noteConversations(hs.conversations);
+         msgs=flatten(hs);
          // only after the chunk is decoded AND on disk: release the server copy, as the browser does
          if(held) await releaseChunk(sock, hn, hn && hn.url); }
     catch(e){ console.error('  blob err', e.message); }
     if(!r){
+      lateReplies++;
       if(msgs&&msgs.length){
         let fresh=0; for(const mm of msgs){ if(!all.has(mm.id)) fresh++; all.set(mm.id,mm); }
+        lateMessages+=msgs.length;
         const w=writeOut();
-        console.error(`  [late] a notification arrived after its request had timed out: banked `
+        console.error(`  [late] a reply arrived after its request had timed out: banked `
           +`${msgs.length} message(s), ${fresh} new`+(w?` (total ${w.tot})`:''));
+      } else {
+        writeOut();                 // still an answer: its chat outcome is recorded
+        console.error(`  [late] a reply arrived after its request had timed out (no messages in it)`);
       }
       continue;
     }
@@ -486,13 +511,16 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     // Same salvage as above: Baileys has already downloaded and decrypted this one itself, so a late
     // arrival costs nothing to keep and dropping it would lose recovered messages outright.
     if(r==='duplicate') return;               // same chunk via the other listener; already banked
+    noteConversations(d.chats);               // Baileys spreads each conversation into d.chats
     if(!r){
+      lateReplies++;
       const late=(d.messages||[]).map(w=>({ chat:w.key&&w.key.remoteJid, id:w.key&&w.key.id,
         fromMe:!!(w.key&&w.key.fromMe), participant:(w.key&&w.key.participant)||w.participant||null, pushName:w.pushName||null,
         ts:Number(w.messageTimestamp)||0, text:txt(w.message),
         type:w.message?Object.keys(w.message)[0]:'?' })).filter(x=>x.id);
       if(late.length){
         let fresh=0; for(const mm of late){ if(!all.has(mm.id)) fresh++; all.set(mm.id,mm); }
+        lateMessages+=late.length;
         const w2=writeOut();
         console.error(`  [late] history set arrived after its request had timed out: banked `
           +`${late.length} message(s), ${fresh} new`+(w2?` (total ${w2.tot})`:''));
@@ -762,12 +790,14 @@ function histNotif(message){ // dig through device/ephemeral wrappers
             break; }
           if(pg===0){ served++; answeredChats.add(a.chat); }
           noteSuccess();
-          if(!msgs.length){ console.error(`  ${a.chat.slice(0,22)} page${pg}: empty (start reached)`);
-            // An ANSWER, not a silence: the phone located the anchor and had nothing before it. That
-            // is the one unambiguous end-of-history signal we get, so persist it rather than
-            // rediscovering it every run. (Silence is different and deliberately not recorded here:
-            // an unanswered request can also be a reply we failed to decrypt.)
-            startReached.add(a.chat); if(a.chat_id) startReached.add(a.chat_id);
+          if(!msgs.length){
+            // An ANSWER with nothing in it. It is NOT necessarily the end: whether the chat is
+            // finished is the reply's endOfHistoryTransferType, recorded by noteConversations() when
+            // the reply was decoded. An empty reply whose type says more remains (2) had been marking
+            // chats as finished, which hid them from every later run.
+            const ended=startReached.has(a.chat)||(a.chat_id&&startReached.has(a.chat_id));
+            console.error(`  ${a.chat.slice(0,22)} page${pg}: empty`
+              +(ended?' (the phone says nothing older remains)':' (the phone says more remains)'));
             writeOut(); break; }
           for(const m of msgs) all.set(m.id,m);
           got+=msgs.length; msgs.sort((x,y)=>x.ts-y.ts); const o=msgs[0];
@@ -806,6 +836,24 @@ function histNotif(message){ // dig through device/ephemeral wrappers
         if(probed%10===0 || probed===targets.length) progress(probed, targets.length);
         await sleep(delay);                      // adaptive: see noteFailure/noteSuccess above
       }
+      // LINGER for late answers before hanging up. Disconnecting the moment the last request timed
+      // out is what turned slow answers into "no response": they arrived after we had gone, and only
+      // surfaced on a later connection. Wait LATE_WAIT_MS more (default 5 min), longer while replies
+      // keep arriving, and stop early once every request has been answered.
+      const LATE_WAIT=Number(process.env.LATE_WAIT_MS||300000);
+      if(LATE_WAIT>0 && silent>0){
+        const l0=lateReplies, lingerStart=Date.now(); let lastSeen=lateReplies, deadline=lingerStart+LATE_WAIT;
+        console.error(`[i] ${silent} request(s) unanswered — staying connected up to `
+          +`${Math.round(LATE_WAIT/1000)}s for late answers before disconnecting`);
+        while(Date.now()<deadline && (lateReplies-l0)<silent){
+          await sleep(1000);
+          if(lateReplies!==lastSeen){ lastSeen=lateReplies; deadline=Math.max(deadline, Date.now()+60000); }
+        }
+        console.error(`[i] waited ${((Date.now()-lingerStart)/1000).toFixed(0)}s: ${lateReplies-l0} late `
+          +`answer(s) arrived for the ${silent} unanswered request(s)`);
+      }
+      if(lateReplies) console.error(`[*] ${lateReplies} reply(ies) arrived after their request had timed out `
+        +`(this run or an earlier one), carrying ${lateMessages} message(s) — the phone answered, slowly`);
       // Exit 7 means "stopped by the cooldown breaker, not finished". The caller can then wait out
       // WhatsApp's cooldown and resume from the checkpoint rather than treating the pass as a failure;
       // a full sweep of a few hundred chats cannot fit inside one cooldown window.
@@ -816,7 +864,11 @@ function histNotif(message){ // dig through device/ephemeral wrappers
       // Nothing served, and we can say WHY rather than leave the analyst guessing at the phone.
       // The primary is the only peer whose replies carry history, so unreadable stanzas from it are
       // the explanation; unreadable stanzas from anyone else are unrelated noise.
-      if(!served){
+      if(!served && lateReplies){
+        console.error(`\n[DIAGNOSIS] no request was answered within its ${REQ_TIMEOUT/1000}s deadline, `
+          +`but ${lateReplies} answer(s) arrived late. The phone IS answering; it is answering `
+          +`slowly. Late answers are banked and their chats' outcomes recorded.`);
+      } else if(!served){
         if(selfFail.peer>0) console.error(
           `\n[DIAGNOSIS] ${selfFail.peer} repl(ies) from the account's own primary arrived and could `
          +`NOT be decrypted. The phone IS answering; this device cannot read the answers, because the `
