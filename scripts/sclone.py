@@ -109,8 +109,10 @@ class Reader:
                     items.append(self.value(t, d))
             return {"__map": items} if tag == MAP else {"__set": items}
         if tag == REGEXP:
-            _flags = data; src = self.value()
-            return {"__regexp": src}
+            # The low bits of `data` are the RegExp flags (g/i/m/...); they were read and discarded,
+            # so a stored /x/gi came back as /x/. A raw export is meant to be verbatim -- keep them.
+            src = self.value()
+            return {"__regexp": src, "__flags": data}
         raise ValueError(f"unhandled tag 0x{tag:08X} data=0x{data:08X} at {self.p-8}")
 
 def loads(buf):

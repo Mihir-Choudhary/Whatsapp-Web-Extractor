@@ -28,13 +28,13 @@ Examples:
   wawf <PROFILE> --key companion_enc_static.txt --out json:D:\\case
 """
 from __future__ import annotations
-import argparse, sys, os, re, json, base64, logging, collections, datetime as dt, subprocess, time
+import argparse, sys, os, re, json, base64, hashlib, logging, collections, datetime as dt, subprocess, time
 
 HERE = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))  # _MEIPASS when frozen (.exe)
 sys.path.insert(0, os.path.join(HERE, "scripts")); sys.path.insert(0, HERE)
 log = logging.getLogger("wawf")
 
-import audit                                   # optional chain-of-custody DB (no-op unless --audit)
+import audit                                   # chain-of-custody DB (on by default; --no-audit turns it off)
 AUDIT = audit.NoAudit()                        # replaced in main() when --audit is given
 
 def _evidence_paths(src):
@@ -179,11 +179,32 @@ def _holds_export(path):
         log.debug("could not inspect %s: %s", path, e)
     return None
 
+WAWF_RELEASE = "1.0.1"                  # the last tagged release this code descends from
+
 def _wawf_version():
-    try:
-        return __doc__.strip().split("\n", 1)[0]
-    except Exception:
-        return "wawf"
+    """The exact code that produced an artifact: release + git commit (+ ".dirty" if the working tree
+    has uncommitted changes), or the release alone in a frozen build / outside a checkout.
+
+    This used to return the first line of the module docstring, so every export receipt said its
+    version was "wawf - WhatsApp Web Forensics: one CLI for ...", and the audit database recorded a
+    hard-coded "1.0" for every build. Neither can tell an examiner which extractor wrote an export --
+    and the extractor's output changed materially between commits."""
+    if os.environ.get("WAWF_VERSION"):
+        return os.environ["WAWF_VERSION"]
+    v = WAWF_RELEASE
+    if not getattr(sys, "frozen", False):
+        try:
+            import subprocess
+            here = os.path.dirname(os.path.abspath(__file__))
+            sha = subprocess.run(["git", "-C", here, "rev-parse", "--short=12", "HEAD"], capture_output=True,
+                                 text=True, timeout=5).stdout.strip()
+            if sha:
+                dirty = subprocess.run(["git", "-C", here, "status", "--porcelain", "--untracked-files=no"],
+                                       capture_output=True, text=True, timeout=5).stdout.strip()
+                v += "+git." + sha + (".dirty" if dirty else "")
+        except Exception:
+            pass
+    return v
 
 def _parse_out(spec):
     """'--out FORMAT:PATH' -> (format, path); a bare path -> (None, path) meaning 'all text formats'.
@@ -712,6 +733,10 @@ def cmd_raw(a):
         for st in sorted(idb[db]):
             recs = idb[db][st]
             if not recs:
+                # An empty store still EXISTED; for an image of the database that is a fact, so it is
+                # listed rather than silently left out.
+                manifest.append({"database": db, "store": st, "file": None, "records": 0,
+                                 "encrypted": 0, "decrypted": 0, "sha256": None})
                 continue
             safe = re.sub(r"[^A-Za-z0-9._-]", "_", f"{db}__{st}")
             path = os.path.join(a.out, safe + ".jsonl")
@@ -733,8 +758,11 @@ def cmd_raw(a):
                     n += 1
             totals["stores"] += 1; totals["records"] += n
             totals["encrypted"] += enc; totals["decrypted"] += dec
+            # The file's hash in the manifest itself: the audit database records it too, but a raw
+            # export made with --no-audit otherwise carried no integrity record at all.
             manifest.append({"database": db, "store": st, "file": safe + ".jsonl",
-                             "records": n, "encrypted": enc, "decrypted": dec})
+                             "records": n, "encrypted": enc, "decrypted": dec,
+                             "sha256": hashlib.sha256(open(path, "rb").read()).hexdigest()})
             AUDIT.artifact(path, kind=f"raw store dump ({db}/{st})", records=n)
     json.dump({"format": "wawf-raw/1", "generated": dt.datetime.now(dt.timezone.utc).isoformat(),
                "profile": os.path.abspath(a.profile) if a.profile else None,
@@ -2113,6 +2141,9 @@ def main():
     g.add_argument("--log-file", metavar="FILE", help="mirror all logs (DEBUG) to this file")
 
     a = p.parse_args()
+    # One version string for this run, inherited by the audit database (audit._tool_version reads
+    # WAWF_VERSION) and by every helper process, so they cannot record different values.
+    os.environ["WAWF_VERSION"] = _wawf_version()
     setup_logging(a.verbose, a.log_file)
     # Pick the action. The default IS the job: credentials -> key -> decrypt. --history and --memory are
     # the two alternative actions; everything else is an option on the default job.

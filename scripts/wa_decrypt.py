@@ -182,7 +182,13 @@ def _dedupe(records, key="id"):
     return out
 
 def _txt(v):
-    return v.strip() if isinstance(v, str) and v.strip() else None
+    """A stored name, EXACTLY as saved -- or None when there is none.
+
+    It used to return v.strip(), so a group whose subject was saved as "Book club " was exported
+    as "Book club". JSON's contract is the value as stored; whitespace is only used to decide
+    whether there is a name at all. (The transcript still collapses whitespace in a label, because a
+    label there must fit on one line -- chats.json and identities.json keep it verbatim.)"""
+    return v if isinstance(v, str) and v.strip() else None
 
 class Identities:
     """jid/lid -> who that is, from `model-storage`'s own contact, group-metadata, chat and

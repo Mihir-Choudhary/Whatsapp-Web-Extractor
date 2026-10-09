@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""audit.py — optional chain-of-custody / audit database for wawf.
+"""audit.py — chain-of-custody / audit database for wawf.
 
-Enabled with `wawf --audit` (see wawf.py). When on, EVERY run of the tool appends to one SQLite DB that
+On by default (`wawf --no-audit` turns it off; see wawf.py). When on, EVERY run of the tool appends to one SQLite DB that
 lives next to the output, so an examiner can reconstruct exactly what the tool did: which files it opened,
 what it took out of them, which key material derived what, which network requests went out, what artifacts
 were produced (with hashes), and — if the tool crashed — the last thing it was doing plus the traceback.
@@ -51,7 +51,7 @@ def sha256_file(path, cap=None):
         except Exception: return None, None
 
 def fp(data):
-    """Fingerprint key/salt material: SHA-256 hex, truncated. Never the material itself."""
+    """Fingerprint key/salt material: the full SHA-256 hex digest. Never the material itself."""
     if data is None: return None
     if isinstance(data, str): data = data.encode("utf-8", "replace")
     try: return hashlib.sha256(bytes(data)).hexdigest()
@@ -187,19 +187,44 @@ class Audit:
                          digest, records, _js(detail)))
         return digest
 
+    DIR_HASH_CAP = 256 << 20     # hash a directory's files when it totals at most this much
+
     def dir_read(self, path, purpose=None, detail=None):
-        """Record a directory as evidence: file count + total bytes (hashing a whole LevelDB is wasteful)."""
-        n = tot = 0
+        """Record a directory as evidence, with a digest that pins exactly what was read.
+
+        Every file is hashed and listed in `detail.files` as (relative path, size, sha256), and the
+        `sha256` column holds one digest over that sorted list -- so an examiner can show later which
+        evidence an export came from, and that it has not changed since. This used to record only a
+        file count and total bytes ("hashing a whole LevelDB is wasteful"), which proves neither; the
+        WhatsApp stores are ~53 MB and hash in well under a second. A directory larger than
+        DIR_HASH_CAP (a whole browser profile, ~1 GB) is still counted, not hashed."""
+        entries, tot = [], 0
         for dp, _d, fs in os.walk(path):
             for f in fs:
-                n += 1
-                try: tot += os.path.getsize(os.path.join(dp, f))
-                except OSError: pass
-        d = {"files": n, "bytes": tot}
+                fp_ = os.path.join(dp, f)
+                try: sz = os.path.getsize(fp_)
+                except OSError: sz = None
+                entries.append([os.path.relpath(fp_, path).replace(os.sep, "/"), sz])
+                tot += sz or 0
+        entries.sort()
+        digest = None
+        if tot <= self.DIR_HASH_CAP:
+            h = hashlib.sha256()
+            for e in entries:
+                fh, _ = sha256_file(os.path.join(path, e[0]))
+                e.append(fh)
+                h.update(("%s\0%s\0%s\n" % (e[0], e[1], fh)).encode("utf-8"))
+            digest = h.hexdigest()
+        d = {"files": len(entries), "bytes": tot,
+             "digest": "sha256 over sorted 'path NUL size NUL sha256' lines" if digest else
+                       "not hashed: larger than %d bytes" % self.DIR_HASH_CAP}
+        if digest: d["file_hashes"] = entries
         if detail: d.update(detail)
-        self.db.execute("INSERT INTO file_access(run_id,ts_utc,action,path,purpose,present,size,records,detail)"
-                        " VALUES(?,?,'read',?,?,?,?,?,?)",
-                        (self.run_id, _utc(), str(path), purpose, 1 if os.path.isdir(path) else 0, tot, n, _js(d)))
+        self.db.execute("INSERT INTO file_access(run_id,ts_utc,action,path,purpose,present,size,sha256,records,detail)"
+                        " VALUES(?,?,'read',?,?,?,?,?,?,?)",
+                        (self.run_id, _utc(), str(path), purpose, 1 if os.path.isdir(path) else 0, tot,
+                         digest, len(entries), _js(d)))
+        return digest
 
     # ---------- what decrypted what ----------
     def crypto(self, op, algorithm=None, kdf=None, scheme=None, key=None, key_source=None,
