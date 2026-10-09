@@ -211,6 +211,18 @@ wawf._resume_master(ledger, ap, {}, deepen=False, chat_state=st2)      # the --h
 a = json.load(open(ap, encoding="utf-8"))
 check("...and on the refetch path, which does not deepen",
       [str(x["chat"]) for x in a["anchors"]][-1], "ended@g.us")
+# no ledger yet (first run, or after a reset): saved outcomes must still be applied
+json.dump({"anchors": [
+    {"chat": "ended@g.us", "chat_id": "ended@g.us", "more_on_primary": True,
+     "oldest_id": "E0", "oldest_ts": 1_760_000_000, "oldest_fromMe": False},
+    {"chat": "good@g.us", "chat_id": "good@g.us", "more_on_primary": True,
+     "oldest_id": "G0", "oldest_ts": 1_760_000_000, "oldest_fromMe": False}],
+    "ondisk_ids": []}, open(ap, "w", encoding="utf-8"))
+missing = os.path.join(os.path.dirname(ap), "no_such_ledger.json")
+wawf._resume_master(missing, ap, {}, deepen=True, chat_state=st2)
+a = json.load(open(ap, encoding="utf-8"))
+check("saved outcomes apply even with no ledger yet",
+      {str(x["chat"]): x["more_on_primary"] for x in a["anchors"]}, {"ended@g.us": False, "good@g.us": True})
 for f in (sp, ledger):
     if os.path.exists(f): os.remove(f)
 

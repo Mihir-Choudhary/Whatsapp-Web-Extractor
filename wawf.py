@@ -1325,7 +1325,13 @@ def _resume_master(accum, anchors_path, master, deepen=True, chat_state=None):
     """Reload messages recovered on prior `wawf history` runs (from the accumulated ledger) into `master`
     and push the freshly-built anchors past them, so a new run continues older than prior runs instead of
     re-requesting the same window. Returns how many prior messages were reloaded (0 if none / on error)."""
-    if not os.path.exists(accum): return 0
+    cs = chat_state or {"ended": set(), "silent": {}}
+    if not os.path.exists(accum):
+        # No ledger yet, but saved per-chat outcomes still apply to the freshly built anchors.
+        if cs["ended"] or cs["silent"]:
+            try: _deepen_anchors(anchors_path, {}, start_reached=cs["ended"], silent=cs["silent"])
+            except Exception as e: log.warning("could not apply saved chat state (%s)", e)
+        return 0
     try:
         WD, _ = _imp()
         WD.bank_history(master, json.load(open(accum, encoding="utf-8")).get("messages"))
@@ -1333,7 +1339,6 @@ def _resume_master(accum, anchors_path, master, deepen=True, chat_state=None):
         # the same window. `--history-refetch` is the case where re-asking is the entire point: the
         # messages are banked but missing fields an older extractor never captured (the group
         # sender), and the only way to fill them is to have the phone serve them again.
-        cs = chat_state or {"ended": set(), "silent": {}}
         if master and deepen:
             _deepen_anchors(anchors_path, master, start_reached=cs["ended"], silent=cs["silent"])
         elif cs["ended"] or cs["silent"]:                    # refetch: no deepening, state still applies

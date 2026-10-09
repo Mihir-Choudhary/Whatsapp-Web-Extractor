@@ -111,19 +111,19 @@ function keepChunk(inflated, hn){
 // response to OUR request, and only after the decrypted chunk is on disk in history_chunks/, so the
 // evidence is retained locally first. Leaving it instead is itself a deviation from the reference
 // client. HIST_CHUNK_DELETE=0 disables it.
-let mediaAuth = null;              // cached media_conn auth token (ttl is minutes, a run is longer)
 let released = 0, releaseFailed = 0;
 async function releaseChunk(sock, hn, signedUrl){
   if(process.env.HIST_CHUNK_DELETE === '0') return;
   try{
     if(!hn || !hn.fileEncSha256 || !hn.directPath) return;
-    if(!mediaAuth){
-      const mc = await sock.refreshMediaConn();
-      mediaAuth = mc && mc.auth;
-      if(!mediaAuth) return;
-      // prefer the PoP host the chunk itself came from; fall back to the media_conn host list
-      if(!releaseChunk._host && mc && mc.hosts && mc.hosts.length) releaseChunk._host = mc.hosts[0].hostname;
-    }
+    // Ask every time: Baileys caches media_conn itself and refetches once its ttl lapses. Holding
+    // the token in our own variable for the whole run bypassed that, so releases on a long run
+    // would start failing with an expired token.
+    const mc = await sock.refreshMediaConn();
+    const mediaAuth = mc && mc.auth;
+    if(!mediaAuth) return;
+    // prefer the PoP host the chunk itself came from; fall back to the media_conn host list
+    if(!releaseChunk._host && mc && mc.hosts && mc.hosts.length) releaseChunk._host = mc.hosts[0].hostname;
     const b64url = b => Buffer.from(b).toString('base64').replace(/\+/g,'-').replace(/\//g,'_');
     const hash = b64url(hn.fileEncSha256);                       // padding kept, as in the capture
     const d_md = b64url(Buffer.from(hn.directPath,'utf8')).replace(/=+$/,'');   // unpadded
@@ -194,7 +194,16 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   // had answered all of them, after that run had timed out at 10 s, given up and disconnected, and
   // the server had held the answers until the next connection. Those used to be banked but otherwise
   // ignored; they are answers, and are now counted as such.
-  let lateReplies=0, lateMessages=0;
+  let lateReplies=0, lateMessages=0, lateOurs=0;
+  // Request ids this run sent. A late reply for one of these answers THIS run; anything else is an
+  // answer to an earlier run's request. Counting both as ours ended the late-answer wait early.
+  const ourIds=new Set();
+  // A reply labels its conversation with the phone's id for the chat, often the LID, while silence
+  // is recorded under the anchor's `chat`, often the phone-number jid. Map both ways so an answer
+  // clears the same entry its silence created.
+  const anchorChat=new Map();
+  for(const a of A.anchors){ if(a.chat) anchorChat.set(String(a.chat), String(a.chat));
+                             if(a.chat_id) anchorChat.set(String(a.chat_id), String(a.chat)); }
   // Fold one reply's conversations into the per-chat outcomes. Only the phone's own statement that
   // nothing older remains (endOfHistoryTransferType 1, COMPLETE_AND_NO_MORE_MESSAGE_REMAIN_ON_PRIMARY)
   // ends a chat. An EMPTY reply does not: three of those four late replies carried 0 messages with
@@ -202,8 +211,9 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   const noteConversations=(convs)=>{
     for(const c of (convs||[])){
       const id=c&&c.id; if(!id) continue;
-      answeredChats.add(id); silentChats.delete(id);
-      if(Number(c.endOfHistoryTransferType)===1) startReached.add(id);
+      const ids=[id]; const k=anchorChat.get(String(id)); if(k && k!==id) ids.push(k);
+      for(const x of ids){ answeredChats.add(x); silentChats.delete(x);
+                           if(Number(c.endOfHistoryTransferType)===1) startReached.add(x); }
     }
   };
   const bb=b=>Buffer.from(b,'base64');
@@ -421,6 +431,7 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   // request had timed out" on essentially every chat -- which would bury the real thing it exists to
   // catch. Remembering what we resolved separates a duplicate from a late answer.
   const resolved=new Set();
+  const fetchedChunks=new Set();     // chunks already downloaded+kept+released, keyed by directPath
   let lastRequestId=null;           // fallback target when a reply's session id doesn't match (see resolveFor)
   // Never DISCARD a history blob we were sent. If the reply's peerDataRequestSessionId doesn't match a
   // pending id (id schemes can differ by WhatsApp/Baileys version), fall back to the outstanding request
@@ -515,7 +526,14 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     // Bail BEFORE the download. The same chunk routinely arrives twice (we listen on two events), and
     // this check used to sit after fetchBlob + decrypt + decode -- so every page paid a second full
     // CDN fetch, with up to 3 retries and a 20s socket timeout each, purely to throw the result away.
-    if(r==='duplicate') continue;
+    // The chunk itself is handled exactly once per answer, whichever listener resolved the request.
+    // Skipping on 'duplicate' here was wrong: when Baileys' messaging-history.set listener won the
+    // race, this one saw a duplicate and skipped BEFORE the download -- so the chunk was never kept
+    // on disk, never released, and its upload time never logged. Measured: 2 answers in one run,
+    // 1 chunk kept, 1 released.
+    const ckey=String(hn.directPath||sid);
+    if(fetchedChunks.has(ckey)) continue;              // a genuine second copy of this same chunk
+    fetchedChunks.add(ckey);
     // SALVAGE A LATE ANSWER. `resolveFor` returning null means no request is waiting any more --
     // almost always because we timed out and deleted the pending entry. The old code did
     // `if(!r) continue;` here, i.e. it threw the notification away without downloading it, which
@@ -537,8 +555,9 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     catch(e){ console.error('  blob err', e.message); }
     if(uploadedAt) console.error(`  [answer] session ${sid}: the phone uploaded it at ${new Date(uploadedAt).toISOString()}`
       +` (received ${new Date().toISOString()})`);
+    if(r==='duplicate') continue;    // messaging-history.set already resolved and banked these messages
     if(!r){
-      lateReplies++;
+      lateReplies++; if(ourIds.has(String(sid))) lateOurs++;
       if(msgs&&msgs.length){
         let fresh=0; for(const mm of msgs){ if(!all.has(mm.id)) fresh++; all.set(mm.id,mm); }
         lateMessages+=msgs.length;
@@ -565,7 +584,7 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     if(r==='duplicate') return;               // same chunk via the other listener; already banked
     noteConversations(d.chats);               // Baileys spreads each conversation into d.chats
     if(!r){
-      lateReplies++;
+      lateReplies++; if(ourIds.has(String(sid))) lateOurs++;
       const late=(d.messages||[]).map(w=>({ chat:w.key&&w.key.remoteJid, id:w.key&&w.key.id,
         fromMe:!!(w.key&&w.key.fromMe), participant:(w.key&&w.key.participant)||w.participant||null, pushName:w.pushName||null,
         ts:Number(w.messageTimestamp)||0, text:txt(w.message),
@@ -636,7 +655,7 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   const requestPage=(key,tsSec)=>new Promise(res=>{
     let id=null; const timer=setTimeout(()=>{ if(id!=null) pending.delete(id); res(null); }, REQ_TIMEOUT);
     askHistory(COUNT, key, toMs(tsSec))
-      .then(rid=>{ id=rid; lastRequestId=rid; pending.set(rid, msgs=>{ clearTimeout(timer); res(msgs); }); })
+      .then(rid=>{ id=rid; lastRequestId=rid; ourIds.add(String(rid)); pending.set(rid, msgs=>{ clearTimeout(timer); res(msgs); }); })
       .catch(e=>{ clearTimeout(timer); console.error('  fetch err', e.message); res(null); }); });
 
   const finish=(c)=>{ if(done)return; done=true;
@@ -697,10 +716,15 @@ function histNotif(message){ // dig through device/ephemeral wrappers
       }
       const settleStart=Date.now();
       await sleep(4000);                                  // floor
-      while(Date.now()-settleStart < SETTLE_MAX && !(offline.done && Date.now()-lastIn >= QUIET)){
+      // The marker alone releases us, as in WhatsApp Web. Also demanding QUIET_MS of silence after it
+      // held a run for 132 s when the marker had come at 10.5 s: a live account never goes quiet.
+      while(Date.now()-settleStart < SETTLE_MAX && !offline.done){
         await sleep(250);
       }
       if(!offline.done) while(Date.now()-lastIn < QUIET && Date.now()-settleStart < SETTLE_MAX+30000) await sleep(250);
+      // Stop asking for batches. Once the marker has come there is nothing left to pull; if it never
+      // came, re-asking every second for the rest of the run is noise, not progress.
+      clearInterval(batchPump);
       console.error(`[i] offline queue: preview ${offline.preview?JSON.stringify(offline.preview):'not received'}, `
         +`${offline.batches} extra batch request(s) sent, ${offline.delivered} item(s) delivered before the marker`);
       console.error(offline.done
@@ -902,14 +926,14 @@ function histNotif(message){ // dig through device/ephemeral wrappers
       // keep arriving, and stop early once every request has been answered.
       const LATE_WAIT=Number(process.env.LATE_WAIT_MS||300000);
       if(LATE_WAIT>0 && silent>0){
-        const l0=lateReplies, lingerStart=Date.now(); let lastSeen=lateReplies, deadline=lingerStart+LATE_WAIT;
+        const l0=lateOurs, lingerStart=Date.now(); let lastSeen=lateOurs, deadline=lingerStart+LATE_WAIT;
         console.error(`[i] ${silent} request(s) unanswered — staying connected up to `
           +`${Math.round(LATE_WAIT/1000)}s for late answers before disconnecting`);
-        while(Date.now()<deadline && (lateReplies-l0)<silent){
+        while(Date.now()<deadline && (lateOurs-l0)<silent){
           await sleep(1000);
-          if(lateReplies!==lastSeen){ lastSeen=lateReplies; deadline=Math.max(deadline, Date.now()+60000); }
+          if(lateOurs!==lastSeen){ lastSeen=lateOurs; deadline=Math.max(deadline, Date.now()+60000); }
         }
-        console.error(`[i] waited ${((Date.now()-lingerStart)/1000).toFixed(0)}s: ${lateReplies-l0} late `
+        console.error(`[i] waited ${((Date.now()-lingerStart)/1000).toFixed(0)}s: ${lateOurs-l0} late `
           +`answer(s) arrived for the ${silent} unanswered request(s)`);
       }
       if(lateReplies) console.error(`[*] ${lateReplies} reply(ies) arrived after their request had timed out `
