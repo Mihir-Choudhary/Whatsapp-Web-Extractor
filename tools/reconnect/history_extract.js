@@ -446,6 +446,17 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     // branch -- and the whole reason these fallbacks exist is that the id scheme may NOT match. So a
     // chunk resolved by fallback still produced the spurious "[late] arrived after its request had
     // timed out" line that `resolved` was introduced to eliminate.
+    // FALLBACKS ONLY WHEN THE REPLY CARRIES NO SESSION ID. They were written when it was unclear
+    // whether reply ids would match request ids at all; they do (every answer in the 2026-10-09
+    // runs matched exactly). With a real id that matches nothing, the reply is an answer to some
+    // OTHER request -- one that already timed out, or an earlier run's -- and handing it to the
+    // one outstanding request (pagination always has exactly one) gave that chat another chat's
+    // messages and made its next page request a message id from the wrong chat.
+    if(sid!=null && sid!==''){
+      console.error(`  [${what}] reply for session ${sid} has no outstanding request -- `
+        +`banking it rather than discarding it`);
+      return null;
+    }
     if(pending.size===1){ const [k,v]=pending.entries().next().value;
       console.error(`  [${what}] session id ${sid} did not match; attributing to the single outstanding request ${k}`);
       pending.delete(k); if(sid!=null) resolved.add(sid); resolved.add(k); return v; }
@@ -473,6 +484,7 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   // After MAX_DECRYPT_ATTEMPTS across ALL runs we stop: no more retries, and no acknowledgement
   // either. Record it as unrecoverable and move on.
   const MAX_DECRYPT_ATTEMPTS=Number(process.env.MAX_DECRYPT_ATTEMPTS||3);
+  const PLACEHOLDER_BUDGET=Number(process.env.PLACEHOLDER_BUDGET||50); let placeholderSent=0;
   const unrecoverable=[]; const reportedUndecryptable=new Set();
   // Undecryptable traffic FROM OUR OWN ACCOUNT's primary, counted separately from everything else.
   // This is the number that distinguishes a quiet phone from a ratchet we have lost: the primary is
@@ -499,7 +511,11 @@ function histNotif(message){ // dig through device/ephemeral wrappers
       // :43 was revoked after exactly that. Record it and move on.
       if(!reportedUndecryptable.has(m.key.id)){ reportedUndecryptable.add(m.key.id);
         unrecoverable.push({id:m.key.id,chat:m.key.remoteJid,attempts:n}); }
-    } else {
+    } else if(placeholderSent < PLACEHOLDER_BUDGET){
+      // Capped per run. Each of these is a peer request to the phone on the same channel as
+      // history, and draining the whole offline queue now hands us every undecryptable item at
+      // once (4,913 decrypt failures in one drain) -- uncapped, that is thousands of requests.
+      placeholderSent++;
       Promise.resolve(sock.requestPlaceholderResend(m.key)).catch(()=>{});
     }
   } });
@@ -708,7 +724,9 @@ function histNotif(message){ // dig through device/ephemeral wrappers
       // has not come within SETTLE_MAX_MS we go ahead anyway, after QUIET_MS without an inbound
       // stanza, and say so -- a run must not stall forever on a marker that may never arrive.
       const QUIET=Number(process.env.SETTLE_QUIET_MS||3000);
-      const SETTLE_MAX=Number(process.env.SETTLE_MAX_MS||90000);
+      // Draining is now the precondition for any answer arriving, so allow it time: 1,978 items took
+      // 28 s here, and an account with a much larger backlog must not fall back into the stall.
+      const SETTLE_MAX=Number(process.env.SETTLE_MAX_MS||300000);
       let lastIn=Date.now(), inboundSeen=0;
       const bump=()=>{ lastIn=Date.now(); inboundSeen++; };
       for(const tag of ['CB:message','CB:notification','CB:receipt','CB:ack','CB:iq','CB:ib']){
@@ -716,11 +734,17 @@ function histNotif(message){ // dig through device/ephemeral wrappers
       }
       const settleStart=Date.now();
       await sleep(4000);                                  // floor
-      // The marker alone releases us, as in WhatsApp Web. Also demanding QUIET_MS of silence after it
-      // held a run for 132 s when the marker had come at 10.5 s: a live account never goes quiet.
+      // Delivery ending is not enough: WhatsApp Web also awaits waitForOfflineProcessReady(), i.e.
+      // the delivered backlog has been PROCESSED. Asking the instant the marker came (31.6 s) made
+      // answers miss their 10 s deadline -- one reached us 23 s after the phone produced it -- while
+      // the runs that waited for quiet after the marker got every answer in ~3 s. But quiet must be
+      // bounded: on a live account it held one run 132 s after a marker at 10.5 s. So after the
+      // marker, wait for QUIET_MS of silence, at most POST_MARKER_MAX_MS.
+      const POST_MARKER_MAX=Number(process.env.POST_MARKER_MAX_MS||30000);
       while(Date.now()-settleStart < SETTLE_MAX && !offline.done){
         await sleep(250);
       }
+      if(offline.done) while(Date.now()-lastIn < QUIET && Date.now()-offline.at < POST_MARKER_MAX) await sleep(250);
       if(!offline.done) while(Date.now()-lastIn < QUIET && Date.now()-settleStart < SETTLE_MAX+30000) await sleep(250);
       // Stop asking for batches. Once the marker has come there is nothing left to pull; if it never
       // came, re-asking every second for the rest of the run is noise, not progress.
@@ -872,6 +896,18 @@ function histNotif(message){ // dig through device/ephemeral wrappers
             if(pg===0){ probeSilent++; silent++; silentChats.add(a.chat); writeOut(); }
             noteFailure();
             break; }
+          // A page must belong to the chat it was asked for. It is somebody else's answer only when
+          // every message in it maps to a DIFFERENT chat we know; an id form we cannot map is given
+          // the benefit of the doubt rather than dropping a real answer.
+          if(msgs.length){
+            const owner=m=>anchorChat.get(String(m.chat));
+            if(msgs.every(m=>owner(m)!=null && owner(m)!==String(a.chat))){
+              console.error(`  ${a.chat.slice(0,22)} page${pg}: reply belongs to another chat -- banked, `
+                +`not paged from`);
+              for(const m of msgs) all.set(m.id,m);
+              writeOut(); break;
+            }
+          }
           if(pg===0){ served++; answeredChats.add(a.chat); }
           noteSuccess();
           if(!msgs.length){
@@ -888,8 +924,16 @@ function histNotif(message){ // dig through device/ephemeral wrappers
           const newc=msgs.filter(m=>!ondisk.has(m.id)).length;
           writeOut();                                     // checkpoint after every page (crash-safe)
           console.error(`  ${a.chat.slice(0,22)} page${pg}: +${msgs.length} (new ${newc}) oldest=${new Date(o.ts*1000).toISOString().slice(0,10)}`);
+          const advanced = o.id!==key.id;
           key={remoteJid:a.chat,id:o.id,fromMe:!!o.fromMe}; ts=o.ts;
-          if(msgs.length<COUNT) { console.error(`  ${a.chat.slice(0,22)}: short page -> done (${got} total)`); break; }
+          // A short page is the end only when the phone says so (endOfHistoryTransferType 1, recorded
+          // by noteConversations) or when it did not move us back at all. Otherwise -- type 2, "more
+          // remains" -- stopping abandoned a chat the phone still had history for.
+          const endedNow=startReached.has(a.chat)||(a.chat_id&&startReached.has(a.chat_id));
+          if(msgs.length<COUNT && (endedNow || !advanced)) {
+            console.error(`  ${a.chat.slice(0,22)}: short page -> done (${got} total`
+              +(endedNow?', the phone says nothing older remains)':', no older message returned)'));
+            break; }
           await sleep(500);
         }
         probed++;
@@ -927,9 +971,12 @@ function histNotif(message){ // dig through device/ephemeral wrappers
       const LATE_WAIT=Number(process.env.LATE_WAIT_MS||300000);
       if(LATE_WAIT>0 && silent>0){
         const l0=lateOurs, lingerStart=Date.now(); let lastSeen=lateOurs, deadline=lingerStart+LATE_WAIT;
-        console.error(`[i] ${silent} request(s) unanswered — staying connected up to `
+        if(lateOurs>=silent) console.error(`[i] all ${silent} unanswered request(s) already answered late`);
+        else console.error(`[i] ${silent-lateOurs} request(s) still unanswered — staying connected up to `
           +`${Math.round(LATE_WAIT/1000)}s for late answers before disconnecting`);
-        while(Date.now()<deadline && (lateOurs-l0)<silent){
+        // Count every late answer to THIS run's requests, including ones that arrived during
+        // pagination before the wait began; only the rest are still outstanding.
+        while(Date.now()<deadline && lateOurs<silent){
           await sleep(1000);
           if(lateOurs!==lastSeen){ lastSeen=lateOurs; deadline=Math.max(deadline, Date.now()+60000); }
         }
@@ -952,6 +999,11 @@ function histNotif(message){ // dig through device/ephemeral wrappers
         console.error(`\n[DIAGNOSIS] no request was answered within its ${REQ_TIMEOUT/1000}s deadline, `
           +`but ${lateReplies} answer(s) arrived late. The phone IS answering; it is answering `
           +`slowly. Late answers are banked and their chats' outcomes recorded.`);
+      } else if(!served && !offline.done){
+        console.error(`\n[DIAGNOSIS] no reply arrived, and the offline queue was NOT fully drained `
+          +`(${offline.delivered} item(s) received, no <ib><offline/> marker). Answers are queued `
+          +`behind that backlog, so this is the expected result, not the phone declining. Raise `
+          +`SETTLE_MAX_MS and re-run.`);
       } else if(!served){
         if(selfFail.peer>0) console.error(
           `\n[DIAGNOSIS] ${selfFail.peer} repl(ies) from the account's own primary arrived and could `

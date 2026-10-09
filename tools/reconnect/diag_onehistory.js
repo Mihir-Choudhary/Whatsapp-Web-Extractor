@@ -151,12 +151,30 @@ const brief = node => {
     });
     console.error('[one] --passive: logged in passive=true; the passive->active IQ is suppressed');
   }
-  // The offline-delivery-finished marker, caught from the moment the socket exists.
+  // The offline-delivery-finished marker, caught from the moment the socket exists, and the batch
+  // pump that gets us there. The server delivers the offline queue only in batches the client asks
+  // for; Baileys asks once (100). Without draining, the phone's answer is queued behind the backlog
+  // and this diagnostic reproduced exactly the failure it was meant to explain. --no-drain keeps the
+  // old behaviour for comparison.
+  const NO_DRAIN = argv.includes('--no-drain');
+  const off = { done: false, preview: null, batches: 0, lastIn: Date.now() };
   sock.ws.on('CB:ib,,offline', (node) => {
     const c = (node.content || []).find(x => x && x.tag === 'offline');
+    off.done = true;
     console.error(`  [offline] server says offline delivery finished: ${c && c.attrs ? c.attrs.count : '?'} item(s)`
       + (t0 ? ` (${((Date.now() - t0) / 1000).toFixed(2)}s after our request)` : ' (before our request)'));
   });
+  sock.ws.on('CB:ib,,offline_preview', (node) => {
+    const c = (node.content || []).find(x => x && x.tag === 'offline_preview');
+    off.preview = c && c.attrs ? { ...c.attrs } : {}; off.lastIn = Date.now();
+  });
+  for (const tag of ['CB:message', 'CB:notification', 'CB:receipt', 'CB:call']) sock.ws.on(tag, () => { off.lastIn = Date.now(); });
+  const pump = setInterval(() => {
+    if (NO_DRAIN || off.done || off.preview == null || off.batches >= 2000 || Date.now() - off.lastIn < 1000) return;
+    off.batches++; off.lastIn = Date.now();
+    Promise.resolve(sock.sendNode({ tag: 'ib', attrs: {}, content: [{ tag: 'offline_batch', attrs: { count: '100' } }] })).catch(() => {});
+  }, 500);
+  if (pump.unref) pump.unref();
 
   // EVERY inbound stanza, before Baileys' tag dispatch.
   sock.ws.on('frame', node => {
@@ -237,6 +255,15 @@ const brief = node => {
       }
     } catch (e) { console.error('[one] REGISTERED unknown —', e && e.message); }
 
+    // WhatsApp Web sends no peer request before offline delivery has ended; neither do we.
+    if (!NO_DRAIN) {
+      const w0 = Date.now(), LIMIT = Number(process.env.SETTLE_MAX_MS || 300000);
+      while (!off.done && Date.now() - w0 < LIMIT) await new Promise(r => setTimeout(r, 250));
+      clearInterval(pump);
+      console.error(off.done
+        ? `[one] offline queue drained (preview ${JSON.stringify(off.preview)}, ${off.batches} extra batch request(s)) in ${((Date.now() - w0) / 1000).toFixed(1)}s`
+        : `[one] offline queue NOT drained within ${LIMIT / 1000}s -- an unanswered request below is then expected`);
+    }
     // capture our own outbound stanza id so acks can be matched to it
     const origSendNode = sock.sendNode;
     sock.sendNode = function (node) {
@@ -335,10 +362,12 @@ const brief = node => {
       console.error('\nVERDICT: ACCEPTED BUT UNANSWERED. WhatsApp acked our request'
         + (ack ? ' at ' + ack.at : '') + ', so it');
       console.error('reached the server and the stanza was well formed. Nothing came back from the phone.');
-      console.error('That is the signature of a throttle or a phone-side decline -- NOT of a broken');
-      console.error('request, a dead registration, or a disabled feature, all of which are ruled out');
-      console.error('above. The honest reading is that we are inside a quiet window: the fix is pacing,');
-      console.error('not another parameter.');
+      console.error((!NO_DRAIN && !off.done)
+        ? 'The offline queue was not drained, so the answer is most likely queued behind that backlog.'
+        : 'The offline queue WAS drained, so this is not the backlog stall. Not a broken request, a dead');
+      console.error('registration, or a disabled feature either -- those are ruled out above. Listen');
+      console.error('longer (--wait), or check the phone is online with WhatsApp open; then re-run.');
+      console.error('(Earlier versions called this a throttle and prescribed pacing; that was wrong.)');
       done(1);
     }, WAIT);
   });
