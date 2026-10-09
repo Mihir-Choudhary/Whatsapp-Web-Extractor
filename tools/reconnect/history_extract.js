@@ -366,6 +366,49 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     // while ON_DEMAND notifications are still processed (ON_DEMAND is in PROCESSABLE_HISTORY_TYPES).
     shouldSyncHistoryMessage:h=>{ try{ return !!h && h.syncType===B.proto.Message.HistorySyncNotification.HistorySyncType.ON_DEMAND; }catch(e){ return false; } },
     getMessage:async()=>undefined,browser:[subplatOS||'Forensic','Recovery','1.0']});
+  // The server's "offline delivery finished" marker, <ib><offline count="N"/></ib>. WhatsApp Web's
+  // WAWebSendAppStateSyncMsgJob does `yield waitForOfflineDeliveryEnd()` before it sends ANY peer
+  // request, history included. Our earlier listener was attached after connection 'open', which
+  // can be after the marker has already gone by -- so "offline marker not seen" in past logs is not
+  // evidence that it never came. Attached here, the instant the socket exists, it cannot be missed.
+  const offline={done:false, at:null, count:null, preview:null, batches:0, delivered:0};
+  try{ sock.ws.on('CB:ib,,offline', node=>{
+    const c=(node.content||[]).find(x=>x&&x.tag==='offline');
+    offline.done=true; offline.at=Date.now(); offline.count=c&&c.attrs?Number(c.attrs.count):null; }); }catch(e){}
+
+  // PULL THE WHOLE OFFLINE QUEUE, as WhatsApp Web does.
+  //
+  // The server announces the queue with <ib><offline_preview .../> and then delivers it only in
+  // batches the client asks for: <ib><offline_batch count="N"/></ib>. Baileys asks ONCE, for 100,
+  // in its offline_preview handler, and never again. WhatsApp Web's WAWebOfflineHandler keeps asking
+  // (`_maybeRequestMoreStanza: request next batch`) until the server sends <ib><offline/>, and its
+  // WAWebSendAppStateSyncMsgJob will not send a history request before that marker.
+  //
+  // With more than 100 items queued for this device, Baileys therefore receives 100 and the queue
+  // stalls. Everything that arrives later -- including the phone's receipt for our history request
+  // and the answer itself -- is queued BEHIND the stalled backlog, so it never reaches us while we
+  // are connected. Every run received roughly 100 stanzas and then nothing; the only answers that
+  // ever came back were ones that happened to land inside that single batch on a later connection.
+  //
+  // So: after the preview, whenever the inbound stream goes quiet and the marker has not come, ask
+  // for the next batch. Bounded, so a pathological queue cannot loop forever.
+  // NOTE: draining delivers -- and acknowledges -- everything pending for this device slot. When
+  // riding the browser profile's registration, those items will not be redelivered to the browser.
+  const OFFLINE_BATCH=Number(process.env.OFFLINE_BATCH||100), MAX_BATCHES=Number(process.env.OFFLINE_MAX_BATCHES||2000);
+  let lastOfflineIn=Date.now();
+  try{ sock.ws.on('CB:ib,,offline_preview', node=>{
+    const c=(node.content||[]).find(x=>x&&x.tag==='offline_preview');
+    offline.preview=c&&c.attrs?{...c.attrs}:{}; lastOfflineIn=Date.now(); }); }catch(e){}
+  for(const tag of ['CB:message','CB:notification','CB:receipt','CB:call']){
+    try{ sock.ws.on(tag, ()=>{ lastOfflineIn=Date.now(); if(!offline.done) offline.delivered++; }); }catch(e){}
+  }
+  const batchPump=setInterval(()=>{
+    if(offline.done || offline.preview==null || offline.batches>=MAX_BATCHES) return;
+    if(Date.now()-lastOfflineIn < 1000) return;              // still delivering the current batch
+    offline.batches++; lastOfflineIn=Date.now();
+    Promise.resolve(sock.sendNode({tag:'ib',attrs:{},content:[{tag:'offline_batch',attrs:{count:String(OFFLINE_BATCH)}}]})).catch(()=>{});
+  },500);
+  if(batchPump.unref) batchPump.unref();
 
   // Correlate each response to its request by peerDataRequestSessionId (== the fetchMessageHistory id),
   // so a late/duplicate notification can't resolve a different chat's page. Only matched notifications
@@ -579,7 +622,10 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     const pdo={historySyncOnDemandRequest:req, peerDataOperationRequestType:B.proto.Message.PeerDataOperationRequestType.HISTORY_SYNC_ON_DEMAND};
     if(!selfLid) return sock.sendPeerDataOperationMessage(pdo);        // no LID known: old behaviour
     return sock.relayMessage(selfLid, {protocolMessage:{peerDataOperationRequestMessage:pdo, type:PDO_TYPE}},
-      {additionalAttributes:{category:'peer', push_priority:'high_force'}});
+      // privacy_sensitive="1": WhatsApp Web's sendPeerDataOperationRequest passes
+      // PrivacySensitiveType.OnDemand for HISTORY_SYNC_ON_DEMAND, and createUserDeviceMsgStanza
+      // writes it as this attribute. Baileys never sets it.
+      {additionalAttributes:{category:'peer', push_priority:'high_force', privacy_sensitive:'1'}});
   };
 
   // WhatsApp Web's own per-request deadline is the AB prop `history_sync_on_demand_timeout_ms`,
@@ -637,28 +683,33 @@ function histNotif(message){ // dig through device/ephemeral wrappers
       // of the inbound flood with hundreds of kilobytes still arriving and the offline queue not
       // drained. Aligning the condition is cheap. It is not a proven fix and is not claimed as one.
       //
-      // Wait for QUIET_MS with no inbound stanza, bounded by SETTLE_MAX_MS so a large account
-      // cannot stall a run, and never shorter than the 4 s this replaced.
+      // WAIT FOR OFFLINE DELIVERY TO END, as WhatsApp Web does before sending any peer request
+      // (WAWebSendAppStateSyncMsgJob: `yield waitForOfflineDeliveryEnd()`). The gate is the server's
+      // <ib><offline/> marker, caught by the listener attached when the socket was created. If it
+      // has not come within SETTLE_MAX_MS we go ahead anyway, after QUIET_MS without an inbound
+      // stanza, and say so -- a run must not stall forever on a marker that may never arrive.
       const QUIET=Number(process.env.SETTLE_QUIET_MS||3000);
       const SETTLE_MAX=Number(process.env.SETTLE_MAX_MS||90000);
-      let lastIn=Date.now(), inboundSeen=0, offlineDone=false;
+      let lastIn=Date.now(), inboundSeen=0;
       const bump=()=>{ lastIn=Date.now(); inboundSeen++; };
-      for(const tag of ['CB:message','CB:notification','CB:receipt','CB:ack','CB:iq']){
+      for(const tag of ['CB:message','CB:notification','CB:receipt','CB:ack','CB:iq','CB:ib']){
         try{ sock.ws.on(tag, bump); }catch(e){}
       }
-      // Baileys' own "offline queue fully handled" marker, recorded for the log line only -- not a
-      // gate, because the comment above explains why it can never arrive when a payload will not
-      // decrypt. The quiet period is what actually releases us.
-      try{ sock.ws.on('CB:ib', node=>{ bump();
-        try{ if((node.content||[]).some(c=>c&&c.tag==='offline')) offlineDone=true; }catch(e){} }); }catch(e){}
       const settleStart=Date.now();
-      await sleep(4000);                                  // the floor this replaced
-      while(Date.now()-settleStart < SETTLE_MAX && Date.now()-lastIn < QUIET){
+      await sleep(4000);                                  // floor
+      while(Date.now()-settleStart < SETTLE_MAX && !(offline.done && Date.now()-lastIn >= QUIET)){
         await sleep(250);
       }
-      console.error(`[i] connection settled in ${((Date.now()-settleStart)/1000).toFixed(1)}s `
-        +`(${inboundSeen} inbound stanza(s), offline marker ${offlineDone?'seen':'not seen'}) — the `
-        +`reference client's one observed on-demand request was made on a settled connection`);
+      if(!offline.done) while(Date.now()-lastIn < QUIET && Date.now()-settleStart < SETTLE_MAX+30000) await sleep(250);
+      console.error(`[i] offline queue: preview ${offline.preview?JSON.stringify(offline.preview):'not received'}, `
+        +`${offline.batches} extra batch request(s) sent, ${offline.delivered} item(s) delivered before the marker`);
+      console.error(offline.done
+        ? `[i] offline delivery finished (server marker: ${offline.count} item(s), `
+          +`${((offline.at-settleStart)/1000).toFixed(1)}s after open); settled in `
+          +`${((Date.now()-settleStart)/1000).toFixed(1)}s — WhatsApp Web waits for exactly this before asking`
+        : `[!] the server's offline-delivery-finished marker did NOT arrive within `
+          +`${Math.round(SETTLE_MAX/1000)}s; going ahead after ${QUIET/1000}s of quiet `
+          +`(${inboundSeen} inbound stanza(s)). WhatsApp Web would still be waiting here.`);
       // Rebuild the Signal session with our own primary device from a freshly fetched prekey
       // bundle before asking it for anything. The copy in the browser profile is a snapshot of a
       // live ratchet the phone has since advanced, so its replies would arrive on a chain we

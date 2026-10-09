@@ -66,6 +66,15 @@ const QUIET_PEER = argv.includes('--quiet-peer');
 //     never sends it), type="text"
 //   - <enc v="2" type="msg|pkmsg">, plus <device-identity> when pkmsg
 const WEB_STANZA = argv.includes('--webstanza');
+// --passive: log in with ClientPayload.passive = true and NEVER send <iq xmlns="passive"><active/>.
+// Baileys hard-codes passive:false and sends `active` the moment <success> arrives; WhatsApp Web
+// logs in passive when it has pending passive tasks (WAWebRegisterPassiveTasksForConnect) and goes
+// active afterwards. This is an experiment: what does the server send a companion that stays passive?
+const PASSIVE = argv.includes('--passive');
+// --cookies FILE: send this Cookie header on the WebSocket upgrade, as the browser does
+// (wa_ul, wa_web_lang_pref, wa_csrf, wa_lang_pref, wa_web_access_token). Baileys sends none.
+const COOKIE_FILE = arg('--cookies', null);
+const COOKIE = COOKIE_FILE ? fs.readFileSync(COOKIE_FILE, 'utf8').trim() : null;
 
 const red = s => String(s == null ? '' : s).replace(/\d{5,}/g, m => m.slice(0, 4) + '*'.repeat(m.length - 4));
 const bb = b => Buffer.from(b, 'base64');
@@ -119,12 +128,35 @@ const brief = node => {
 
   try { require('./proto_patch').patch(B); } catch (e) {}
 
+  if (PASSIVE && !B.proto.ClientPayload.__wawfPassive) {
+    const enc = B.proto.ClientPayload.encode;
+    B.proto.ClientPayload.encode = function (m, w) { if (m) m.passive = true; return enc.call(this, m, w); };
+    B.proto.ClientPayload.__wawfPassive = true;
+  }
   const sock = makeWASocket({ version, auth: { creds, keys: rt.keys }, logger: quiet,
+    ...(COOKIE ? { options: { headers: { Cookie: COOKIE } } } : {}),
     printQRInTerminal: false, markOnlineOnConnect: true, syncFullHistory: false,
     shouldSyncHistoryMessage: h => { try { return !!h && h.syncType === B.proto.Message.HistorySyncNotification.HistorySyncType.ON_DEMAND; } catch (e) { return false; } },
     getMessage: async () => undefined, browser: ['Forensic', 'Recovery', '1.0'],
     ...(QUIET_PEER ? { maxMsgRetryCount: 0 } : {}) });
   if (QUIET_PEER) console.error('[one] --quiet-peer: no retry receipts, no placeholder resends -- only the history request goes to the phone');
+  if (COOKIE) console.error(`[one] --cookies: sending the browser's Cookie header (${COOKIE.split(';').length} cookies, values not shown)`);
+  if (PASSIVE) {
+    // Reproduce Baileys' CB:success handler minus `sendPassiveIq('active')`.
+    sock.ws.removeAllListeners('CB:success');
+    sock.ws.on('CB:success', async (node) => {
+      try { await sock.uploadPreKeysToServerIfRequired(); } catch (e) {}
+      sock.ev.emit('creds.update', { me: { ...sock.authState.creds.me, lid: node.attrs.lid } });
+      sock.ev.emit('connection.update', { connection: 'open' });
+    });
+    console.error('[one] --passive: logged in passive=true; the passive->active IQ is suppressed');
+  }
+  // The offline-delivery-finished marker, caught from the moment the socket exists.
+  sock.ws.on('CB:ib,,offline', (node) => {
+    const c = (node.content || []).find(x => x && x.tag === 'offline');
+    console.error(`  [offline] server says offline delivery finished: ${c && c.attrs ? c.attrs.count : '?'} item(s)`
+      + (t0 ? ` (${((Date.now() - t0) / 1000).toFixed(2)}s after our request)` : ' (before our request)'));
+  });
 
   // EVERY inbound stanza, before Baileys' tag dispatch.
   sock.ws.on('frame', node => {
