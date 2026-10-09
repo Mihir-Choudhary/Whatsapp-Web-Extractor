@@ -53,6 +53,19 @@ const AS = arg('--as', null);
 // decrypts everything and sends none. This switch (maxMsgRetryCount: 0) tests whether those requests
 // are what delays the phone's answer to ours.
 const QUIET_PEER = argv.includes('--quiet-peer');
+// --webstanza: send the request EXACTLY as WhatsApp Web builds it, instead of through Baileys'
+// relayMessage. From WA Web's own WAWebSendNonMessageDataRequest + WAWebSendAppStateSyncMsgJob +
+// WAWebSendMsgCreateDeviceStanza (bundle fetched 2026-10-09, the build in the cold capture):
+//   - recipient: getMyPrimaryForOutgoingPeerMessage() = own LID user, device 0, ONE device
+//   - payload: the protocolMessage itself. WA Web wraps own-account messages in deviceSentMessage
+//     EXCEPT this type: `isMeAccount(to) && type !== AppStateSync ? wrapDeviceSentMessage : as-is`.
+//     Baileys always wraps (meMsg = {deviceSentMessage:{destinationJid, message}}), and on the peer
+//     path sends only participants[0] -- which is that wrapped copy. So the phone has been receiving
+//     our request disguised as "a message this companion sent", not as a request.
+//   - attrs: category="peer", push_priority="high_force", privacy_sensitive="1" (OnDemand; Baileys
+//     never sends it), type="text"
+//   - <enc v="2" type="msg|pkmsg">, plus <device-identity> when pkmsg
+const WEB_STANZA = argv.includes('--webstanza');
 
 const red = s => String(s == null ? '' : s).replace(/\d{5,}/g, m => m.slice(0, 4) + '*'.repeat(m.length - 4));
 const bb = b => Buffer.from(b, 'base64');
@@ -213,6 +226,23 @@ const brief = node => {
     t0 = Date.now();
     let reqId = null;
     try {
+      if (WEB_STANZA) {
+        if (!selfLid) throw new Error('--webstanza needs our own LID');
+        const to = selfLid;                                        // device 0 = the primary
+        const msg = B.proto.Message.fromObject({ protocolMessage: { peerDataOperationRequestMessage: pdo,
+          type: B.proto.Message.ProtocolMessage.Type.PEER_DATA_OPERATION_REQUEST_MESSAGE } });
+        await sock.assertSessions([to], false);
+        const enc = await sock.signalRepository.encryptMessage({ jid: to, data: B.encodeWAMessage(msg) });
+        const content = [{ tag: 'enc', attrs: { v: '2', type: enc.type }, content: enc.ciphertext }];
+        if (enc.type === 'pkmsg') content.push({ tag: 'device-identity', attrs: {},
+          content: B.encodeSignedDeviceIdentity(sock.authState.creds.account, true) });
+        reqId = B.generateMessageIDV2(sock.user && sock.user.id);
+        const stanza = { tag: 'message', attrs: { to, id: reqId, type: 'text', category: 'peer',
+          push_priority: 'high_force', privacy_sensitive: '1' }, content };
+        console.error(`[one] --webstanza: sending as WhatsApp Web does -- unwrapped protocolMessage, `
+          + `enc=${enc.type}, attrs ${JSON.stringify(stanza.attrs).replace(/\d{6,}/g, m => m.slice(0, 4) + '…')}`);
+        await origSendNode.call(sock, stanza);
+      } else
       reqId = selfLid
         ? await sock.relayMessage(selfLid,
             { protocolMessage: { peerDataOperationRequestMessage: pdo,
@@ -223,7 +253,7 @@ const brief = node => {
       // for this path -- relayMessage calls an internal sendNode closure, not the exported one -- so
       // relying on it meant `ack for our stanza` always read NO even when the ack plainly arrived.
       if (reqId) ourStanzaId = String(reqId);
-      console.error(`[one] request sent via ${selfLid ? 'LID' : 'PN'} routing, msg id ${reqId}`);
+      console.error(`[one] request sent via ${WEB_STANZA ? 'the WA Web stanza' : selfLid ? 'LID' : 'PN'} routing, msg id ${reqId}`);
       console.error(`[one] listening ${WAIT / 1000}s — every inbound stanza below\n`);
     } catch (e) {
       console.error('\n[one] VERDICT: the request could not even be SENT:', e && e.message);
