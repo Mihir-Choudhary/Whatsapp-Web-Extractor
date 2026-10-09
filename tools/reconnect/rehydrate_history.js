@@ -25,6 +25,11 @@ const DRY = argv.includes('--dry-run');
 const DIR = path.resolve(arg('--dir', 'history_chunks'));
 const LEDGER = path.resolve(arg('--ledger', 'history_all.json'));
 
+// The message's CONTENT type. Object.keys(message)[0] was used, and when the protobuf carries
+// messageContextInfo (metadata) ahead of the content, that is what got recorded as the type --
+// 287 recovered messages were typed "messageContextInfo". Skip the metadata keys.
+const META_KEYS=new Set(['messageContextInfo','senderKeyDistributionMessage']);
+function mtype(m){ if(!m) return '?'; for(const k of Object.keys(m)){ if(!META_KEYS.has(k) && m[k]!=null) return k; } return '?'; }
 function need(name) {
   for (const c of [path.resolve(process.cwd(), name), path.join(__dirname, name)])
     if (fs.existsSync(c)) return c;
@@ -49,7 +54,7 @@ function flatten(hs) {
                  participant: (w.key && w.key.participant) || w.participant || null,
                  pushName: w.pushName || null,
                  ts: Number(w.messageTimestamp) || 0, text: txt(w.message),
-                 type: w.message ? Object.keys(w.message)[0] : '?' });
+                 type: mtype(w.message) });
     }
   }
   return out;

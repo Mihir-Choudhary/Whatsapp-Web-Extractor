@@ -1800,6 +1800,10 @@ def cmd_history(a):
             # can be served hundreds of messages and have none of them be new (a refetch), or be
             # served nothing at all (throttled). Those mean opposite things to the user.
             served = len(passd.get("messages") or [])
+            # Chats that ANSWERED, whether or not the answer held any messages. Counting only
+            # messages reported a pass in which 30 chats answered "nothing older" as "no chat
+            # answered", and pointed the user at the phone.
+            answered = len(passd.get("answered_chats") or [])
             served_any = served_any or served > 0
             # Chats the phone itself ended this pass. Accumulated across passes because the anchors
             # are rewritten every pass and a chat ended in pass 1 must stay ended in pass 3.
@@ -1837,7 +1841,11 @@ def cmd_history(a):
                 # is exhausted". The client even stops after the first few silent chats, deliberately,
                 # to stay under the failure limit -- so a run can try 4 chats out of 253, be told
                 # nothing, and announce that the history had run out.
-                if served == 0:
+                if served == 0 and answered:
+                    log.info("pass %d: %d chat(s) answered, none with messages older than what is "
+                             "already recovered -- the phone says the rest has nothing older to give "
+                             "at this depth, or no more yet. Stopping.", p, answered)
+                elif served == 0:
                     # Say what was actually asked. This used to read "the phone answered NONE of the
                     # requests ... it is the throttling described above", which was wrong twice over:
                     # the client stops after its first few chats, so "none of the requests" was four

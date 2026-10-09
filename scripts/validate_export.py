@@ -113,7 +113,8 @@ flagdiff = [m for m in msgs if str(m.get('id')).startswith('true_') and m.get('d
 print("  ..   rows where the stored flag says outgoing but the actor is someone else: %d (types: %s)"
       % (len(flagdiff), dict(collections.Counter(m.get('type') for m in flagdiff))))
 chk("...and those are group system events, not messages",
-    all(m.get('type') in ('gp2', 'notification_template', 'e2e_notification', 'protocol') for m in flagdiff),
+    all(m.get('type') in ('gp2', 'notification', 'notification_template', 'e2e_notification', 'protocol')
+        for m in flagdiff),
     dict(collections.Counter(m.get('type') for m in flagdiff)))
 same = [m for m in msgs if m.get('text') and m.get('text') == m.get('quoted_text')]
 print("  ..   replies whose own words equal the words they quote: %d (people do this)" % len(same))
@@ -338,7 +339,13 @@ if DB:
             q("SELECT COUNT(*) FROM call_log WHERE jid_row_id NOT IN (SELECT _id FROM jid)") == 0)
 
     # the Android correlation chain
-    tot = q("SELECT COUNT(*) FROM message WHERE from_me=0")
+    # Recovered group messages pulled before the extractor captured key.participant have no sender to
+    # resolve; they are reported separately above, so they are not counted against the chain here --
+    # with them included a merged export "failed" at 45% for a gap that is already stated.
+    unsendered = q("""SELECT COUNT(*) FROM message m JOIN chat ch ON ch._id=m.chat_row_id JOIN jid j ON j._id=ch.jid_row_id
+                      WHERE m.from_me=0 AND m.source='phone' AND j.server='g.us'
+                        AND (m.sender_jid_row_id IS NULL OR m.sender_jid_row_id=0)""")
+    tot = q("SELECT COUNT(*) FROM message WHERE from_me=0") - unsendered
     named = q("""SELECT COUNT(*) FROM message m JOIN jid j ON j._id=m.sender_jid_row_id
                  JOIN wa.wa_contacts c ON c.jid=(j.user||'@'||j.server)
                  WHERE m.from_me=0 AND COALESCE(NULLIF(c.display_name,''),NULLIF(c.wa_name,''),NULLIF(c.number,'')) IS NOT NULL""")

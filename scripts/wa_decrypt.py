@@ -607,7 +607,15 @@ _HIST_TYPE = {"conversation": "chat", "extendedtextmessage": "chat", "imagemessa
 def hist_type(t):
     """The protobuf field name the phone used -> the type word the local store uses."""
     k = str(t or "").strip()
-    if not k or k == "?": return "unknown"
+    if not k: return "unknown"
+    # "?" is not "unknown": the history mapper writes it exactly when a record has NO message payload
+    # (`w.message ? Object.keys(w.message)[0] : '?'`), i.e. a stub -- someone added, left, changed
+    # the subject. As "unknown" those read as content of no known type, and in a merged export 23 of
+    # them looked like outgoing messages sent by someone else. They are system events.
+    if k == "?": return "notification"
+    # Records banked before the mapper skipped metadata keys were typed by that key instead of their
+    # content. The content is not recoverable from the ledger; say so rather than invent a type.
+    if k == "messageContextInfo": return "unknown"
     lk = k.lower()
     if lk in _HIST_TYPE: return _HIST_TYPE[lk]
     return k[:-7].lower() if lk.endswith("message") else lk

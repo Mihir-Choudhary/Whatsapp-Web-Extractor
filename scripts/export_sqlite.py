@@ -205,7 +205,7 @@ MTYPE = {'chat':0,'image':1,'ptt':2,'audio':2,'video':3,'vcard':4,'location':5,'
          'poll_creation':66,'poll':66,'poll_vote':46,'gif':13,'album':99,'interactive':45,
          # 15 = deleted ("revoked"), 7 = system, as in Android's msgstore. Mapping revoked to 0 made
          # 126 deletions in the reference store read as 126 blank text messages.
-         'revoked':15,'notification_template':7,'ciphertext':0,'status':116,'template':45,
+         'revoked':15,'notification_template':7,'protocol':7,'ciphertext':0,'status':116,'template':45,
          'rich_response':0,'unknown':0}
 def ack_status(a): return {0:0,1:4,2:5,3:13,4:13}.get(a, 0)
 
@@ -338,13 +338,28 @@ if HIST:
     for m in messages:
         byform.setdefault(_canon_jid(m['chat_jid']), m['chat_jid'])
         byform.setdefault(m['chat_jid'], m['chat_jid'])
+    # ...and the phone-number form onto the LID form. The store files a 1:1 chat under the LID, while
+    # history from the phone names it by phone number; canon_jid only normalises the phone-number
+    # SERVER, so every such record opened a second chat. Measured on a merged export: 77 people's
+    # conversations split in two in msgstore.db (359 chats with messages) while chats.json, which
+    # resolves identities, had them as one (282). The contact record's phoneNumber is the link -- the
+    # same pairs this script writes to jid_map.
+    # A phone number can have more than one LID record (a stale one beside the current one); prefer
+    # the LID the store actually filed a chat under, or the fold misses and the split survives.
+    lid_of = {}
+    for c in contacts:
+        lid, phone = norm_jid(c.get('id')), norm_jid(c.get('phoneNumber'))
+        if lid and phone and str(lid).endswith('@lid'):
+            k = _canon_jid(phone)
+            if k not in lid_of or (lid in byform and lid_of[k] not in byform):
+                lid_of[k] = lid
     appended = 0
     for r in HIST:
         sid = str(r.get('id') or '')
         chat = r.get('chat')
         if not sid or not chat or sid in have: continue
         raw = _canon_jid(chat)
-        cj = byform.get(raw) or chat
+        cj = byform.get(raw) or byform.get(lid_of.get(raw)) or chat
         fromme = 1 if r.get('fromMe') else 0
         part = ser(r.get('participant'))
         is_group = str(cj).endswith('@g.us')

@@ -151,14 +151,22 @@ function decryptHistory(blob, mediaKey){
   const pt=Buffer.concat([d.update(blob.subarray(0,-10)), d.final()]);
   try { return zlib.inflateSync(pt); }                       // history blobs are zlib; fall back to gzip/raw for parity
   catch(e){ try { return zlib.gunzipSync(pt); } catch(e2){ return pt; } } }
+// The message's CONTENT type. Object.keys(message)[0] was used, and when the protobuf carries
+// messageContextInfo (metadata) ahead of the content, that is what got recorded as the type --
+// 287 recovered messages were typed "messageContextInfo". Skip the metadata keys.
+const META_KEYS=new Set(['messageContextInfo','senderKeyDistributionMessage']);
+function mtype(m){ if(!m) return '?'; for(const k of Object.keys(m)){ if(!META_KEYS.has(k) && m[k]!=null) return k; } return '?'; }
 function txt(m){ if(!m) return ''; const c=m.conversation||m.extendedTextMessage?.text
-  ||m.imageMessage?.caption||m.videoMessage?.caption||m.documentMessage?.caption; return c||''; }
+  ||m.imageMessage?.caption||m.videoMessage?.caption||m.documentMessage?.caption
+  // replies to buttons and lists carry their text here; 13 recovered ones had come back empty
+  ||m.templateButtonReplyMessage?.selectedDisplayText||m.buttonsResponseMessage?.selectedDisplayText
+  ||m.listResponseMessage?.title||m.buttonsMessage?.contentText||m.listMessage?.description; return c||''; }
 function flatten(hs){ const out=[]; for(const conv of (hs.conversations||[])){ for(const hm of (conv.messages||[])){
   const w=hm.message; if(!w||!w.key) continue; out.push({chat:conv.id||w.key.remoteJid, id:w.key.id,
     // The group sender, from either place the protobuf carries it, plus the name the sender gave
     // themselves. Without these a recovered group message has no author at all.
     fromMe:!!w.key.fromMe, participant:(w.key&&w.key.participant)||w.participant||null, pushName:w.pushName||null,
-    ts:Number(w.messageTimestamp)||0, text:txt(w.message), type:w.message?Object.keys(w.message)[0]:'?'}); } } return out; }
+    ts:Number(w.messageTimestamp)||0, text:txt(w.message), type:mtype(w.message)}); } } return out; }
 function histNotif(message){ // dig through device/ephemeral wrappers
   let m=message; for(let i=0;i<4&&m;i++){ if(m.protocolMessage?.historySyncNotification) return m.protocolMessage.historySyncNotification;
     m=m.deviceSentMessage?.message||m.ephemeralMessage?.message||m.viewOnceMessage?.message; } return null; }
@@ -195,6 +203,12 @@ function histNotif(message){ // dig through device/ephemeral wrappers
   // the server had held the answers until the next connection. Those used to be banked but otherwise
   // ignored; they are answers, and are now counted as such.
   let lateReplies=0, lateMessages=0, lateOurs=0;
+  // Both listeners see the same late reply; count it once. Measured: 2 late replies were reported
+  // as "all 4 unanswered request(s) already answered late", which also ended the wait for the two
+  // that were still outstanding.
+  const lateSeen=new Set();
+  const noteLate=(sid)=>{ const k=String(sid); if(lateSeen.has(k)) return false; lateSeen.add(k);
+                          lateReplies++; if(ourIds.has(k)) lateOurs++; return true; };
   // Request ids this run sent. A late reply for one of these answers THIS run; anything else is an
   // answer to an earlier run's request. Counting both as ours ended the late-answer wait early.
   const ourIds=new Set();
@@ -573,7 +587,7 @@ function histNotif(message){ // dig through device/ephemeral wrappers
       +` (received ${new Date().toISOString()})`);
     if(r==='duplicate') continue;    // messaging-history.set already resolved and banked these messages
     if(!r){
-      lateReplies++; if(ourIds.has(String(sid))) lateOurs++;
+      noteLate(sid);
       if(msgs&&msgs.length){
         let fresh=0; for(const mm of msgs){ if(!all.has(mm.id)) fresh++; all.set(mm.id,mm); }
         lateMessages+=msgs.length;
@@ -600,11 +614,11 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     if(r==='duplicate') return;               // same chunk via the other listener; already banked
     noteConversations(d.chats);               // Baileys spreads each conversation into d.chats
     if(!r){
-      lateReplies++; if(ourIds.has(String(sid))) lateOurs++;
+      noteLate(sid);
       const late=(d.messages||[]).map(w=>({ chat:w.key&&w.key.remoteJid, id:w.key&&w.key.id,
         fromMe:!!(w.key&&w.key.fromMe), participant:(w.key&&w.key.participant)||w.participant||null, pushName:w.pushName||null,
         ts:Number(w.messageTimestamp)||0, text:txt(w.message),
-        type:w.message?Object.keys(w.message)[0]:'?' })).filter(x=>x.id);
+        type:mtype(w.message) })).filter(x=>x.id);
       if(late.length){
         let fresh=0; for(const mm of late){ if(!all.has(mm.id)) fresh++; all.set(mm.id,mm); }
         lateMessages+=late.length;
@@ -616,7 +630,7 @@ function histNotif(message){ // dig through device/ephemeral wrappers
     }
     const msgs=(d.messages||[]).map(w=>({ chat:w.key&&w.key.remoteJid, id:w.key&&w.key.id, fromMe:!!(w.key&&w.key.fromMe),
       participant:(w.key&&w.key.participant)||w.participant||null, pushName:w.pushName||null,
-      ts:Number(w.messageTimestamp)||0, text:txt(w.message), type:w.message?Object.keys(w.message)[0]:'?' })).filter(m=>m.chat&&m.id);
+      ts:Number(w.messageTimestamp)||0, text:txt(w.message), type:mtype(w.message) })).filter(m=>m.chat&&m.id);
     console.error('  [messaging-history.set] '+msgs.length+' msgs for session '+sid);
     r(msgs);
   });
@@ -947,7 +961,12 @@ function histNotif(message){ // dig through device/ephemeral wrappers
             +`this device slot is still registered, which is definitive.`);
           break;
         }
-        if(probed>=PROBE && probeSilent>=PROBE){
+        // The probe exists to stop a run whose FIRST chats are all silent. probeSilent counts every
+        // silent first page and is never reset, so `probed>=PROBE && probeSilent>=PROBE` also fired
+        // much later: a full run had 30 chats answer and was then stopped by its 4th silence anywhere,
+        // announcing that "the first 4 chats returned NOTHING". Before the offline-queue fix almost
+        // every chat was silent, so the two readings coincided and this never showed.
+        if(probed===PROBE && probeSilent===PROBE){
           // Deliberately does NOT claim the registration is dead. Silence has more than one cause
           // and this tool repeatedly mis-attributed it; diag_health.js settles it with a USync
           // device query instead of inferring from silence.

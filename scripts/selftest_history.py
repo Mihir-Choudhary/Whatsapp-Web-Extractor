@@ -64,7 +64,8 @@ check("extendedTextMessage is a chat message", hist_type("extendedTextMessage"),
 check("stickerMessage is a sticker", hist_type("stickerMessage"), "sticker")
 check("an unmapped xMessage drops the suffix", hist_type("albumMessage"), "album")
 check("something else is passed through lowercased", hist_type("Weird"), "weird")
-check("nothing becomes unknown", hist_type("?"), "unknown")
+check("nothing becomes unknown", hist_type(""), "unknown")
+check("no message payload ('?', a stub) is a system event", hist_type("?"), "notification")
 
 print("\nthe id the two sides share is the stanza")
 check("a stored composite yields its stanza", stanza_of("false_120300000009@g.us_ABC123"), "ABC123")
