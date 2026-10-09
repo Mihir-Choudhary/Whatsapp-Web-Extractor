@@ -428,7 +428,9 @@ Settings (environment variables, all optional):
 
 | variable | default | what it does |
 |---|---|---|
-| `SETTLE_MAX_MS` | 90000 | longest wait for the queue to finish draining before asking anyway |
+| `SETTLE_MAX_MS` | 300000 | longest wait for the queue to finish draining before asking anyway |
+| `POST_MARKER_MAX_MS` | 30000 | after draining, how long to wait for the backlog to finish processing |
+| `PLACEHOLDER_BUDGET` | 50 | cap on resend requests sent to the phone for undecryptable items, per run |
 | `OFFLINE_BATCH` / `OFFLINE_MAX_BATCHES` | 100 / 2000 | batch size requested, and the cap on requests |
 | `LATE_WAIT_MS` | 300000 | how long to stay connected for late answers |
 | `PROBE_CHATS` | 4 | stop after this many silent chats in a row at the start |
