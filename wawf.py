@@ -25,7 +25,7 @@ Two alternative actions replace the default job:
 Examples:
   wawf "C:\\Users\\<you>\\AppData\\Local\\Microsoft\\Edge\\User Data\\Default"
   wawf <PROFILE> --out sqlite:D:\\case\\db --out txt:D:\\case\\out
-  wawf <PROFILE> --key companion_enc_static.txt --out json:D:\\case --audit
+  wawf <PROFILE> --key companion_enc_static.txt --out json:D:\\case
 """
 from __future__ import annotations
 import argparse, sys, os, re, json, base64, logging, collections, datetime as dt, subprocess, time
@@ -813,18 +813,27 @@ def cmd_decrypt(a):
             v = float(v); v = v/1000 if v > 1e12 else v
             return dt.datetime.fromtimestamp(v, dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if 1e9 < v < 2e9 else ""
         except Exception: return ""
-    chats = collections.defaultdict(list); ok = fail = 0
+    chats = collections.defaultdict(list); ok = fail = nobody = other = 0
     for m in msgs:
-        if not m["data"] or m["scheme"] != 1: continue   # scheme-1 only; skip scheme-0 (would be garbage)
+        # Every message is written. One without a decryptable body used to be skipped here, so it was
+        # missing from chats.json and the transcript while msgstore.db kept it (a sender-deleted
+        # message, measured). It is now a row with no text and a body_status saying why.
+        if not m["data"]:
+            nobody += 1; chats[m["chat"]].append(WD.bodyless_row(m, ts(m["t"]), ids, "none")); continue
+        if m["scheme"] != 1:                     # never decrypt another scheme's body into garbage
+            other += 1; chats[m["chat"]].append(WD.bodyless_row(m, ts(m["t"]), ids, "other-scheme")); continue
         # CBC consumes whole blocks: update() on a ciphertext that is not a multiple of 16 returns the
         # blocks it could and silently buffers the tail, so a truncated record decrypts to a SHORT
         # plaintext and is still counted as a success. Count it as what it is. None of the 22,121
         # bodies in the reference profile are misaligned; this is about the counts staying truthful
         # on a damaged store, which is exactly the case where they are what is being measured.
         if len(m["data"]) % 16:
-            fail += 1; log.debug("misaligned body %s: %d bytes", m["id"][:24], len(m["data"])); continue
+            fail += 1; log.debug("misaligned body %s: %d bytes", m["id"][:24], len(m["data"]))
+            chats[m["chat"]].append(WD.bodyless_row(m, ts(m["t"]), ids, "failed")); continue
         try: pt = WD.pk7(Cipher(algorithms.AES(key), modes.CBC(m["iv"])).decryptor().update(m["data"]))
-        except Exception as e: fail += 1; log.debug("decrypt fail %s: %s", m["id"][:24], e); continue
+        except Exception as e:
+            fail += 1; log.debug("decrypt fail %s: %s", m["id"][:24], e)
+            chats[m["chat"]].append(WD.bodyless_row(m, ts(m["t"]), ids, "failed")); continue
         chats[m["chat"]].append(WD.msg_row(m, ts(m["t"]), pt, ids))
         ok += 1
     for c in chats: chats[c].sort(key=lambda x: x["t"])
@@ -864,7 +873,7 @@ def cmd_decrypt(a):
                        records=len(tbl["identities"]))
     if only == "json":
         log.info("decrypted %d bodies (%d failed) -> %s/ (chats.json + identities.json)", ok, fail, a.out)
-        AUDIT.artifact(f"{a.out}/chats.json", kind="decrypted chats (JSON)", records=ok)
+        AUDIT.artifact(f"{a.out}/chats.json", kind="decrypted chats (JSON)", records=sum(len(v) for v in chats.values()))
         # the same receipt the other formats leave: this branch returned before writing one, so a
         # json-only export was the one kind a later --history run could not describe
         _write_export_manifest(a.out, "cache+phone" if hist_added else "cache",
@@ -877,6 +886,9 @@ def cmd_decrypt(a):
     # that lists files that are not there is a log line that gets believed
     wrote = "transcripts.txt" if only == "txt" else "chats.json + identities.json + transcripts.txt"
     log.info("decrypted %d bodies (%d failed) -> %s/ (%s)", ok, fail, a.out, wrote)
+    if nobody or other or fail:
+        log.info("also written without text, not dropped: %d message(s) with no stored body, %d with a "
+                 "body of another scheme, %d that failed to decrypt (see body_status)", nobody, other, fail)
     # outcome of the bulk decrypt + hashes of what was produced (so the exports are tamper-evident)
     AUDIT.crypto("decrypt", algorithm="AES-CBC-128", scheme="1 (final)", key=key,
                  input_desc="all scheme-1 msgRowOpaqueData bodies", records_in=ok + fail,
@@ -884,8 +896,8 @@ def cmd_decrypt(a):
     # only record artifacts that were actually produced: with --out txt:PATH there is no chats.json,
     # and a custody record asserting a file that does not exist is worse than no record
     if only != "txt":
-        AUDIT.artifact(f"{a.out}/chats.json", kind="decrypted chats (JSON)", records=ok)
-    AUDIT.artifact(f"{a.out}/transcripts.txt", kind="decrypted transcripts (text)", records=ok)
+        AUDIT.artifact(f"{a.out}/chats.json", kind="decrypted chats (JSON)", records=sum(len(v) for v in chats.values()))
+    AUDIT.artifact(f"{a.out}/transcripts.txt", kind="decrypted transcripts (text)", records=sum(len(v) for v in chats.values()))
     _write_export_manifest(a.out, "cache+phone" if hist_added else "cache",
                            {"messages": sum(len(v) for v in chats.values()), "chats": len(chats),
                             "decrypted_from_cache": ok, "recovered_from_phone": hist_added},
@@ -2011,7 +2023,7 @@ def main():
         "EXAMPLES\n"
         "  wawf \"" + _example_profile() + "\"\n"
         "  wawf \"" + _example_profile() + "\" --out sqlite:D:\\case\\db\n"
-        "  wawf \"" + _example_profile() + "\" --key companion_enc_static.txt --out json:D:\\case --audit\n"
+        "  wawf \"" + _example_profile() + "\" --key companion_enc_static.txt --out json:D:\\case\n"
         "\n"
         "PROFILE LOCATIONS ON THIS SYSTEM\n" + _profile_help() + "\n",
         formatter_class=argparse.RawDescriptionHelpFormatter)

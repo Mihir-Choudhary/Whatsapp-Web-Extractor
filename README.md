@@ -110,7 +110,10 @@ re-order how a line renders and this file's whole premise is that every line is 
 
 `chats.json` keeps `sender` exactly as stored and **adds** `sender_name`, `sender_lid`,
 `sender_phone`, `sender_source`, `chat_name` and `quoted_text` beside it — nothing is replaced by an
-interpretation of it. `identities.json` is the correlation table itself: jid ↔ lid ↔ phone ↔ name ↔ pushname, where
+interpretation of it. Every message in the store is written, including one whose body cannot be
+turned into text: such a row has empty `text` and one extra field, `body_status` — `none` (no body
+was stored, e.g. a message deleted by its sender), `other-scheme` (a body this key does not open), or
+`failed`. `identities.json` is the correlation table itself: jid ↔ lid ↔ phone ↔ name ↔ pushname, where
 each label came from, which contacts are in the address book, plus group subjects, members, **past**
 members and admins. That mapping is the one thing the browser holds and the wire format does not: a
 lid-keyed contact record carries the matching `phoneNumber`, and on disk that is the only place the
@@ -247,6 +250,12 @@ wawf <PROFILE> --out D:\case\out
 The key capture is **networked**: it logs in as your linked device and registers activity on the
 account. Own account or authorised investigation only. The captured key is written as
 `companion_enc_static.txt` beside the output, and a later run finds it there and skips the network.
+
+> **Two files in the (first) output folder are key material, not evidence.**
+> `companion_enc_static.txt` decrypts the store, and `creds_in.json` holds the linked device's private
+> Noise key and identity — enough to log in *as* that device. They are left there so a later run can
+> reuse them (automatically, or with `--key` / `--creds`). Remove both before an export is copied,
+> shared or attached to a report; everything else in the folder is safe to hand over.
 
 **B. Decrypt offline with a key you already hold.** Useful when you must not contact the account at
 all, and it keeps working after the device has been revoked, because decryption is purely local:

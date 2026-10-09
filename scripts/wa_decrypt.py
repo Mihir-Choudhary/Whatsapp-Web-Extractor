@@ -79,7 +79,18 @@ def _textlike(c):
     o = ord(c)
     return (c.isprintable() or c in "\n\r\t" or o in _JOINERS
             or 0xE0020 <= o <= 0xE007F
-            or unicodedata.category(c) in ("Cf", "Mn", "Me", "Mc"))
+            or unicodedata.category(c) in ("Cf", "Mn", "Me", "Mc")
+            or _newer_than_tables(c))
+
+def _newer_than_tables(c):
+    """A code point this interpreter's Unicode database calls unassigned, that a newer standard may
+    well have assigned. The build interpreter is Python 3.12 (Unicode 15.0); U+1FAE9 FACE WITH BAGS
+    UNDER EYES arrived in Unicode 16, read as unassigned, failed the 90%-text test, and took the
+    whole message with it -- measured: messages consisting of, or ending in, that emoji exported as
+    empty. Surrogates and the permanent noncharacters are still refused."""
+    o = ord(c)
+    return (unicodedata.category(c) == "Cn" and o >= 0x2000
+            and not (o & 0xFFFE) == 0xFFFE and not 0xFDD0 <= o <= 0xFDEF)
 
 # Bidi and other explicit-formatting controls, stripped on the way into the LINE-ORIENTED file only.
 # chats.json keeps the characters the store held; the transcript cannot, because they rewrite it.
@@ -454,10 +465,67 @@ def split_body(pt):
     return (b"".join(own) or None), quoted   # own is None when the only content is a quote, and
                                              # saying so is the entire point
 
+# A serialized message key, "<fromMe>_<chat>_<id>[_<participant>]". An encrypted edit's body holds
+# the key of the message it edits, and it was exported as that message's TEXT -- the transcript
+# showed the user "saying" true_6627..._3EB0FBE4... It is a reference, never something typed; the
+# raw export keeps it.
+_MSGKEY = re.compile(r"(?:true|false)_[^_\s]+@[a-z.]+_[0-9A-Fa-f]{16,}(?:_[^\s]+)?\Z")
+
+def _primary_text(buf):
+    """Field 1 of the body's own part, read verbatim -- the message's `body`.
+
+    This is WhatsApp Web's internal record, not the protocol Message. Field 1 is its `body`
+    property: the text of a text message, but for image / video / sticker messages the BASE64 JPEG
+    THUMBNAIL ("/9j/4AAQ..."). `leaves()` guards against such blobs with a 12+ digit / 40+ base64 /
+    90%-text test, and applied to a text message's own body those guards deleted real messages: a
+    number someone sent ("1234567812345678", "919876543210"), a pasted hash, and -- with
+    _newer_than_tables -- anything containing a new emoji. So: take field 1 verbatim unless it is an
+    encoded image, which is decided by decoding it, not by its shape.
+    (A first version also read field 6 as extendedTextMessage; this is not the Message schema, so
+    that was unverified and is gone. Regression check over all 22,562 bodies: see STATE PHASE 43.)"""
+    if not buf: return ""
+    i, n = 0, len(buf)
+    try:
+        while i < n:
+            tag, i = _varint(buf, i); f, wt = tag >> 3, tag & 7
+            if wt == 2:
+                ln, i = _varint(buf, i); seg = buf[i:i + ln]; i += ln
+                if f == 1:
+                    t = seg.decode("utf-8")
+                    return "" if (not t.strip() or _is_encoded_image(t)) else t
+            elif wt == 0: _, i = _varint(buf, i)
+            elif wt == 5: i += 4
+            elif wt == 1: i += 8
+            else: break
+    except Exception:
+        pass                      # not readable field by field: the scraper still runs
+    return ""
+
+_IMAGE_MAGIC = (b"\xff\xd8\xff", b"\x89PNG", b"RIFF", b"GIF8")
+def _is_encoded_image(t):
+    """True for a base64 string that decodes to an image (a stored thumbnail), not merely base64-shaped."""
+    s = t.strip()
+    if len(s) < 40 or not re.fullmatch(r"[A-Za-z0-9+/\r\n]+={0,2}", s): return False
+    try:
+        head = base64.b64decode(s[:64] + "=" * (-len(s[:64]) % 4))
+    except Exception:
+        return False
+    return head.startswith(_IMAGE_MAGIC)
+
 def _scrape(buf, cap):
     if not buf: return ""
-    lv = list(dict.fromkeys(leaves(buf)))
-    return " ".join(x for x in lv if not _ADDRESS.match(x.strip()))[:cap]
+    p = _primary_text(buf)
+    # The address filter still applies to the primary text: a body that is only a jid is routing
+    # data in these records, not something someone typed (pinned by selftest_identities).
+    if p and (_ADDRESS.match(p.strip()) or _MSGKEY.match(p.strip())): p = ""
+    # ...and a scraped fragment of the primary text is dropped, not appended. leaves() tries any
+    # string starting with a byte that is also a protobuf tag ('*', '"', newline...) as nested
+    # protobuf; a WhatsApp *bold* message parsed that way lost its first characters, which is the
+    # copy the old export showed ("allet Update*" for "*Wallet Update*", 26 messages here).
+    rest = [x for x in leaves(buf) if not _ADDRESS.match(x.strip()) and not _MSGKEY.match(x.strip())
+            and not (p and x.strip() in p)]
+    lv = list(dict.fromkeys(([p] if p else []) + rest))
+    return " ".join(lv)[:cap]
 
 def texts(pt, cap=2000):
     """-> (own text, quoted text) from ONE parse of the body.
@@ -620,6 +688,18 @@ def bank_history(master, msgs):
                 cur[k] = v; filled = True
         if filled: enriched += 1
     return new, enriched
+
+def bodyless_row(m, when, ids, status):
+    """A message whose body could not be turned into text still EXISTS, and is written as a row.
+
+    The text writers used to `continue` past any message without a decryptable body, so it vanished
+    from chats.json and the transcript while msgstore.db -- which writes every message -- kept it.
+    Measured: a message deleted by its sender ("revoked", body cleared) was in msgstore.db and in
+    neither of the other two formats. A deletion marker is evidence. `status` says why there is no
+    text: "none" (no body was stored), "other-scheme" (a body this key does not open), "failed"."""
+    row = msg_row(m, when, b"", ids)
+    row["body_status"] = status
+    return row
 
 def merge_history(chats, recovered, ids, ts):
     """Fold messages the phone served into an export built from the local store.
@@ -880,13 +960,22 @@ def main():
             return dt.datetime.fromtimestamp(v, dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if 1e9 < v < 2e9 else ""
         except Exception: return ""
     chats = collections.defaultdict(list); ok = fail = 0
+    nobody = other = 0
     for m in msgs:
-        if not m["data"] or m["scheme"] != 1: continue   # only scheme-1 bodies match this key; skip (don't write garbage)
-        if len(m["data"]) % 16: fail += 1; continue       # misaligned: see the note in wawf.py's cmd_decrypt
+        if not m["data"]:                                  # no body stored: still a message (see bodyless_row)
+            nobody += 1; chats[m["chat"]].append(bodyless_row(m, ts(m["t"]), ids, "none")); continue
+        if m["scheme"] != 1:                               # a body this key does not open: never decrypt to garbage
+            other += 1; chats[m["chat"]].append(bodyless_row(m, ts(m["t"]), ids, "other-scheme")); continue
+        if len(m["data"]) % 16:                            # misaligned: see the note in wawf.py's cmd_decrypt
+            fail += 1; chats[m["chat"]].append(bodyless_row(m, ts(m["t"]), ids, "failed")); continue
         try: pt = pk7(Cipher(algorithms.AES(key), modes.CBC(m["iv"])).decryptor().update(m["data"]))
-        except Exception: fail += 1; continue
+        except Exception:
+            fail += 1; chats[m["chat"]].append(bodyless_row(m, ts(m["t"]), ids, "failed")); continue
         ok += 1
         chats[m["chat"]].append(msg_row(m, ts(m["t"]), pt, ids))
+    if nobody or other:
+        print(f"[+] {nobody} message(s) with no stored body and {other} with a body of another scheme "
+              f"are written without text (body_status), not dropped")
     print(f"[+] decrypted {ok} bodies ({fail} failed)  ->  {a.out}/")
     if ok and fail > ok:
         print("[!] most bodies failed to decrypt — companion_enc_static likely wrong for THIS profile/device.")

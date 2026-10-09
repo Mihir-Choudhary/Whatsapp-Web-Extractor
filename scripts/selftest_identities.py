@@ -432,6 +432,36 @@ check("...nor into a label there", "AnnBob" in bt, True)
 check("the row still holds the characters the store held", rlo in brow["text"], True)
 
 print()
+print("a message's own body field is read verbatim, whatever it looks like")
+# Measured on the reference store: every one of these decrypted, and every one exported EMPTY or
+# truncated, because the generic scraper's guards (12+ digits, 40+ base64-looking, 90% "text-like",
+# protobuf-tag first byte) were applied to the message's own text field.
+import wa_decrypt as _WD
+def _pb(field, payload):
+    v, n, out = (field << 3) | 2, len(payload), bytearray()
+    out.append(v)
+    while True:
+        b = n & 0x7F; n >>= 7
+        out.append(b | (0x80 if n else 0))
+        if not n: break
+    return bytes(out) + payload
+def _body(text):                       # top-level field 1 = this message; its field 1 = body
+    return _pb(1, _pb(1, text.encode("utf-8")))
+for label, txt in [("a number someone sent", "1234567812345678"),
+                   ("a phone number as the whole message", "919876543210"),
+                   ("a pasted hex hash", "ae4f5d0932e7e10a8e4dfdbbe9bc7773dbbb5936ab25b310f8ceb44fe99f"),
+                   ("an emoji newer than the interpreter's Unicode tables", "\U0001FAE9"),
+                   ("text ending in new emoji", "Are.....\U0001FAE9\U0001FAE9\U0001FAE9"),
+                   ("WhatsApp *bold* -- first byte '*' is also a protobuf tag", "*Wallet Update*\nDear Customer")]:
+    check(label, _WD.texts(_body(txt))[0], txt)
+thumb = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEABsbGxscGx4hIR4qLS0tLS0yMjIyMjI="
+check("a stored JPEG thumbnail in the body field is NOT text", _WD.texts(_body(thumb))[0], "")
+check("...a base64-shaped hash is not mistaken for one", _WD._is_encoded_image(
+      "ae4f5d0932e7e10a8e4dfdbbe9bc7773dbbb5936ab25b310f8ceb44fe99f"), False)
+q = _pb(1, _pb(1, b"reply")) + _pb(2, _pb(1, b"*the quoted one*"))
+check("own and quoted stay apart", _WD.texts(q), ("reply", "*the quoted one*"))
+
+print()
 if FAIL:
     print(f"{len(FAIL)} CASE(S) FAILED")
     for f in FAIL: print("  -", f)

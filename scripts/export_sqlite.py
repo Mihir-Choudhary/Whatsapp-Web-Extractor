@@ -203,7 +203,10 @@ jid_id(OWNER_PHONE); jid_id(OWNER_LID)
 MTYPE = {'chat':0,'image':1,'ptt':2,'audio':2,'video':3,'vcard':4,'location':5,'live_location':16,
          'gp2':7,'e2e_notification':7,'notification':7,'call_log':90,'document':9,'sticker':20,
          'poll_creation':66,'poll':66,'poll_vote':46,'gif':13,'album':99,'interactive':45,
-         'revoked':0,'ciphertext':0,'status':116,'template':45,'rich_response':0,'unknown':0}
+         # 15 = deleted ("revoked"), 7 = system, as in Android's msgstore. Mapping revoked to 0 made
+         # 126 deletions in the reference store read as 126 blank text messages.
+         'revoked':15,'notification_template':7,'ciphertext':0,'status':116,'template':45,
+         'rich_response':0,'unknown':0}
 def ack_status(a): return {0:0,1:4,2:5,3:13,4:13}.get(a, 0)
 
 # store() is defined per-engine in the loader above; reference model-storage object stores by NAME.
@@ -270,9 +273,10 @@ for o in store(MSG_SID):
     # `sticker` is in the list now: a sticker has no text of its own, but it can be a REPLY, and the
     # quote it carries is the only record of what it answered. Before the own/quoted split that quote
     # was mistaken for the sticker's own text, which is why stickers were kept out.
-    body, quoted_body = decrypt_body(o.get('msgRowOpaqueData')) if typ in (
-        'chat','image','video','document','ptt','audio','sticker','interactive','template',
-        'rich_response','poll_creation') else (None, None)
+    # Every message that carries a body is decrypted, whatever its type -- the JSON export already
+    # does this. The old allow-list silently dropped the text of types it did not name: a
+    # template_button_reply ("Yes, I am interested") was in chats.json and empty in msgstore.db.
+    body, quoted_body = decrypt_body(o.get('msgRowOpaqueData'))
     md = None
     if o.get('mediaKey') or o.get('directPath'):
         md = {'media_key': base64.b64decode(o['mediaKey']) if o.get('mediaKey') else None,
