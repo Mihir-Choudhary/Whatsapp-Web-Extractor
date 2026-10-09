@@ -400,8 +400,39 @@ node tools/reconnect/diag_onehistory.js      # ONE request, every inbound stanza
 ```
 
 It separates causes that otherwise look identical: no ack means the stanza was never accepted (not a
-cooldown), an explicit error means refused with a readable reason, an ack then silence means throttled
-or declined by the phone, and an ack then a notification means served.
+cooldown), an explicit error means refused with a readable reason, and an ack then a notification
+means served. An ack then silence is NOT, by itself, the phone declining: the commonest cause was an
+offline queue the client had not finished pulling (below), with the phone's answer queued behind it.
+
+#### How a history run proceeds
+
+1. **Drain the offline queue.** On login the server announces everything pending for the device
+   (`offline_preview`) and delivers it only in batches the client asks for. The client keeps asking
+   until the server says delivery is finished (`<ib><offline/>`) — as WhatsApp Web does — and only
+   then sends a history request. Anything that arrives later, including the phone's answers, is
+   queued behind that backlog, so asking before it is drained gets no answer while you are
+   connected. (The Baileys library asks for one batch of 100 and stops; with a ~2,000-item backlog
+   that was the whole reason history appeared to stop working.)
+2. **Ask, chat by chat**, skipping chats the phone has said are finished and asking chats that have
+   stayed silent last (`tools/reconnect/history_chat_state.json` remembers both across runs).
+3. **Each answer** is downloaded, decrypted, kept in `history_chunks/`, then released from the CDN
+   the way WhatsApp Web releases it. The log records when the phone produced it.
+4. **Before disconnecting**, if a request went unanswered the client waits for late answers.
+   Answers that arrive on a later connection are still banked.
+
+**Side effect.** Draining receives and acknowledges everything pending for the device slot. While the
+tool rides the browser profile's registration (the default, unless `pair.js` has been run), those
+items are not redelivered to the browser.
+
+Settings (environment variables, all optional):
+
+| variable | default | what it does |
+|---|---|---|
+| `SETTLE_MAX_MS` | 90000 | longest wait for the queue to finish draining before asking anyway |
+| `OFFLINE_BATCH` / `OFFLINE_MAX_BATCHES` | 100 / 2000 | batch size requested, and the cap on requests |
+| `LATE_WAIT_MS` | 300000 | how long to stay connected for late answers |
+| `PROBE_CHATS` | 4 | stop after this many silent chats in a row at the start |
+| `HIST_CHUNK_DELETE` | on | `0` keeps consumed chunks on the CDN instead of releasing them |
 
 **What to expect.** On a healthy device the server acks in ~0.3s and a chunk of up to 50 messages
 arrives ~3s later. A first pass over a few hundred chats takes tens of minutes; draining a long
