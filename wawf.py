@@ -180,7 +180,7 @@ def _holds_export(path):
         log.debug("could not inspect %s: %s", path, e)
     return None
 
-WAWF_RELEASE = "1.0.1"                  # the last tagged release this code descends from
+WAWF_RELEASE = "1.0.2"                  # the last tagged release this code descends from
 
 def _wawf_version():
     """The exact code that produced an artifact: release + git commit (+ ".dirty" if the working tree
