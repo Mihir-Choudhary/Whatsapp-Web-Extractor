@@ -23,6 +23,11 @@ after a while. Smart App Control **cannot be re-enabled once turned off**, so di
 one-way decision about the whole machine, not a workaround; running from Python instead avoids the
 question entirely. See [BUILD.md](BUILD.md).
 
+`--history` (pulling messages older than the browser cache from your phone) is the one feature the
+`.exe` cannot do alone: it runs a Node.js client that is not bundled. For it, clone this repository,
+install [Node.js](https://nodejs.org), run `npm install` in `tools/reconnect`, and run the `.exe` from
+inside the repository (or `python wawf.py`). See [Recovering history](#recovering-history-older-than-the-cache).
+
 ### Linux / macOS — run with Python
 
 ```bash
