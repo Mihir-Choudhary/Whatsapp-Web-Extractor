@@ -489,7 +489,7 @@ python3 wawf.py --origin .../storage/default/https+++web.whatsapp.com --out out/
 
 # Offline, with a key captured earlier, and a faithful dump plus a database
 python3 wawf.py ~/.config/google-chrome/Default --key companion_enc_static.txt \
-    --out raw:case/raw --out sqlite:case/db --audit
+    --out raw:case/raw --out sqlite:case/db        # + case/raw/wawf_audit.db (audit is on by default)
 ```
 
 `<profile>` is a browser profile directory:
