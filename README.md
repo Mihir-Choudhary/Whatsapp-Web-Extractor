@@ -78,10 +78,10 @@ one that printed "me / them" would be unusable. Both are resolved against the ex
 ===== Weekend plans  [120363000000000000@g.us]  (group; 412 msgs, 377 with text) =====
   - Dev                       244358000000001@lid  919300000001@c.us
   - Riya                      133461000000002@lid  919300000002@c.us  (me)
-[2026-07-03 00:50:37] ->                   Riya: I wanted to try golf at least once
+[2026-07-03 00:50:37] ->                   Riya: We should try bowling sometime
 [2026-07-03 00:51:02] <-                    Dev: next weekend?
 [2026-07-03 00:51:40] <-                    Dev: (sticker)
-                                           re: I wanted to try golf at least once
+                                           re: We should try bowling sometime
 [2026-07-03 00:52:03] ->                   Riya: booking it
 ```
 
