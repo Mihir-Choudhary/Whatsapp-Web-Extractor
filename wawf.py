@@ -93,7 +93,8 @@ def setup_logging(verbose: bool, logfile: str | None):
     for h in list(root.handlers): root.removeHandler(h)
     sh = logging.StreamHandler(sys.stderr); sh.setFormatter(logging.Formatter(fmt)); root.addHandler(sh)
     if logfile:
-        fh = logging.FileHandler(logfile); fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(name)s %(message)s"))
+        # utf-8, not the locale codepage: on Windows cp1252 dropped every log line holding a name or an arrow
+        fh = logging.FileHandler(logfile, encoding="utf-8"); fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(name)s %(message)s"))
         fh.setLevel(logging.DEBUG); root.addHandler(fh)
         log.debug("logging to file %s", logfile)
 
