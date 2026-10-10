@@ -170,7 +170,7 @@ def decrypt_body(op):
     if len(data) % 16: return (None, None)    # misaligned: CBC would decrypt part and drop the tail
     try: pt = pk7(Cipher(algorithms.AES(MSGKEY), modes.CBC(iv)).decryptor().update(data))
     except Exception: return (None, None)
-    own, quoted = _message_texts(pt, 8000)      # one parse, both strings
+    own, quoted = _message_texts(pt)            # one parse, both strings; never truncated
     return (own or None, quoted or None)
 
 def ser(x):
@@ -370,7 +370,7 @@ if HIST:
             'chat_jid': cj, 'from_me': fromme, 'key_id': sid,
             'sender_jid': norm_jid(sender) if sender else None,
             'timestamp': int(r.get('ts') or 0) * 1000, 'message_type': MTYPE.get(typ, 0),
-            'text_data': (r.get('text') or '').strip() or None,
+            'text_data': (r.get('text') or None) if (r.get('text') or '').strip() else None,   # as sent
             'status': 0, 'starred': 0, 'media': None, 'thumb': None, 'mentioned': [],
             'quoted_id': None, 'quoted_type': None, 'quoted_text': None, 'source': 'phone',
         })

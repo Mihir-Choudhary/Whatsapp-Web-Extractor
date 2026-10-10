@@ -533,20 +533,24 @@ def _scrape(buf, cap):
     lv = list(dict.fromkeys(([p] if p else []) + rest))
     return " ".join(lv)[:cap]
 
-def texts(pt, cap=2000):
+def texts(pt, cap=None):
     """-> (own text, quoted text) from ONE parse of the body.
 
     Both writers want both strings for every message, and calling `message_text` then `quoted_text`
     parsed each body twice and walked the tree twice -- 22,121 bodies in the hot loop of both
-    exporters, for identical output."""
+    exporters, for identical output.
+
+    No length cap by default. JSON used to cut every message at 2,000 characters and SQLite at
+    8,000, so a long forward or a pasted document lost its tail without a word -- 16 messages and
+    3 quotes in the reference store, and the two exports disagreed about them."""
     own, q = split_body(pt)
     return _scrape(own, cap), _scrape(q, cap)
 
-def message_text(pt, cap=2000):
+def message_text(pt, cap=None):
     """This message's OWN text: every distinct string in its own content, addressing stripped."""
     return texts(pt, cap)[0]
 
-def quoted_text(pt, cap=2000):
+def quoted_text(pt, cap=None):
     """The text of the message this one replies to, or "" -- kept apart, never merged into the above."""
     return texts(pt, cap)[1]
 
@@ -671,7 +675,7 @@ def hist_row(r, ids, when, chat_key=None):
             "sender": sender, "sender_name": name,
             "sender_lid": e.get("lid"), "sender_phone": e.get("pn"),
             "sender_source": src,
-            "text": (r.get("text") or "").strip(), "quoted_text": "",
+            "text": r.get("text") or "", "quoted_text": "",      # as sent: decrypt, change nothing
             "source": "phone"}
 
 def bank_history(master, msgs):

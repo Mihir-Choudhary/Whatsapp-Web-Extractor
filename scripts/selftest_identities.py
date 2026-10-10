@@ -460,6 +460,11 @@ check("...a base64-shaped hash is not mistaken for one", _WD._is_encoded_image(
       "ae4f5d0932e7e10a8e4dfdbbe9bc7773dbbb5936ab25b310f8ceb44fe99f"), False)
 q = _pb(1, _pb(1, b"reply")) + _pb(2, _pb(1, b"*the quoted one*"))
 check("own and quoted stay apart", _WD.texts(q), ("reply", "*the quoted one*"))
+# A long message is evidence like any other: no length cap. JSON used to cut every message at 2,000
+# characters and SQLite at 8,000, so a pasted document or a long forward lost its tail silently.
+long_txt = "".join("A long forwarded notice, line %d.\n" % i for i in range(400))
+check("a long message is kept whole", _WD.texts(_body(long_txt))[0], long_txt)
+check("...and so is a long quote", _WD.texts(_pb(1, _pb(1, b"ok")) + _pb(2, _pb(1, long_txt.encode())))[1], long_txt)
 
 print()
 if FAIL:

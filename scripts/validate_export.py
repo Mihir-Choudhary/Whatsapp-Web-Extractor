@@ -358,12 +358,13 @@ if DB:
     print("  ..   inbound senders resolving to a name or number: %d of %d" % (named, tot))
     chk("the sender correlation chain resolves", tot == 0 or named >= tot * 0.9,
         "%d of %d" % (named, tot))
-    # text agreement with chats.json, below the 2000-char cap where both must agree exactly
-    jt = collections.Counter(m.get('text') for m in msgs if m.get('text') and len(m.get('text')) < 2000)
+    # text agreement with chats.json, at every length. This used to skip texts of 2,000+ characters
+    # because JSON truncated there -- which is how a cap that cut 16 messages short went unnoticed.
+    jt = collections.Counter(m.get('text') for m in msgs if m.get('text'))
     st = collections.Counter(r[0] for r in con.execute(
-        "SELECT text_data FROM message WHERE text_data IS NOT NULL AND text_data<>''") if len(r[0]) < 2000)
+        "SELECT text_data FROM message WHERE text_data IS NOT NULL AND text_data<>''"))
     extra_j = sum((jt - st).values()); extra_s = sum((st - jt).values())
-    print("  ..   short texts json=%d sqlite=%d (json-only %d, sqlite-only %d)"
+    print("  ..   texts json=%d sqlite=%d (json-only %d, sqlite-only %d)"
           % (sum(jt.values()), sum(st.values()), extra_j, extra_s))
     # The database must never contain text the JSON does not: that would mean one writer inventing
     # or mis-scraping content. The reverse is expected and bounded -- the database decrypts bodies

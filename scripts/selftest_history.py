@@ -96,6 +96,10 @@ mine = hist_row({"chat": "965000000001@lid", "id": "S3", "fromMe": True, "partic
                  "ts": 1760000002, "text": "mine", "type": "conversation"}, IDS, ts(1760000002))
 check("my own recovered message is mine", mine["dir"], "me")
 check("...and attributed to me", IDS.is_me(mine["sender"]), True)
+spaced = hist_row({"chat": "965000000001@lid", "id": "S3b", "fromMe": False, "participant": None,
+                   "ts": 1760000003, "text": "  indented reply\n\n", "type": "conversation"},
+                  IDS, ts(1760000003))
+check("recovered text is kept exactly as sent, whitespace included", spaced["text"], "  indented reply\n\n")
 
 noone = hist_row({"chat": "120300000009@g.us", "id": "S4", "fromMe": False, "participant": None,
                   "ts": 1760000003, "text": "?", "type": "conversation"}, IDS, ts(1760000003))
