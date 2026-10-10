@@ -175,6 +175,17 @@ check("failure counted", "(1 failed)" in log)
 check("the other three still written", "decrypted 3 bodies" in log)
 shutil.rmtree(out, ignore_errors=True)
 
+print("\nraw output: a JavaScript Date says which instant it is")
+import datetime as _dt
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_argv, sys.argv = sys.argv, ["wawf.py"]
+import wawf as _W
+sys.argv = _argv
+_d = _dt.datetime(1970, 1, 1) + _dt.timedelta(milliseconds=1759337576102)   # as the Chromium reader builds it
+check("a Date becomes exact epoch ms, as Firefox's reader gives it",
+      _W._jsonable(_d) == {"__date_ms": 1759337576102.0, "utc": "2025-10-01T16:52:56.102Z"})
+check("...not a Python repr", "__repr__" not in json.dumps(_W._jsonable({"t": [_d]})))
+
 print()
 if FAIL:
     print(f"{len(FAIL)} CASE(S) FAILED")

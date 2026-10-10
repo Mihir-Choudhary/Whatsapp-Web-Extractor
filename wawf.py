@@ -616,6 +616,17 @@ def _jsonable(o, depth=0, seen=None):
     # serialise. Not mapped to null: that would silently merge two different states.
     if type(o).__name__ in ("Undefined", "JSUndefined") or repr(o) == "<Undefined>":
         return {"__undefined__": True}
+    # A JavaScript Date. The Chromium deserialiser hands back a NAIVE datetime built as epoch + ms, so
+    # it is UTC -- but its repr ("datetime.datetime(2026, 10, 1, 16, 52, 56, 102000)") said neither
+    # that nor anything a non-Python reader could parse. Emit the same marker the Firefox reader
+    # (sclone) produces, the exact epoch milliseconds, plus the UTC instant spelled out.
+    if isinstance(o, dt.datetime):
+        if o.tzinfo is None:
+            ms = (o - dt.datetime(1970, 1, 1)) / dt.timedelta(milliseconds=1)
+        else:
+            ms = o.timestamp() * 1000
+        utc = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc) + dt.timedelta(milliseconds=ms)
+        return {"__date_ms": ms, "utc": utc.isoformat(timespec="milliseconds").replace("+00:00", "Z")}
     b = None
     try:
         b = _ab(o)
@@ -623,7 +634,7 @@ def _jsonable(o, depth=0, seen=None):
         b = None
     if b:
         return {"__bytes__": base64.b64encode(bytes(b)).decode(), "len": len(bytes(b))}
-    return {"__repr__": repr(o)[:400]}
+    return {"__repr__": repr(o)}         # whole: a raw export is not the place to shorten anything
 
 
 # Stores holding key material rather than evidence. A raw dump is meant to travel with a case, and
@@ -635,7 +646,7 @@ def cmd_raw(a):
     """--out raw:DIR -- decrypt, and change NOTHING else.
 
     Every other output reshapes: the text writer scrapes strings out of the decrypted protobuf with a
-    heuristic walker, dedupes them and truncates at 2000 characters, so field identity and every
+    heuristic walker and dedupes them, so field identity and every
     non-string field are lost. This one emits each record as the browser stored it -- a JavaScript
     object, same field names, same "<Undefined>" markers, nothing renamed or dropped -- and ADDS the
     decrypted payload beside the original rather than in place of it:
@@ -773,6 +784,8 @@ def cmd_raw(a):
                "markers": {"__bytes__": "base64 of a binary value, with its length",
                            "__undefined__": "JavaScript undefined, which JSON cannot express and "
                                             "which is NOT the same as null",
+                           "__date_ms": "a JavaScript Date: milliseconds since 1970-01-01 UTC "
+                                        "(with `utc`, the same instant as ISO 8601)",
                            "__repr__": "a value no other marker covers, as its Python repr",
                            "__cycle__": "a reference back to an enclosing object",
                            "__truncated__": "nesting beyond the depth cap",

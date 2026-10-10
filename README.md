@@ -145,11 +145,12 @@ yourself that an export you were handed is internally consistent. It writes noth
 #### `raw` — decrypt, and change nothing else
 
 The other formats summarise. The text writer runs the decrypted payload through a heuristic string
-scraper, which drops field identity, every non-string field and anything past 2000 characters.
+scraper, which keeps every message's text whole but drops field identity and every non-string field.
 
 `raw` writes one JSONL file per object store — typically **48 stores and ~70,000 records** — with each
 record exactly as the browser stored it: same field names, same ordering, JavaScript `undefined`
-preserved as a distinct marker (it is not the same as `null`). The decryption is **added beside** the
+preserved as a distinct marker (it is not the same as `null`), and a JavaScript `Date` as its exact
+milliseconds since 1970 UTC with the instant beside it. The decryption is **added beside** the
 ciphertext rather than replacing it, so the file stays a faithful image of the store *plus* a
 decryption:
 
