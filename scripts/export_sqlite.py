@@ -319,7 +319,10 @@ for o in store(MSG_SID):
         'webid': idv, 'chat_jid': chat_jid, 'from_me': from_me, 'key_id': key_id,
         # received: sender = author/partner (groups+broadcast use author; 1:1 partner also fine)
         'sender_jid': None if (from_me or (not is_group and not is_bcast)) else sender,   # null sender for own + 1:1 received
-        'timestamp': int(t)*1000 if t else 0, 'message_type': MTYPE.get(typ, 0), 'text_data': body,
+        # view-once: Android's own types (42 photo, 43 video), so Android tools show it as view-once
+        'timestamp': int(t)*1000 if t else 0,
+        'message_type': ({'image': 42, 'video': 43}.get(typ, MTYPE.get(typ, 0)) if o.get('isViewOnce') else MTYPE.get(typ, 0)),
+        'text_data': body,
         'status': ack_status(o.get('ack'), from_me), 'starred': 1 if o.get('star') or o.get('isStarred') else 0,
         'media': md, 'thumb': base64.b64decode(th) if isinstance(th, str) and th else None,
         'mentioned': ment, 'quoted_id': as_text(o.get('quotedStanzaID')), 'quoted_type': as_text(o.get('quotedType')),

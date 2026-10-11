@@ -101,6 +101,7 @@ PROTOCOL_MESSAGE = {1: ("key", "m", MESSAGE_KEY), 2: ("type", "e"), 6: ("history
 
 # Message: the content fields named (for message types), with the few whose content is read here
 MESSAGE: dict = {}
+PROTOCOL_MESSAGE[14] = ("editedMessage", "m", MESSAGE)        # MESSAGE_EDIT carries the new message
 DEVICE_SENT = {1: ("destinationJid", "s"), 2: ("message", "m", MESSAGE), 3: ("phash", "s")}
 FUTURE_PROOF = {1: ("message", "m", MESSAGE)}
 EXTENDED_TEXT = {1: ("text", "s"), 6: ("title", "s")}

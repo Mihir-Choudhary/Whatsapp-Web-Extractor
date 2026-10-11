@@ -97,6 +97,30 @@ for ack in ("none", "saved"):
     kinds = {r["id"]: r["chat_kind"] for r in rows}
     check("readable output: chat kinds", kinds.get("A1") == "1:1" and kinds.get("G0") == "group" and kinds.get("N1") == "channel")
 
+print("readable rows: own messages from the phone, reactions")
+c, me, me_bundle = client("none")
+phone, _ = party(4004)
+S.SessionBuilder(phone, "x").init_outgoing(me_bundle)
+phone.sessions["15550000000.0"] = phone.sessions.pop("x")
+pc = S.SessionCipher(phone, "15550000000.0")
+sent =WP.encode({"deviceSentMessage": {"destinationJid": "15551112222@s.whatsapp.net",
+                                        "message": {"conversation": "sent from my phone"}}}, WP.MESSAGE)
+m = pc.encrypt(WC._pad(sent))
+feed(c, {"tag": "message", "attrs": {"id": "S1", "from": "15550000000@s.whatsapp.net", "recipient": "15551112222@s.whatsapp.net",
+                                      "t": "1760000020", "type": "text"}, "content": [enc_node(m["type"], m["body"])]})
+react = WP.encode({"reactionMessage": {"key": {"remoteJid": "15551112222@s.whatsapp.net", "fromMe": True, "id": "S1"},
+                                       "text": "👍"}}, WP.MESSAGE)
+m = pc.encrypt(WC._pad(WP.encode({"deviceSentMessage": {"destinationJid": "15551112222@s.whatsapp.net",
+                                                        "message": WP.decode(react, WP.MESSAGE)}}, WP.MESSAGE)))
+feed(c, {"tag": "message", "attrs": {"id": "S2", "from": "15550000000@s.whatsapp.net", "recipient": "15551112222@s.whatsapp.net",
+                                      "t": "1760000021", "type": "reaction"}, "content": [enc_node(m["type"], m["body"])]})
+rows = {r["id"]: r for r in QC.readable(os.path.join(tmp, "j_none.jsonl"), own=("15550000000",))}
+s1, s2 = rows.get("S1", {}), rows.get("S2", {})
+check("an own message from the phone is filed under the chat it went to, marked from me",
+      s1.get("chat") == "15551112222@s.whatsapp.net" and s1.get("from_me") is True and s1.get("text") == "sent from my phone")
+check("a reaction names the message it reacts to", s2.get("action") == "reaction" and s2.get("target_id") == "S1"
+      and s2.get("text") == "👍")
+
 # ---------------------------------------------------------------- group handover + message, sender = Baileys
 mods = os.environ.get("WAWF_XTEST_NODE_MODULES") or os.path.join(os.path.dirname(HERE), "tools", "reconnect", "node_modules")
 node = shutil.which("node") or (r"C:\Program Files\nodejs\node.exe" if os.path.isfile(r"C:\Program Files\nodejs\node.exe") else None)

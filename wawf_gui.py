@@ -18,7 +18,7 @@ from wawf_help import TIPS, STEPS, GUIDE
 # which tip explains which toggle (matched on the start of its label)
 _TOGGLE_TIPS = {"Profile folder": "profile_mode", "Separate folders": "stores_mode",
                 "Readable chats": "fmt_text", "SQLite database": "fmt_sqlite", "Raw store dump": "fmt_raw",
-                "Also download media": "fetch_media", "Also recover history": "history",
+                "Also download media": "fetch_media", "Also recover history": "history", "Also record what": "queue",
                 "Get it from WhatsApp": "key_online", "Use a saved key": "key_file", "Don't go online": "key_offline",
                 "Record every step": "audit_on", "…including raw key values": "audit_secrets", "Don't record": "audit_off",
                 "Only re-ask chats": "refetch", "Allow installing Node.js": "install_node",
@@ -422,6 +422,10 @@ class App(tk.Tk):
         self._toggle(c, "Also recover history older than the browser's ~90 days, from the phone "
                         "(online; can take hours)",
                      self.history).grid(row=4, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        self.queue = tk.BooleanVar(value=False)
+        self._toggle(c, "Also record what WhatsApp's server is holding for this device "
+                        "(online; nothing is taken from it)",
+                     self.queue).grid(row=5, column=0, columnspan=3, sticky="w", pady=(2, 0))
 
         # 3 — key
         c = self._card(form, "3", "Message key")
@@ -673,6 +677,7 @@ class App(tk.Tk):
         out = self.out.get().strip()
         src = self._source()
         mode, fetch, hist = self.key_mode.get(), self.fetch_media.get(), self.history.get()
+        queue = self.queue.get()
         if not out:
             raise ValueError("Choose where to save the results.")
         if not (self.fmt_text.get() or self.fmt_sqlite.get() or self.fmt_raw.get()):
@@ -680,6 +685,12 @@ class App(tk.Tk):
         if (fetch or hist) and mode == "offline":
             raise ValueError("Downloading media and recovering history both go online, and 'Don't go online' "
                              "is chosen. Untick them, or choose another key option.")
+        if queue and mode == "offline":
+            raise ValueError("Recording the server queue goes online, and 'Don't go online' is chosen. "
+                             "Untick it, or choose another key option.")
+        if queue and hist:
+            raise ValueError("History recovery and recording the server queue are separate runs: "
+                             "tick one, run it, then the other.")
         if fetch and not self.fmt_sqlite.get():
             raise ValueError("Downloading media needs the SQLite database output ticked.")
         if hist and not (self.fmt_text.get() or self.fmt_sqlite.get()):
@@ -701,10 +712,11 @@ class App(tk.Tk):
         if self.raw_keys.get(): cmd += ["--raw-include-keys"]
         if mode == "file":
             # a key file never needs the sign-in; stay offline unless something else must go online
-            cmd += ["--key", self.key.get().strip()] + ([] if (fetch or hist) else ["--offline"])
+            cmd += ["--key", self.key.get().strip()] + ([] if (fetch or hist or queue) else ["--offline"])
         if mode == "offline": cmd += ["--offline"]
         if creds: cmd += ["--creds", creds]
         if fetch: cmd += ["--fetch-media"]
+        if queue: cmd += ["--queue"]
         if hist:
             cmd += ["--history", "--yes"]               # --yes: the window cannot answer a typed prompt
             if self.refetch.get(): cmd += ["--history-refetch"]

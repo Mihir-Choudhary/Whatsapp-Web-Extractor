@@ -243,6 +243,7 @@ A Windows drive letter is never mistaken for a `FORMAT`, so `D:\case\out` works 
 | `--origin DIR` | Firefox `web.whatsapp.com` storage folder instead of a profile folder. |
 | `--raw-include-keys` | With `--out raw:` — also dump `signal-storage` and `wawc_db_enc`. Those are key material; a dump including them must not travel with a case. |
 | `--history` | **Also** pull chat history older than the browser cache from your phone, iteratively, resuming across runs, and append it to the export. Pure Python, no Node needed. Phone-side and rate-limited — see below. |
+| `--queue` | After the export, record what WhatsApp's server is holding for this device, decrypted with the browser's own keys, into `<out>/server-queue/<time>/`. Networked; acknowledges nothing, so the queue stays for the browser. See [Recording what the server is holding](#recording-what-the-server-is-holding----queue). |
 | `--fetch-media` | With `--out sqlite:PATH` (with or without `--history`): download, decrypt and verify from the CDN the media the browser never cached, newest first. Networked, and it downloads real bytes — a large account can be a lot of them. Urls whose signature has already expired are skipped without a request. |
 | `--history-refetch` | With `--history`: re-ask for history already recovered, to fill in fields an earlier run did not capture (the group sender). Finds nothing new by design. |
 | `--install-node` | Only with the optional Node engine (`WAWF_HISTORY_ENGINE=node`): allow `--history` to install Node.js via winget when none is found. **Not** covered by `--yes`: it modifies the machine and asks for elevation. A portable Node unzipped beside the tool, or `WAWF_NODE` pointing at one, needs neither. |
@@ -276,9 +277,11 @@ the kinds of gap do not.
 | **Contacts** | yes: name, pushname, lid ↔ phone number, username, *about* text, business names | `contacts.csv`, `identities.json`, `wa.db` |
 | **Groups** | members, admins, past members with *left/removed* and when, subject, description, settings | 99.3% of memberships match the phone; the difference is the owner, whom the phone stores as itself |
 | Reactions, mentions, pins, labels, channels, blocklist | yes | |
-| Statuses (stories) | **no** — not written to disk | |
+| Statuses (stories) | **no** — not written to disk | status updates posted while the browser was closed are in the server queue: `--queue` records them, with media keys |
 | Profile pictures | addresses and hashes only; the image only if still cached | |
 | Media files | keys and hashes for all; the bytes only for what the browser cached (it caches some already decrypted) | `--fetch-media` downloads the rest while their links are valid |
+| **View-once** photos and videos | a stub only: sender, time, message id, photo or video (here 344 of the phone's 370 in the window; none with content) | WhatsApp does not send view-once content to linked devices. The stanza arrives as `<unavailable type="view_once"/>` with no ciphertext, WhatsApp Web stores it as a `view_once_unavailable_fanout` placeholder, and the phone does not answer a resend request for it. True whether or not the message was opened on the phone (the 45 still unopened there are stubs too). The content exists only on the sending and receiving phones. |
+| **What the server is holding** | not on disk until the browser next connects | `--queue` records it — see below |
 | History before the link | not on disk | each history chunk is downloaded once and deleted from the server; a network log of the sync shows the downloads but cannot be decrypted after the fact (its keys never leave the browser's memory) |
 
 Where a number above says the browser has less, that is the browser's content, not a reading gap: the
@@ -377,6 +380,41 @@ A wrong or stale key is **detected, not acted on**: every writer trial-decrypts 
 first and refuses rather than producing garbage. If the key was one the tool found by itself, it
 discards it and captures a fresh one; if you named it with `--key`, it reports the problem and stops
 rather than silently reaching for the network.
+
+## Recording what the server is holding — `--queue`
+
+While the browser session is closed, WhatsApp's server keeps for that device everything the account
+receives and sends from its other devices: messages, group key handovers, status updates, channel posts,
+receipts, call offers. The browser collects it the next time it connects. Until then it exists only on
+the server — and a closed browser on a seized machine may never connect again.
+
+```
+wawf <profile> --out D:\case\out --queue
+```
+
+After the normal export, this exports the device's credentials and the browser's **own** Signal state
+(identity, sessions, the group sender keys) into `<out>/server-queue/<time>/`, signs in as the device and
+records every stanza the server delivers:
+
+- `queue_journal.jsonl` — every stanza exactly as received (after transport decryption), each payload
+  decrypted, written and synced to disk before anything else happens;
+- `queue_messages.json` — one row per message: chat, group / 1:1 / status / channel / broadcast, sender
+  (with device number and phone number), time, type, text, reactions and edits with the message they
+  apply to, deletions, media keys (downloadable while the links are valid), and view-once stubs;
+- `queue_summary.json` — counts, and whether the server's end-of-queue marker was received.
+
+**Nothing is acknowledged.** An acknowledgement is what makes the server delete a stanza from the
+device's queue, so the queue is left exactly where it was: the next client that connects as this device
+— the browser included — receives it all again, and decrypts it with its own unchanged state. Nothing a
+contact can see is sent either: no delivery or read receipts, no presence. It is still a sign-in, recorded
+as activity on the account.
+
+Group messages whose key handover a *previous* client took without keeping are left encrypted (and on
+the server); they are counted as `not decrypted`. View-once content is never in the queue (see the table
+above).
+
+`WAWF_QUEUE_ACK=saved` acknowledges what was saved and fully decrypted — never use it on evidence that
+the browser should still receive. `--history` uses the same journal and the same default.
 
 ## Recovering history older than the cache
 

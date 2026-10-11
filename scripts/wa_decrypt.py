@@ -142,6 +142,7 @@ def _norm_msg(o):
             "sender": as_str(o.get("author")) or as_str(o.get("from")),
             "iv": iv, "data": data, "scheme": op.get("_scheme") if op else None,
             "filename": as_str(o.get("filename")),
+            "view_once": bool(o.get("isViewOnce")),
             "ack": o.get("ack") if isinstance(o.get("ack"), int) else None}
 def as_str(x):
     if isinstance(x, str): return x
@@ -590,6 +591,9 @@ ACK_STATUS = {-1: "error", 0: "pending", 1: "sent", 2: "delivered", 3: "read", 4
 _SYSTEM_TYPES = {"e2e_notification", "gp2", "notification_template", "notification", "pinned_message",
                  "protocol", "revoked", "ciphertext", "call_log", "message_history_notice"}
 
+VIEW_ONCE_NOTE = ("view-once: WhatsApp sends the content only to the phones, never to linked devices; "
+                  "the browser holds this record of it")
+
 def msg_row(m, when, pt, ids):
     """One chats.json record, built from the decrypted body in one place so no writer can derive the
     text differently. The identity fields are ADDITIVE: `sender` stays exactly as stored and the
@@ -622,6 +626,12 @@ def msg_row(m, when, pt, ids):
             # and an export that merges them has to say which is which.
             "source": "cache"}
     if m.get("filename"): row["filename"] = m["filename"]
+    # WhatsApp does not send view-once content to linked devices: the browser keeps a record that the
+    # message exists (sender, time, photo or video) and nothing else. Said here, so an empty row is not
+    # read as a gap in the extraction.
+    if m.get("view_once"):
+        row["view_once"] = True
+        row["content_note"] = VIEW_ONCE_NOTE
     # Delivery state of a message I sent, as WhatsApp Web last recorded it (the ticks).
     if m.get("from_me") and m.get("ack") in ACK_STATUS and (m["ack"] != 0 or m.get("type") not in _SYSTEM_TYPES):
         row["ack"] = m["ack"]; row["status"] = ACK_STATUS[m["ack"]]
@@ -889,7 +899,8 @@ def write_transcripts(path, chats, ids):
                 # to say is still a message that was sent at a time by a person, so it is shown as
                 # its type in parentheses. Nothing is invented: `(image)` is the type the store
                 # recorded, not a guess at content.
-                body = m["text"] or ("(%s)" % (m.get("type") or "unknown"))
+                body = m["text"] or ("(view-once %s: content only on the phones)" % (m.get("type") or "media")
+                                     if m.get("view_once") else "(%s)" % (m.get("type") or "unknown"))
                 # 3.7% of messages contain newlines, and writing them raw broke the one-line-per-
                 # message structure this file promises: 2,394 continuation lines carried no
                 # timestamp and no sender, and 29 of them began with '#', which is what this file

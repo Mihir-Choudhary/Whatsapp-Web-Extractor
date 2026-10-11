@@ -38,6 +38,12 @@ TIPS = {
     "history": "Sign in as the linked device and ask the phone for messages older than the browser's ~90 days, "
                "chat by chat. The phone must be reachable (it answers in the background, sometimes after "
                "minutes); a full sweep can take hours; recorded as account activity.\nCommand line: --history.",
+    "queue": "While the browser is closed, WhatsApp's server holds for this device what the account receives "
+             "(messages, group and status updates, receipts, call offers). This signs in as the device and "
+             "records it all, decrypted with the browser's own keys, into server-queue\\ in the results folder. "
+             "Nothing is acknowledged, so the server keeps it for the browser; nothing a contact can see is "
+             "sent. View-once media is never sent to linked devices: only a placeholder is recorded.\n"
+             "Command line: --queue.",
     # step 3
     "key_online": "Message text is encrypted with a key WhatsApp gives the browser at sign-in. This signs in once "
                   "as the linked device to get it, and saves it as companion_enc_static.txt in the results "

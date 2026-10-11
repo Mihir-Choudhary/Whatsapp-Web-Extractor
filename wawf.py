@@ -1692,6 +1692,73 @@ def _history_export(a, targets, history_file=None):
                             history_file=history_file)
     return cmd_run(ns)
 
+def cmd_queue(a):
+    """--queue: record what WhatsApp's server is holding for the examined device, without taking it.
+
+    While the browser session is closed, the server queues for that device everything the account
+    receives (messages, group key handovers, receipts, call offers, notifications). This exports the
+    device's credentials and the browser's OWN Signal state (identity, sessions, group sender keys)
+    into a new folder, signs in as the device and journals every stanza the server delivers --
+    exactly as received, and each payload decrypted -- acknowledging nothing, so the server keeps
+    the queue for the browser. Each run starts from the browser's state again, in a folder of its own.
+
+    Networked: recorded as activity on the account. Nothing a contact can see is sent (no receipts,
+    no presence)."""
+    _require_source(a, "queue")
+    if a.profile and _is_chromium(a.profile):
+        eng = ["--profile", a.profile]
+    else:
+        origin = a.origin or (os.path.join(a.profile, "storage/default/https+++web.whatsapp.com") if a.profile else None)
+        if not origin: log.error("pass a profile or --origin"); return 2
+        eng = ["--origin", origin]
+    base = None
+    for spec in (a.out or []):
+        _, path = _parse_out(spec)
+        base = path; break
+    base = base or _pick_work_dir()
+    work = os.path.join(base, "server-queue", time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
+    os.makedirs(work, exist_ok=True)
+    log.info("server queue capture -> %s", work)
+    log.info("[1/3] recovering the device credentials ...")
+    if a.creds:
+        import shutil
+        shutil.copyfile(a.creds, os.path.join(work, "creds_in.json"))
+    elif cmd_creds(argparse.Namespace(profile=a.profile, origin=a.origin, out=os.path.join(work, "creds_in.json"), _internal=True)):
+        return 3
+    log.info("[2/3] exporting the browser's Signal state (sessions, group sender keys) ...")
+    if _sub("export_signal_state.py", eng + ["--out", os.path.join(work, "signal_state.json")]): return 3
+    log.info("[3/3] signing in as the device and recording the queue (nothing is acknowledged) ...")
+    if getattr(sys, "frozen", False):
+        qcmd = [sys.executable, "_runpy", "queue_capture.py"]
+    else:
+        qcmd = [sys.executable, os.path.join(HERE, "scripts", "queue_capture.py")]
+    env = dict(AUDIT.child_env() or os.environ)
+    env.update(PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYINSTALLER_RESET_ENVIRONMENT="1")
+    AUDIT.event("server queue capture start", category="network",
+                detail={"argv": qcmd, "cwd": work, "ack_policy": env.get("WAWF_QUEUE_ACK", "none")})
+    rc = subprocess.run(qcmd, cwd=work, env=env).returncode
+    summ = {}
+    try: summ = json.load(open(os.path.join(work, "queue_summary.json"), encoding="utf-8"))
+    except Exception: pass
+    for name, kind in (("queue_journal.jsonl", "server queue journal (stanzas as received + decrypted payloads)"),
+                       ("queue_messages.json", "server queue, readable (one row per message)"),
+                       ("queue_summary.json", "server queue capture summary")):
+        p = os.path.join(work, name)
+        if os.path.isfile(p): AUDIT.artifact(p, kind=kind)
+    AUDIT.event("server queue capture exit rc=%s" % rc, level="INFO" if rc == 0 else "ERROR", category="network",
+                detail={k: summ.get(k) for k in ("stats", "end_of_queue_marker", "messages", "decrypted", "not_decrypted")})
+    if rc:
+        log.error("queue capture failed (exit %s)", rc); return rc
+    st = summ.get("stats") or {}
+    log.info("server queue: %s stanzas recorded, %s acknowledged; %s messages (%s decrypted, %s not); "
+             "end-of-queue marker %s", st.get("journalled"), st.get("acked"), summ.get("messages"),
+             summ.get("decrypted"), summ.get("not_decrypted"),
+             "received" if summ.get("end_of_queue_marker") is not None else "NOT received (queue may be partial)")
+    log.info("readable: %s", os.path.join(work, "queue_messages.json"))
+    log.warning("%s holds the device's credentials and Signal state: key material -- keep it with the case, "
+                "never share it.", work)
+    return 0
+
 def cmd_history(a):
     """On-demand history sync: pull messages OLDER than the browser cache from the account's phone, per
     chat, going back toward each chat's start -- ITERATIVELY: each pass re-anchors on the oldest message
@@ -2270,7 +2337,8 @@ def main():
     g = p.add_argument_group("optional actions (instead of the default decrypt job)")
     g.add_argument("--history", action="store_true",
                    help="pull chat history older than the browser cache from your phone. NETWORKED and "
-                        "phone-dependent; needs Node (offers to install it). Results are saved and resume. "
+                        "phone-dependent; pure Python (WAWF_HISTORY_ENGINE=node runs the Node client). "
+                        "Results are saved and resume. "
                         "With --out, the local store is decrypted first and the recovered messages are "
                         "appended to it, so the export is one timeline per chat with every row saying "
                         "whether it came from the cache or the phone; it is written beside any export "
@@ -2281,6 +2349,12 @@ def main():
     # FIREFOX store and there is no scenario yet where it beats the two routes that always work: a
     # normal run captures the key over the network, and `--key` decrypts offline with a key captured
     # earlier. Restoring it is these four add_argument lines plus the dispatch branch, both marked.
+    g.add_argument("--queue", action="store_true",
+                   help="record what WhatsApp's server is holding for this device (messages, group and "
+                        "status updates, receipts, call offers received while the browser was closed), "
+                        "decrypted with the browser's own keys. NETWORKED; nothing is acknowledged, so the "
+                        "server keeps the queue for the browser, and nothing a contact can see is sent. "
+                        "Runs after the normal export, into <first --out>/server-queue/<time>/.")
     g.add_argument("--install-node", action="store_true",
                    help="allow --history to INSTALL Node.js via winget if none is found. Not covered "
                         "by --yes, because it modifies this machine and asks for elevation; a "
@@ -2349,7 +2423,16 @@ def main():
         os.environ["WAWF_PARTITION"] = a.partition       # helper subprocesses read the same session
     if getattr(a, "list_partitions", False):
         return cmd_list_partitions(a)
-    if a.history:
+    if getattr(a, "queue", False) and a.history:
+        _usage("--queue and --history are separate runs: run one, then the other")
+    if getattr(a, "queue", False) and getattr(a, "offline", False):
+        _usage("--queue signs in to WhatsApp's server, and --offline forbids going online")
+    if getattr(a, "queue", False):
+        def _decrypt_then_queue(a):
+            rc = cmd_run(a) if a.out else 0          # with no --out: only the queue
+            return rc or cmd_queue(a)
+        a.cmd, action = "decrypt+queue", _decrypt_then_queue
+    elif a.history:
         a.cmd, action = "history", cmd_history
     else:
         a.cmd, action = "decrypt", cmd_run

@@ -235,6 +235,14 @@ check("the message id is carried", row["id"], "false_120300000009@g.us_AAA")
 check("own text on the row", row["text"], "hello")
 check("quote on the row, in its own field", row["quoted_text"], "earlier words")
 
+import wa_decrypt as _WD
+vo = msg_row(_WD._norm_msg({"id": "false_120300000009@g.us_VO1", "type": "image", "t": 0, "isViewOnce": True,
+                            "author": "965000000001@lid"}), "2026-01-01 00:00:02", b"", ids)
+check("a view-once stub is marked as such", (vo.get("view_once"), vo.get("content_note")), (True, _WD.VIEW_ONCE_NOTE))
+plain = msg_row(_WD._norm_msg({"id": "false_120300000009@g.us_P1", "type": "image", "t": 0,
+                               "author": "965000000001@lid"}), "2026-01-01 00:00:02", b"", ids)
+check("an ordinary photo is not", "view_once" in plain, False)
+
 mine = msg_row({"chat": "120300000009@g.us", "from_me": True, "type": "chat", "t": 0,
                 "sender": "919000000001@c.us"}, "2026-01-01 00:00:01", pb("hi"), ids)
 check("my own message resolves to my name", mine["sender_name"], "Riya")

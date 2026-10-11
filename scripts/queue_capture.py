@@ -116,35 +116,95 @@ def _parts_from_stanza(r):
     return [{"enc": None, "unavailable": (c.get("attrs") or {}).get("type") or "unknown"}
             for c in (n.get("content") or []) if isinstance(c, dict) and c.get("tag") == "unavailable"]
 
-def readable(journal_path: str) -> list:
+PROTOCOL_ACTIONS = {0: "delete for everyone", 3: "disappearing-messages setting", 4: "disappearing-messages sync",
+                    5: "history sync notification", 6: "app-state key share", 7: "app-state key request",
+                    11: "phone number shared", 14: "edit", 16: "request to the phone", 17: "answer from the phone",
+                    22: "LID mapping sync", 23: "reminder", 25: "status mention", 27: "limit sharing",
+                    30: "group member label change"}
+
+
+def _content(pt: bytes) -> dict:
+    """What a decrypted Message says, for the readable row: type, text, and for reactions, edits and
+    deletions the action and the message it applies to. Own messages synced from the phone arrive
+    wrapped in deviceSentMessage; the row describes the inner message and names the chat it went to."""
+    msg = WP.decode(pt, WP.MESSAGE)
+    out = {}
+    dsm = msg.get("deviceSentMessage")
+    if isinstance(dsm, dict) and isinstance(dsm.get("message"), dict):
+        out["sent_to"] = dsm.get("destinationJid")
+    inner = WP.unwrap(msg)
+    out["type"] = WP.message_type(inner)
+    out["text"] = WP.message_text(msg)
+    if inner.get("reactionMessage"):
+        rm = inner["reactionMessage"]
+        out["action"] = "reaction" if rm.get("text") else "reaction removed"
+        out["target_id"] = (rm.get("key") or {}).get("id")
+    pm = inner.get("protocolMessage")
+    if isinstance(pm, dict):
+        out["action"] = PROTOCOL_ACTIONS.get(pm.get("type"), "protocol type %s" % pm.get("type"))
+        out["target_id"] = (pm.get("key") or {}).get("id")
+        if pm.get("type") == 14 and isinstance(pm.get("editedMessage"), dict):
+            out["text"] = WP.message_text(pm["editedMessage"])
+    inner_bytes = pt
+    if out.get("sent_to"):                                  # media fields of the inner message
+        try: inner_bytes = WP.decode(WP.decode(pt, {31: ("d", "y")}).get("d") or b"", {2: ("m", "y")}).get("m") or pt
+        except Exception: pass
+    out.update(media_and_association(inner_bytes))
+    return out
+
+
+def readable(journal_path: str, own=()) -> list:
+    """One row per message stanza (the server re-delivers what is not acknowledged: duplicates are
+    dropped by id + sender). A stanza can carry several encrypted parts -- typically a group key
+    handover plus the message itself -- and the row describes the message, noting the handover."""
+    own = {o for o in own if o}
     rows, seen = [], set()
     for line in open(journal_path, encoding="utf-8"):
         try: r = json.loads(line)
         except ValueError: continue
         if r.get("tag") != "message": continue
         a = r["attrs"]
-        for p in (r.get("decrypted") or _parts_from_stanza(r)):
-            key = (a.get("id"), a.get("participant") or a.get("from"), p.get("enc"))
-            if key in seen: continue                             # the server re-delivers what is not acknowledged
-            seen.add(key)
-            row = {"id": a.get("id"), "chat": a.get("from"), "chat_kind": WC.chat_kind(a.get("from")),
-                   "message_type_attr": a.get("type"), "sender": a.get("participant") or a.get("from"),
-                   "recipient": a.get("recipient"), "push_name": a.get("notify"), "t": int(a.get("t") or 0),
-                   "time_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(int(a.get("t") or 0))),
-                   "category": a.get("category"), "enc": p.get("enc"),
-                   "sender_device": sender_device(a.get("participant") or a.get("from")),
-                   "sender_phone_number": a.get("sender_pn") or a.get("participant_pn"),
-                   "id_style": id_style(a.get("id"))}
-            if p.get("unavailable"):
-                row.update(status="withheld from linked devices (%s)" % p["unavailable"], type=a.get("type"))
-            elif p.get("error"):
-                row.update(status="not decrypted", error=p["error"])
-            else:
-                pt = base64.b64decode(p["plaintext_b64"])
-                msg = WP.decode(pt, WP.MESSAGE)
-                row.update(status="decrypted", type=p.get("type"), text=WP.message_text(msg))
-                row.update(media_and_association(pt))
-            rows.append(row)
+        sender = a.get("participant") or a.get("from")
+        key = (a.get("id"), sender)
+        if key in seen: continue
+        seen.add(key)
+        parts = r.get("decrypted") or _parts_from_stanza(r)
+        sender_user = (sender or "").split("@")[0].split(":")[0]
+        from_me = sender_user in own
+        chat = a.get("from")
+        if from_me and a.get("recipient") and WC.chat_kind(chat) == "1:1":
+            chat = a["recipient"]                       # own message from the phone: the chat is the recipient
+        row = {"id": a.get("id"), "chat": chat, "chat_kind": WC.chat_kind(chat), "from_me": from_me,
+               "sender": sender, "sender_device": sender_device(sender),
+               "sender_phone_number": a.get("sender_pn") or a.get("participant_pn"),
+               "push_name": a.get("notify"), "t": int(a.get("t") or 0),
+               "time_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(int(a.get("t") or 0))),
+               "stanza_type": a.get("type"), "id_style": id_style(a.get("id")),
+               "parts": [p.get("enc") for p in parts]}
+        withheld = [p for p in parts if p.get("unavailable")]
+        failed = [p for p in parts if p.get("error")]
+        good = [p for p in parts if p.get("plaintext_b64")]
+        contents = []
+        for p in good:
+            try: contents.append(_content(base64.b64decode(p["plaintext_b64"])))
+            except Exception as e: contents.append({"type": None, "decode_error": str(e)})
+        row["key_handover"] = any(c.get("type") == "senderKeyDistributionMessage" for c in contents)
+        main = next((c for c in contents if c.get("type") not in ("senderKeyDistributionMessage", None)), None)
+        if main:
+            row["status"] = "decrypted"
+            row.update(main)
+        elif withheld:
+            row["status"] = "withheld from linked devices (%s)" % withheld[0]["unavailable"]
+        elif failed:
+            row["status"] = "not decrypted"
+            row["error"] = failed[0]["error"]
+        elif row["key_handover"]:
+            row["status"] = "decrypted"; row["type"] = "senderKeyDistributionMessage"
+        else:
+            row["status"] = "empty"
+        if failed and main:
+            row["partly_not_decrypted"] = [p.get("enc") for p in failed]
+        rows.append(row)
     rows.sort(key=lambda x: (x["t"], x["id"] or ""))
     return rows
 
@@ -189,7 +249,7 @@ def main():
     finally:
         c.close()
         while not c.messages.empty(): c.messages.get_nowait()
-    rows = readable(jpath)
+    rows = readable(jpath, own=(c.me_lid, c.me_pn))
     json.dump(rows, open("queue_messages.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     summ = {"finished_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "ack_policy": ACK,
             "end_of_queue_marker": offline_marker, "seconds": round(time.time() - started),
@@ -197,7 +257,7 @@ def main():
             "messages": len(rows), "decrypted": sum(1 for r in rows if r["status"] == "decrypted"),
             "not_decrypted": sum(1 for r in rows if r["status"] != "decrypted")}
     json.dump(summ, open("queue_summary.json", "w", encoding="utf-8"), indent=1)
-    say("[+] %d stanzas journalled (%d acknowledged); %d message parts, %d decrypted, %d not; queue end marker %s"
+    say("[+] %d stanzas journalled (%d acknowledged); %d messages, %d decrypted, %d not; queue end marker %s"
         % (c.stats["journalled"], c.stats["acked"], len(rows), summ["decrypted"], summ["not_decrypted"],
            "seen" if offline_marker is not None else "NOT seen"))
     return 0
