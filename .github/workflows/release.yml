@@ -45,6 +45,7 @@ jobs:
           python scripts/selftest_anchors.py
           python scripts/selftest_mediacache.py
           python scripts/selftest_chromium.py
+          python scripts/selftest_gui.py
       - name: Build
         run: pyinstaller wawf.spec --noconfirm
       - name: Rename artifact

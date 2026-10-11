@@ -194,6 +194,7 @@ class App(tk.Tk):
         self._build()
         self.after(100, self._drain)
         self.after(50, self.refresh_profiles)
+        self.after(120, self._fit_screen)
 
     def _style(self):
         s = ttk.Style(self)
@@ -218,6 +219,9 @@ class App(tk.Tk):
                     borderwidth=0, focusthickness=2, focuscolor="#FFFFFF")
         s.map("Run.TButton", background=[("disabled", "#94A3B8"), ("active", ACTION_HOVER)])
         s.configure("Stop.TButton", foreground=DANGER, padding=(16, 9))
+        s.configure("Link.TButton", background=BG, foreground=PRIMARY, borderwidth=0, padding=(0, 2),
+                    font=FONT_LABEL, focuscolor=PRIMARY)
+        s.map("Link.TButton", background=[("active", BG)], foreground=[("active", ACTION_HOVER)])
 
     def _indicators(self):
         if getattr(self, "_ind", None): return self._ind
@@ -281,7 +285,7 @@ class App(tk.Tk):
         self.profile_box.bind("<FocusOut>", lambda e: self._check_profile())
         ttk.Button(pf, text="Browse…", command=self.pick_profile).grid(row=0, column=1, padx=(8, 0), pady=(8, 0))
         ttk.Button(pf, text="Rescan", command=self.refresh_profiles).grid(row=0, column=2, padx=(8, 0), pady=(8, 0))
-        self.profile_help = ttk.Label(pf, style="Help.TLabel", wraplength=660, justify="left",
+        self.profile_help = ttk.Label(pf, style="Help.TLabel", wraplength=880, justify="left",
                                       text="Pick the acquired profile folder with Browse…  "
                                            "Profiles found on this computer are listed for convenience.")
         self.profile_help.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
@@ -340,14 +344,61 @@ class App(tk.Tk):
         self.key_btn = ttk.Button(r, text="Browse…", command=self.pick_key, state="disabled")
         self.key_btn.grid(row=0, column=2, padx=(8, 0))
         self._toggle(c, "Don't go online (everything except message text)", self.key_mode, value="offline", command=self._key_mode).grid(row=3, column=0, columnspan=3, sticky="w", pady=(4, 0))
-        ttk.Label(c, style="Help.TLabel", wraplength=660, justify="left",
+        ttk.Label(c, style="Help.TLabel", wraplength=880, justify="left",
                   text="Message text is encrypted with a key WhatsApp issues to the browser at sign-in and "
                        "never writes to disk. Getting it online signs in once as this linked device (recorded "
                        "as activity on the account) and saves it as companion_enc_static.txt in the results "
                        "folder; choose that file here on later runs to decrypt without going online.").grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
+        # advanced options: everything else the command line offers, out of the way until asked for
+        adv_head = ttk.Frame(root); adv_head.pack(fill="x", pady=(0, 6))
+        self.adv_btn = ttk.Button(adv_head, text="Advanced options…", style="Link.TButton", command=self._toggle_adv)
+        self.adv_btn.pack(side="left")
+        self.adv_summary = ttk.Label(adv_head, text="", style="Sub.TLabel")
+        self.adv_summary.pack(side="left", padx=(10, 0))
+        self.adv = tk.Toplevel(self)                      # its own small window: the main one stays compact
+        self.adv.withdraw(); self.adv.title("Advanced options"); self.adv.configure(bg=BG)
+        self.adv.transient(self); self.adv.resizable(False, False)
+        self.adv.protocol("WM_DELETE_WINDOW", self._toggle_adv)
+        if getattr(self, "_icon", None): self.adv.iconphoto(False, self._icon)
+        c = ttk.Frame(self.adv, style="Card.TFrame", padding=(16, 12)); c.pack(fill="both", expand=True, padx=12, pady=12)
+        c.columnconfigure(1, weight=1)
+        self.history, self.refetch, self.install_node = tk.BooleanVar(), tk.BooleanVar(), tk.BooleanVar()
+        self.raw_keys, self.verbose = tk.BooleanVar(), tk.BooleanVar()
+        self.audit_mode, self.creds = tk.StringVar(value="on"), tk.StringVar()
+        self._toggle(c, "Also recover older history from the phone (online; can take hours; needs Node.js)",
+                     self.history).grid(row=0, column=0, columnspan=3, sticky="w")
+        sub = ttk.Frame(c, style="Card.TFrame", padding=(26, 0, 0, 0)); sub.configure(borderwidth=0)
+        sub.grid(row=1, column=0, columnspan=3, sticky="w")
+        self._toggle(sub, "Only re-ask chats whose senders are missing", self.refetch).pack(side="left")
+        self._toggle(sub, "Allow installing Node.js", self.install_node).pack(side="left", padx=(18, 0))
+        self._toggle(c, "Include key material in the raw store dump (do not share that dump)",
+                     self.raw_keys).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(c, text="Saved credentials (creds_in.json)", style="Card.TLabel").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(c, textvariable=self.creds, font=FONT).grid(row=3, column=1, sticky="ew", pady=(8, 0), padx=(10, 0))
+        ttk.Button(c, text="Browse…", command=self.pick_creds).grid(row=3, column=2, padx=(8, 0), pady=(8, 0))
+        aud = ttk.Frame(c, style="Card.TFrame", padding=0); aud.configure(borderwidth=0)
+        aud.grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Label(aud, text="Chain of custody:", style="Card.TLabel").pack(side="left", padx=(0, 8))
+        self._toggle(aud, "Record (default)", self.audit_mode, value="on").pack(side="left")
+        self._toggle(aud, "Record with raw key values", self.audit_mode, value="secrets").pack(side="left", padx=(14, 0))
+        self._toggle(aud, "Don't record", self.audit_mode, value="off").pack(side="left", padx=(14, 0))
+        self._toggle(c, "Detailed log (full tracebacks)", self.verbose).grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Button(c, text="List the WhatsApp sessions in this profile", command=self.list_sessions).grid(
+            row=6, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Button(c, text="Done", style="Run.TButton", command=self._toggle_adv).grid(row=7, column=2, sticky="e", pady=(12, 0))
+
+        # the command line this window will run, always visible and copyable
+        cl = ttk.Frame(root); cl.pack(fill="x", pady=(0, 6))
+        ttk.Label(cl, text="Command line", style="Sub.TLabel").pack(side="left", padx=(0, 8))
+        self.cmd_text = tk.StringVar()
+        ttk.Entry(cl, textvariable=self.cmd_text, state="readonly", font=FONT_MONO).pack(side="left", fill="x", expand=True)
+        ttk.Button(cl, text="Copy", command=self.copy_cmd).pack(side="left", padx=(8, 0))
+        self.after(300, self._refresh_cmd)
+
         # run row
         bar = ttk.Frame(root); bar.pack(fill="x", pady=(4, 8))
+        self._bar_row = bar
         self.run_btn = ttk.Button(bar, text="Start", style="Run.TButton", command=self.start)
         self.run_btn.pack(side="left")
         self.stop_btn = ttk.Button(bar, text="Stop", style="Stop.TButton", command=self.stop, state="disabled")
@@ -361,7 +412,7 @@ class App(tk.Tk):
 
         # log
         lf = ttk.Frame(root); lf.pack(fill="both", expand=True, pady=(8, 0))
-        self.log = tk.Text(lf, height=12, font=FONT_MONO, bg=LOG_BG, fg=LOG_FG, insertbackground=LOG_FG,
+        self.log = tk.Text(lf, height=5, font=FONT_MONO, bg=LOG_BG, fg=LOG_FG, insertbackground=LOG_FG,
                            relief="flat", wrap="word", padx=10, pady=8, state="disabled")
         sb = ttk.Scrollbar(lf, command=self.log.yview); self.log.configure(yscrollcommand=sb.set)
         self.log.pack(side="left", fill="both", expand=True); sb.pack(side="right", fill="y")
@@ -415,6 +466,59 @@ class App(tk.Tk):
         d = filedialog.askdirectory(title=f"Choose the {title}")
         if d: var.set(os.path.normpath(d))
 
+    def _fit_screen(self):
+        """Never taller than the screen's usable height: the log, packed last, gives up the space."""
+        self.update_idletasks()
+        avail = self.winfo_screenheight() - 90                 # leave room for a taskbar / dock
+        h = min(max(self.winfo_reqheight() + 120, 640), avail)
+        self.geometry(f"{max(self.winfo_reqwidth(), 760)}x{h}")
+        self.minsize(760, min(640, avail))
+
+    def _refresh_cmd(self):
+        try:
+            cmd, _ = self._command()
+            text = _cmdline(cmd)
+        except ValueError as e:
+            text = "(not ready: " + str(e) + ")"
+        except Exception:
+            text = ""
+        if text != self.cmd_text.get(): self.cmd_text.set(text)
+        summ = self._adv_text()
+        if summ != self.adv_summary.cget("text"): self.adv_summary.configure(text=summ)
+        self.after(400, self._refresh_cmd)
+
+    def copy_cmd(self):
+        t = self.cmd_text.get()
+        if t and not t.startswith("(not ready"):
+            self.clipboard_clear(); self.clipboard_append(t)
+            self.status.configure(text="Command line copied.", foreground=MUTED)
+
+    def _toggle_adv(self):
+        if self.adv.winfo_viewable():
+            self.adv.withdraw()
+        else:
+            self.adv.deiconify(); self.adv.lift(); self.adv.focus_set()
+
+    def _adv_text(self):
+        on = [t for v, t in ((self.history, "history from the phone"), (self.refetch, "refetch"),
+                             (self.install_node, "may install Node.js"), (self.raw_keys, "key material in raw dump"),
+                             (self.verbose, "detailed log")) if v.get()]
+        if self.creds.get().strip(): on.append("saved credentials")
+        on += {"secrets": ["audit with key values"], "off": ["no audit"]}.get(self.audit_mode.get(), [])
+        return ("on: " + " · ".join(on)) if on else ""
+
+    def pick_creds(self):
+        f = filedialog.askopenfilename(title="Choose creds_in.json saved by an earlier run",
+                                       filetypes=[("Credentials", "creds_in*.json"), ("JSON", "*.json"), ("All files", "*.*")])
+        if f: self.creds.set(os.path.normpath(f))
+
+    def list_sessions(self):
+        try:
+            src = self._source()
+        except ValueError as e:
+            messagebox.showwarning("WhatsApp Web Extractor", str(e)); return
+        self._launch(self._exe() + src + ["--list-partitions"], None, "Reading the profile to list its sessions…")
+
     def pick_out(self):
         d = filedialog.askdirectory(title="Choose where to save the results")
         if d: self.out.set(os.path.normpath(d))
@@ -429,10 +533,13 @@ class App(tk.Tk):
         st = "normal" if self.key_mode.get() == "file" else "disabled"
         self.key_entry.configure(state=st); self.key_btn.configure(state=st)
 
-    def _command(self):
-        out = self.out.get().strip()
-        stores = self.src_mode.get() == "stores"
-        if stores:
+    def _exe(self):
+        """How to run the command line: this very exe when frozen, else the script beside this file."""
+        return [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, "-u", os.path.join(HERE, "wawf.py")]
+
+    def _source(self):
+        """The evidence arguments: a profile folder, Firefox --origin, or the stores given separately."""
+        if self.src_mode.get() == "stores":
             idb, ls, cache = self.st_idb.get().strip(), self.st_ls.get().strip(), self.st_cache.get().strip()
             if not os.path.isdir(idb): raise ValueError("Choose the IndexedDB folder.")
             if cache and not os.path.isdir(cache): raise ValueError("The media cache folder does not exist.")
@@ -443,38 +550,61 @@ class App(tk.Tk):
             else:
                 if not os.path.isdir(ls): raise ValueError("Choose the Local Storage folder.")
                 src = ["--idb", idb, "--local-storage", ls]
-            src += ["--media-cache", cache] if cache else []
-        else:
-            prof = self._profile_path()
-            if not prof or not os.path.isdir(prof):
-                raise ValueError("Choose a browser profile folder that exists.")
-            src = [prof]
+            return src + (["--media-cache", cache] if cache else [])
+        prof = self._profile_path()
+        if not prof or not os.path.isdir(prof):
+            raise ValueError("Choose a browser profile folder that exists.")
+        src = [prof]
+        if len(self._accounts) > 1 and self.account.get(): src += ["--partition", self.account.get()]
+        return src
+
+    def _command(self):
+        out = self.out.get().strip()
+        src = self._source()
+        mode, fetch, hist = self.key_mode.get(), self.fetch_media.get(), self.history.get()
         if not out:
             raise ValueError("Choose where to save the results.")
         if not (self.fmt_text.get() or self.fmt_sqlite.get() or self.fmt_raw.get()):
             raise ValueError("Tick at least one output.")
-        if self.fetch_media.get() and self.key_mode.get() == "offline":
-            raise ValueError("Downloading media goes online, and 'Don't go online' is chosen. "
-                             "Untick the media download, or choose another key option.")
-        if self.fetch_media.get() and not self.fmt_sqlite.get():
+        if (fetch or hist) and mode == "offline":
+            raise ValueError("Downloading media and recovering history both go online, and 'Don't go online' "
+                             "is chosen. Untick them, or choose another key option.")
+        if fetch and not self.fmt_sqlite.get():
             raise ValueError("Downloading media needs the SQLite database output ticked.")
-        if self.key_mode.get() == "file" and not os.path.isfile(self.key.get().strip()):
+        if hist and not (self.fmt_text.get() or self.fmt_sqlite.get()):
+            raise ValueError("Recovered history is merged into the chats or database output; tick one of them.")
+        if (self.refetch.get() or self.install_node.get()) and not hist:
+            raise ValueError("'Only re-ask chats…' and 'Allow installing Node.js' belong to history recovery; "
+                             "tick that too, or untick them.")
+        if self.raw_keys.get() and not self.fmt_raw.get():
+            raise ValueError("'Include key material' applies to the raw store dump; tick that output too.")
+        if mode == "file" and not os.path.isfile(self.key.get().strip()):
             raise ValueError("Choose the companion_enc_static.txt saved by an earlier run, or get the key from WhatsApp.")
-        if getattr(sys, "frozen", False):
-            cmd = [sys.executable]
-        else:
-            cmd = [sys.executable, "-u", os.path.join(HERE, "wawf.py")]
-        cmd += src
+        creds = self.creds.get().strip()
+        if creds and not os.path.isfile(creds):
+            raise ValueError("The saved credentials file does not exist.")
+        cmd = self._exe() + src
         if self.fmt_text.get(): cmd += ["--out", os.path.join(out, "export")]
         if self.fmt_sqlite.get(): cmd += ["--out", "sqlite:" + os.path.join(out, "database")]
         if self.fmt_raw.get(): cmd += ["--out", "raw:" + os.path.join(out, "raw")]
-        if self.key_mode.get() == "file":
-            # a key file never needs the sign-in; stay offline unless media is to be downloaded
-            cmd += ["--key", self.key.get().strip()] + ([] if self.fetch_media.get() else ["--offline"])
-        if self.key_mode.get() == "offline": cmd += ["--offline"]
-        if self.fetch_media.get(): cmd += ["--fetch-media"]
-        if not stores and len(self._accounts) > 1 and self.account.get(): cmd += ["--partition", self.account.get()]
-        cmd += ["--audit-db", os.path.join(out, "wawf_audit.db"), "--log-file", os.path.join(out, "wawf.log")]
+        if self.raw_keys.get(): cmd += ["--raw-include-keys"]
+        if mode == "file":
+            # a key file never needs the sign-in; stay offline unless something else must go online
+            cmd += ["--key", self.key.get().strip()] + ([] if (fetch or hist) else ["--offline"])
+        if mode == "offline": cmd += ["--offline"]
+        if creds: cmd += ["--creds", creds]
+        if fetch: cmd += ["--fetch-media"]
+        if hist:
+            cmd += ["--history", "--yes"]               # --yes: the window cannot answer a typed prompt
+            if self.refetch.get(): cmd += ["--history-refetch"]
+            if self.install_node.get(): cmd += ["--install-node"]
+        if self.audit_mode.get() == "off":
+            cmd += ["--no-audit"]
+        else:
+            cmd += ["--audit-db", os.path.join(out, "wawf_audit.db")]
+            if self.audit_mode.get() == "secrets": cmd += ["--audit-secrets"]
+        if self.verbose.get(): cmd += ["-v"]
+        cmd += ["--log-file", os.path.join(out, "wawf.log")]
         return cmd, out
 
     def start(self):
@@ -482,20 +612,31 @@ class App(tk.Tk):
             cmd, out = self._command()
         except ValueError as e:
             messagebox.showwarning("WhatsApp Web Extractor", str(e)); return
+        if self.history.get() and not messagebox.askyesno(
+                "Recover history from the phone",
+                "This signs in as the linked device and asks the phone for older messages, chat by chat. "
+                "It can take hours, the phone must stay online, and it is recorded as activity on the account.\n\n"
+                "Start it?"):
+            return
         os.makedirs(out, exist_ok=True)
         self.out_dir = out
-        self._clear(); self._append("$ " + " ".join(_q(c) for c in cmd) + "\n\n")
+        self._launch(cmd, out, "Working… reading a large profile takes several minutes.")
+
+    def _launch(self, cmd, cwd, status):
+        if self.proc and self.proc.poll() is None:
+            messagebox.showinfo("WhatsApp Web Extractor", "A run is already in progress."); return
+        self._clear(); self._append("$ " + _cmdline(cmd) + "\n\n")
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", WAWF_FROM_GUI="1",
                    PYINSTALLER_RESET_ENVIRONMENT="1")      # the run unpacks its own copy of the exe
         try:
             self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                         env=env, cwd=out, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                                         env=env, cwd=cwd or None, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except OSError as e:
             messagebox.showerror("WhatsApp Web Extractor", f"Could not start: {e}"); return
         threading.Thread(target=self._pump, args=(self.proc,), daemon=True).start()
         self.run_btn.configure(state="disabled"); self.stop_btn.configure(state="normal")
-        self.open_btn.configure(state="normal")
-        self.status.configure(text="Working… reading a large profile takes several minutes.", foreground=MUTED)
+        self.open_btn.configure(state="normal" if cwd else "disabled")
+        self.status.configure(text=status, foreground=MUTED)
         self.bar.pack(fill="x", after=self._bar_after); self.bar.start(12)
 
     def _pump(self, proc):
@@ -570,8 +711,12 @@ class App(tk.Tk):
         self.log.configure(state="disabled")
 
 
-def _q(s):
-    return f'"{s}"' if " " in s else s
+def _cmdline(cmd):
+    """The command exactly as a terminal on this platform would take it, to copy or put in a report."""
+    if sys.platform == "win32":
+        return subprocess.list2cmdline(cmd)
+    import shlex
+    return shlex.join(cmd)
 
 def hide_own_console():
     """Double-clicking a console .exe opens a console window that belongs to this process alone; hide it

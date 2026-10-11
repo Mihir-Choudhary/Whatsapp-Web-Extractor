@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""selftest_gui.py — the window builds the same command lines the CLI documents.
+
+Drives the real window (hidden) through every option and checks the command it would run, that each
+invalid combination is refused with a message instead of being run, and that the command shown for
+copying parses back to exactly the arguments that will be executed. Needs a display; without one
+(e.g. a headless CI runner) it reports that and exits 0.
+
+Run:  python3 scripts/selftest_gui.py        (exit 0 = all cases pass)
+"""
+import os, sys, tempfile, shutil, json
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(HERE, "scripts"))
+FAIL = []
+try: sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception: pass
+
+def check(name, cond):
+    print(("  ok   " if cond else "  FAIL ") + name)
+    if not cond: FAIL.append(name)
+
+try:
+    import tkinter as tk
+    import wawf_gui as G
+    app = G.App(); app.withdraw()
+except Exception as e:                                     # no display / no Tk
+    print(f"skipped: the window cannot be created here ({type(e).__name__}: {e})"); sys.exit(0)
+
+tmp = tempfile.mkdtemp(prefix="wawf_guitest_")
+try:
+    prof = os.path.join(tmp, "Profile 1"); os.makedirs(os.path.join(prof, "IndexedDB"))
+    out = os.path.join(tmp, "case")
+    key = os.path.join(tmp, "companion_enc_static.txt"); open(key, "w").write("x")
+    creds = os.path.join(tmp, "creds_in.json"); open(creds, "w").write("{}")
+    idb = os.path.join(tmp, "stores", "IndexedDB"); os.makedirs(idb)
+    ls = os.path.join(tmp, "stores", "Local Storage"); os.makedirs(ls)
+    cache = os.path.join(tmp, "stores", "CacheStorage"); os.makedirs(cache)
+    ff = os.path.join(tmp, "https+++web.whatsapp.com"); os.makedirs(os.path.join(ff, "idb")); os.makedirs(os.path.join(ff, "ls"))
+
+    def reset():
+        app.src_mode.set("profile"); app.profile.set(prof); app._labels = {}; app._accounts = []
+        app.out.set(out); app.fmt_text.set(True); app.fmt_sqlite.set(True); app.fmt_raw.set(False)
+        app.key_mode.set("online"); app.key.set(""); app.fetch_media.set(False)
+        app.history.set(False); app.refetch.set(False); app.install_node.set(False)
+        app.raw_keys.set(False); app.verbose.set(False); app.audit_mode.set("on"); app.creds.set("")
+        app.st_idb.set(""); app.st_ls.set(""); app.st_cache.set("")
+    def args():
+        cmd, _ = app._command()
+        return cmd[len(app._exe()):]
+    def refused(msg_part):
+        try:
+            app._command(); return False
+        except ValueError as e:
+            return msg_part.lower() in str(e).lower()
+    def pair(a, flag):                                     # value that follows a flag
+        return a[a.index(flag) + 1] if flag in a else None
+
+    print("default run")
+    reset(); a = args()
+    check("profile first, then text+json and sqlite outputs",
+          a[0] == prof and pair(a, "--out") == os.path.join(out, "export") and
+          ("sqlite:" + os.path.join(out, "database")) in a)
+    check("online key capture is the default (no --offline, no --key)", "--offline" not in a and "--key" not in a)
+    check("audit database and log file inside the results folder",
+          pair(a, "--audit-db") == os.path.join(out, "wawf_audit.db") and pair(a, "--log-file") == os.path.join(out, "wawf.log"))
+
+    print("outputs and keys")
+    reset(); app.fmt_raw.set(True); app.raw_keys.set(True); a = args()
+    check("raw dump with key material", ("raw:" + os.path.join(out, "raw")) in a and "--raw-include-keys" in a)
+    reset(); app.key_mode.set("file"); app.key.set(key); a = args()
+    check("saved key decrypts offline", pair(a, "--key") == key and "--offline" in a)
+    reset(); app.key_mode.set("offline"); a = args()
+    check("don't go online", "--offline" in a and "--key" not in a)
+    reset(); app.fetch_media.set(True); a = args()
+    check("media download", "--fetch-media" in a)
+    reset(); app.key_mode.set("file"); app.key.set(key); app.fetch_media.set(True); a = args()
+    check("saved key + media download stays online for the media only", "--offline" not in a and "--fetch-media" in a)
+    reset(); app.creds.set(creds); a = args()
+    check("saved credentials", pair(a, "--creds") == creds)
+
+    print("history, audit, log")
+    reset(); app.history.set(True); app.refetch.set(True); app.install_node.set(True); a = args()
+    check("history with refetch and Node install, answering prompts with --yes",
+          all(x in a for x in ("--history", "--yes", "--history-refetch", "--install-node")))
+    reset(); app.audit_mode.set("secrets"); a = args()
+    check("audit with raw key values", "--audit-secrets" in a and "--audit-db" in a)
+    reset(); app.audit_mode.set("off"); a = args()
+    check("no audit", "--no-audit" in a and "--audit-db" not in a)
+    reset(); app.verbose.set(True); a = args()
+    check("detailed log", "-v" in a)
+
+    print("sources")
+    reset(); app.src_mode.set("stores"); app.st_idb.set(idb); app.st_ls.set(ls); app.st_cache.set(cache); a = args()
+    check("stores given separately", pair(a, "--idb") == idb and pair(a, "--local-storage") == ls
+          and pair(a, "--media-cache") == cache and prof not in a)
+    reset(); app.src_mode.set("stores"); app.st_idb.set(ff); a = args()
+    check("a Firefox origin folder becomes --origin, no Local Storage needed", pair(a, "--origin") == ff and "--idb" not in a)
+    reset(); app._accounts = [("919000000001", "k1"), ("919000000002", "k2")]; app.account.set("919000000002"); a = args()
+    check("second account selected with --partition", pair(a, "--partition") == "919000000002")
+
+    print("refusals")
+    reset(); app.profile.set(os.path.join(tmp, "missing"))
+    check("a missing profile folder", refused("profile folder"))
+    reset(); app.fmt_text.set(False); app.fmt_sqlite.set(False)
+    check("no output ticked", refused("at least one output"))
+    reset(); app.key_mode.set("offline"); app.fetch_media.set(True)
+    check("offline with media download", refused("go online"))
+    reset(); app.key_mode.set("offline"); app.history.set(True)
+    check("offline with history", refused("go online"))
+    reset(); app.fetch_media.set(True); app.fmt_sqlite.set(False)
+    check("media download without the database", refused("SQLite"))
+    reset(); app.refetch.set(True)
+    check("refetch without history", refused("history recovery"))
+    reset(); app.raw_keys.set(True)
+    check("key material without the raw dump", refused("raw store dump"))
+    reset(); app.key_mode.set("file"); app.key.set(os.path.join(tmp, "nope.txt"))
+    check("a missing key file", refused("companion_enc_static"))
+    reset(); app.src_mode.set("stores"); app.st_idb.set(idb)
+    check("Chromium stores without Local Storage", refused("Local Storage"))
+
+    print("the command shown for copying")
+    reset(); app.out.set(os.path.join(tmp, "a folder with spaces & \"quotes\"")); cmd, _ = app._command()
+    shown = G._cmdline(cmd)
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+        f = ctypes.windll.shell32.CommandLineToArgvW
+        f.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]; f.restype = ctypes.POINTER(wintypes.LPWSTR)
+        n = ctypes.c_int(); argv = f(shown, ctypes.byref(n)); back = [argv[i] for i in range(n.value)]
+        ctypes.windll.kernel32.LocalFree(argv)
+    else:
+        import shlex
+        back = shlex.split(shown)
+    check("parses back to exactly the arguments that run (spaces, quotes, &)", back == cmd)
+finally:
+    app.destroy()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+print()
+if FAIL:
+    print(f"{len(FAIL)} CASE(S) FAILED"); [print("  - " + f) for f in FAIL]; sys.exit(1)
+print("all window cases pass")

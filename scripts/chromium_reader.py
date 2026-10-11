@@ -343,6 +343,7 @@ def _read_idb_dir(ldb_dir: str, blob_dir: str | None) -> tuple:
     # bucket data records (index id 1) by (db, store) in ONE pass; ccl's per-store iteration rescans
     # every record of the database for every store.
     groups = {}
+    blob_index = []                                      # index id 3: where externally stored values live
     for r in raw._fetched_records:
         k = r.key
         if not k: continue
@@ -350,13 +351,19 @@ def _read_idb_dir(ldb_dir: str, blob_dir: str | None) -> tuple:
             dbid, sid, iid, plen = idb.IndexedDb.read_prefix(io.BytesIO(k))
         except ValueError:
             continue
+        if iid == 3 and dbid and sid: blob_index.append(r)
         if dbid == 0 or sid == 0 or iid != 1: continue      # metadata, not object data
         groups.setdefault((dbid, sid), []).append((r, k[plen:]))
+    # Every raw record was held twice from here on (in ccl's list and in `groups`) alongside the values
+    # decoded from them -- 7 GB peak on a 700 MB store. Metadata is already parsed, and only the blob
+    # index is consulted again, so ccl keeps just that.
+    raw._fetched_records = blob_index
 
     blink = ccl_blink_value_deserializer.BlinkV8Deserializer()
     bad = {}
     decoded = {}
-    for (dbid, sid), recs in groups.items():
+    for dbid, sid in list(groups):
+        recs = groups.pop((dbid, sid))                   # each store's raw bytes are released once decoded
         vals = []
         for r, kraw in recs:
             live = r.state == L.KeyState.Live
