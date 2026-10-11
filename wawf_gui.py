@@ -271,8 +271,9 @@ class App(tk.Tk):
         sf.columnconfigure(1, weight=1)
         self.st_idb, self.st_ls, self.st_cache = tk.StringVar(), tk.StringVar(), tk.StringVar()
         for i, (label, var, hint) in enumerate((
-                ("IndexedDB folder", self.st_idb, "…indexeddb.leveldb, or the IndexedDB folder around it"),
-                ("Local Storage folder", self.st_ls, "'Local Storage' (or its 'leveldb')"),
+                ("IndexedDB folder", self.st_idb, "Chromium: …indexeddb.leveldb or the IndexedDB folder around it.  "
+                                                  "Firefox: storage\\default\\https+++web.whatsapp.com"),
+                ("Local Storage folder", self.st_ls, "Chromium: 'Local Storage' (or its 'leveldb').  Not needed for Firefox"),
                 ("Media cache (optional)", self.st_cache, "CacheStorage / Cache_Data, to recover cached media"))):
             ttk.Label(sf, text=label, style="Card.TLabel").grid(row=2 * i, column=0, sticky="w", pady=(8, 0), padx=(0, 10))
             ttk.Entry(sf, textvariable=var, font=FONT).grid(row=2 * i, column=1, sticky="ew", pady=(8, 0))
@@ -402,9 +403,15 @@ class App(tk.Tk):
         if stores:
             idb, ls, cache = self.st_idb.get().strip(), self.st_ls.get().strip(), self.st_cache.get().strip()
             if not os.path.isdir(idb): raise ValueError("Choose the IndexedDB folder.")
-            if not os.path.isdir(ls): raise ValueError("Choose the Local Storage folder.")
             if cache and not os.path.isdir(cache): raise ValueError("The media cache folder does not exist.")
-            src = ["--idb", idb, "--local-storage", ls] + (["--media-cache", cache] if cache else [])
+            firefox = os.path.isdir(os.path.join(idb, "idb")) and (
+                os.path.isdir(os.path.join(idb, "ls")) or os.path.isfile(os.path.join(idb, ".metadata-v2")))
+            if firefox:                     # Firefox keeps IndexedDB and localStorage in this one folder
+                src = ["--origin", idb]
+            else:
+                if not os.path.isdir(ls): raise ValueError("Choose the Local Storage folder.")
+                src = ["--idb", idb, "--local-storage", ls]
+            src += ["--media-cache", cache] if cache else []
         else:
             prof = self._profile_path()
             if not prof or not os.path.isdir(prof):
