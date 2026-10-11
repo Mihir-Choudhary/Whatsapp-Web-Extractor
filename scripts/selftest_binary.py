@@ -9,7 +9,7 @@ Run:  python3 scripts/selftest_binary.py        (exit 0 = all cases pass)
 """
 import os, sys, json, base64, shutil, subprocess, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
-import wa_binary as B, wa_reconnect as R
+import wa_binary as B, wa_reconnect as R, wa_proto as P
 FAIL = []
 def check(name, cond):
     print(("  ok   " if cond else "  FAIL ") + name)
@@ -54,6 +54,24 @@ if node and os.path.isdir(os.path.join(mods, "@whiskeysockets", "baileys")):
         check("%d stanzas byte-identical to Baileys" % len(CASES), out == [B.encode_binary_node(c).hex() for c in CASES])
     finally:
         shutil.rmtree(d, ignore_errors=True)
+    print("protobuf messages against Baileys' WAProto")
+    r = json.loads(subprocess.run([node, os.path.join(os.path.dirname(harness), "proto.js")], capture_output=True,
+                                  text=True, check=True, env=dict(os.environ, NODE_PATH=mods)).stdout)
+    ours = P.decode(P.history_request('120363000000000000@g.us', '3EB0A1B2C3D4E5F60718AB', False, 50, 1783952047000), P.MESSAGE)
+    req = ours['protocolMessage']['peerDataOperationRequestMessage']['historySyncOnDemandRequest']
+    base = {k: v for k, v in req.items() if k != 'supportInlineResponse'}
+    check("history request matches Baileys byte for byte, plus WhatsApp Web's field 7",
+          P.encode({'protocolMessage': {'type': 16, 'peerDataOperationRequestMessage': {'peerDataOperationRequestType': 3,
+                    'historySyncOnDemandRequest': base}}}, P.MESSAGE).hex() == r['req'] and req['supportInlineResponse'] is True)
+    hs = P.decode(bytes.fromhex(r['hs']), P.HISTORY_SYNC); c = hs['conversations'][0]
+    m0, m1 = c['messages'][0]['message'], c['messages'][1]['message']
+    check("a HistorySync chunk from Baileys decodes (type, order, chat, end marker, push names)",
+          (hs['syncType'], hs['chunkOrder'], c['id'], c['endOfHistoryTransferType'], hs['pushnames'][0]['pushname'])
+          == (6, 2, '919000000001@s.whatsapp.net', 1, 'Someone'))
+    check("...and its messages: keys, timestamps, types and text, through wrappers",
+          m0['key'] == {'remoteJid': '919000000001@s.whatsapp.net', 'fromMe': True, 'id': 'ABC123'}
+          and m0['messageTimestamp'] == 1783952047 and P.message_text(m0['message']) == 'hello https://x.y'
+          and P.message_type(m1['message']) == 'imageMessage' and P.message_text(m1['message']) == 'a photo')
 else:
     print("Baileys not available: byte-for-byte comparison skipped")
 print()
