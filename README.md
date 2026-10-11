@@ -393,7 +393,7 @@ the server — and a closed browser on a seized machine may never connect again.
 wawf <profile> --out D:\case\out --queue
 ```
 
-After the normal export, this exports the device's credentials and the browser's **own** Signal state
+This exports the device's credentials and the browser's **own** Signal state
 (identity, sessions, the group sender keys) into `<out>/server-queue/<time>/`, signs in as the device and
 records every stanza the server delivers:
 
@@ -405,6 +405,11 @@ records every stanza the server delivers:
   Edits sent in WhatsApp's newer encrypted form are decrypted when the original message is in the same
   capture (its secret is the key, as in WhatsApp Web); otherwise the row says the original is missing;
 - `queue_summary.json` — counts, and whether the server's end-of-queue marker was received.
+
+The capture runs first, and the export then folds the queue's messages into each chat's timeline —
+`chats.json`, `transcripts.txt` and `msgstore.db` — every row marked `source: server-queue` beside the
+browser's own `cache` rows (deduplicated on the message id; the browser's copy wins). Reactions, edits and
+deletions stay in `queue_messages.json`, which names the message each one acts on.
 
 **Nothing is acknowledged.** An acknowledgement is what makes the server delete a stanza from the
 device's queue, so the queue is left exactly where it was: the next client that connects as this device

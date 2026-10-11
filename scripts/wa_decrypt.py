@@ -733,7 +733,9 @@ def hist_row(r, ids, when, chat_key=None):
             "sender_lid": e.get("lid"), "sender_phone": e.get("pn"),
             "sender_source": src,
             "text": r.get("text") or "", "quoted_text": "",      # as sent: decrypt, change nothing
-            "source": "phone"}
+            # "phone" (served by the phone on request) or "server-queue" (held by WhatsApp's server for
+            # the device, recorded with --queue)
+            "source": r.get("source") or "phone"}
 
 def bank_history(master, msgs):
     """Fold one pass's messages into the accumulated ledger. -> (new, enriched)

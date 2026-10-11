@@ -63,7 +63,9 @@ FIELDS = {'id', 't', 'dir', 'type', 'chat', 'chat_name', 'sender', 'sender_name'
 #                  or "encrypted" in an export made without a key), written rather than dropped;
 #   filename, ack/status, and the structured parts of a body (link, location, poll, event, payment,
 #   target_message_key).
-OPTIONAL = {'filename', 'ack', 'status', 'link', 'location', 'poll', 'event', 'payment', 'target_message_key'}
+#   view_once + content_note -- a view-once record: WhatsApp sends its content only to the phones.
+OPTIONAL = {'filename', 'ack', 'status', 'link', 'location', 'poll', 'event', 'payment', 'target_message_key',
+            'view_once', 'content_note'}
 def _fields_ok(m):
     extra = set(m) - FIELDS
     if not FIELDS <= set(m) or extra - OPTIONAL - {'body_status'}: return False
@@ -130,7 +132,7 @@ print("  ..   rows with a quote: %d   rows with own text: %d"
 bysrc = collections.Counter(m.get('source') for m in msgs)
 print("  ..   provenance: %s" % dict(bysrc))
 chk("every row says where it came from", not [m for m in msgs if m.get('source') not in
-                                              ('cache', 'phone')], dict(bysrc))
+                                              ('cache', 'phone', 'server-queue')], dict(bysrc))
 # A message the phone served has no quote of its own (the extractor does not return one) and was not
 # decrypted locally, so it must not claim to have been.
 chk("a recovered row does not claim a locally decrypted quote",
@@ -219,7 +221,8 @@ def check_transcript():
         rows = ch.get(b['jid'], [])
         if len(rows) != len(b['lines']): continue          # already reported above
         for l, m in zip(b['lines'], rows):
-            want = "(%s)" % (m.get('type') or 'unknown')
+            want = ("(view-once %s: content only on the phones)" % (m.get('type') or 'media') if m.get('view_once')
+                    else "(%s)" % (m.get('type') or 'unknown'))
             if not m.get('text') and l[3] != want:
                 mismatched.append((b['jid'], l[0], l[3], want))
     chk("a message with no text of its own is shown as its type", not mismatched, mismatched[:2])

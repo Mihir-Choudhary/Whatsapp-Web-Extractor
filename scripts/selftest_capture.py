@@ -151,6 +151,22 @@ e1 = rows.get("E1", {})
 check("an encrypted edit is decrypted with the original message's secret",
       (e1.get("action"), e1.get("target_id"), e1.get("text"), e1.get("encrypted_addon")) == ("edit", "O1", "the original", "decrypted"))
 
+print("queue rows as merged into the export")
+h = QC.as_history([
+    {"id": "T1", "chat": "1@g.us", "chat_kind": "group", "from_me": False, "sender": "9:3@lid", "push_name": "P",
+     "t": 5, "status": "decrypted", "type": "conversation", "text": "hi"},
+    {"id": "R1", "chat": "1@g.us", "chat_kind": "group", "from_me": False, "sender": "9@lid", "t": 6,
+     "status": "decrypted", "type": "reactionMessage", "action": "reaction", "text": "x"},
+    {"id": "K1", "chat": "1@g.us", "chat_kind": "group", "sender": "9@lid", "t": 7, "status": "decrypted",
+     "type": "senderKeyDistributionMessage"},
+    {"id": "V1", "chat": "8@lid", "chat_kind": "1:1", "from_me": False, "sender": "8@lid", "t": 8,
+     "status": "withheld from linked devices (view_once)"},
+    {"id": "N1", "chat": "1@g.us", "chat_kind": "group", "sender": "9@lid", "t": 9, "status": "not decrypted"}])["messages"]
+ids_ = [m["id"] for m in h]
+check("messages kept; reactions, key handovers and undecrypted rows left out", ids_ == ["T1", "V1"])
+check("a group message names its sender without the device", h[0]["participant"] == "9@lid" and h[0]["source"] == "server-queue")
+check("a view-once stub is kept and says so", "view-once" in h[1]["text"])
+
 # ---------------------------------------------------------------- group handover + message, sender = Baileys
 mods = os.environ.get("WAWF_XTEST_NODE_MODULES") or os.path.join(os.path.dirname(HERE), "tools", "reconnect", "node_modules")
 node = shutil.which("node") or (r"C:\Program Files\nodejs\node.exe" if os.path.isfile(r"C:\Program Files\nodejs\node.exe") else None)

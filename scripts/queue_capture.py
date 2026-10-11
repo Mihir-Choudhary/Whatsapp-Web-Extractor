@@ -271,6 +271,28 @@ def readable(journal_path: str, own=()) -> list:
     return rows
 
 
+def as_history(rows: list) -> dict:
+    """The queue's messages in the shape wawf merges into an export (as history_recovered.json), marked
+    source=server-queue. Rows that are actions on other messages (reactions, edits, deletions) and bare
+    key handovers are not messages of their own and stay only in queue_messages.json."""
+    out = []
+    for r in rows:
+        if r.get("action") or r.get("type") in ("senderKeyDistributionMessage", "protocolMessage"):
+            continue
+        withheld = str(r.get("status", "")).startswith("withheld")
+        if r.get("status") != "decrypted" and not withheld:
+            continue
+        sender = r.get("sender") or ""
+        part = None
+        if r.get("chat_kind") in ("group", "status") and not r.get("from_me"):
+            part = sender.split("@")[0].split(":")[0] + "@" + sender.split("@")[-1]
+        out.append({"chat": r["chat"], "id": r["id"], "fromMe": bool(r.get("from_me")), "participant": part,
+                    "pushName": r.get("push_name"), "ts": r["t"],
+                    "text": ("(view-once: content only on the phones)" if withheld else r.get("text") or ""),
+                    "type": ("imageMessage" if withheld else r.get("type")), "source": "server-queue"})
+    return {"messages": out, "recovered_total": len(out)}
+
+
 def main():
     for f in ("creds_in.json",):
         if not os.path.isfile(f): say("[!] %s not found in %s" % (f, os.getcwd())); return 4
@@ -313,6 +335,7 @@ def main():
         while not c.messages.empty(): c.messages.get_nowait()
     rows = readable(jpath, own=(c.me_lid, c.me_pn))
     json.dump(rows, open("queue_messages.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    json.dump(as_history(rows), open("queue_for_export.json", "w", encoding="utf-8"), ensure_ascii=False)
     summ = {"finished_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "ack_policy": ACK,
             "end_of_queue_marker": offline_marker, "seconds": round(time.time() - started),
             "stats": c.stats, "tally": dict(c.tally),

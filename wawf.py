@@ -949,9 +949,11 @@ def cmd_decrypt(a):
         try:
             rec = (json.load(open(hf, encoding="utf-8")) or {}).get("messages") or []
             hist_added, hist_skipped, touched = WD.merge_history(chats, rec, ids, ts)
-            log.info("history: +%s message(s) recovered from the phone across %d chat(s); "
+            _from = ("the server queue" if rec and all(r.get("source") == "server-queue" for r in rec)
+                     else "the phone")
+            log.info("merged: +%s message(s) from %s across %d chat(s); "
                      "%s already present in the browser's own store",
-                     f"{hist_added:,}", len(touched), f"{hist_skipped:,}")
+                     f"{hist_added:,}", _from, len(touched), f"{hist_skipped:,}")
         except Exception as e:
             log.error("could not merge recovered history from %s: %s", hf, e)
             return 1
@@ -1742,7 +1744,8 @@ def cmd_queue(a):
     except Exception: pass
     for name, kind in (("queue_journal.jsonl", "server queue journal (stanzas as received + decrypted payloads)"),
                        ("queue_messages.json", "server queue, readable (one row per message)"),
-                       ("queue_summary.json", "server queue capture summary")):
+                       ("queue_summary.json", "server queue capture summary"),
+                       ("queue_for_export.json", "server queue messages as merged into the export")):
         p = os.path.join(work, name)
         if os.path.isfile(p): AUDIT.artifact(p, kind=kind)
     AUDIT.event("server queue capture exit rc=%s" % rc, level="INFO" if rc == 0 else "ERROR", category="network",
@@ -1755,6 +1758,7 @@ def cmd_queue(a):
              summ.get("decrypted"), summ.get("not_decrypted"),
              "received" if summ.get("end_of_queue_marker") is not None else "NOT received (queue may be partial)")
     log.info("readable: %s", os.path.join(work, "queue_messages.json"))
+    a.queue_export_file = os.path.join(work, "queue_for_export.json")
     log.warning("%s holds the device's credentials and Signal state: key material -- keep it with the case, "
                 "never share it.", work)
     return 0
@@ -2354,7 +2358,8 @@ def main():
                         "status updates, receipts, call offers received while the browser was closed), "
                         "decrypted with the browser's own keys. NETWORKED; nothing is acknowledged, so the "
                         "server keeps the queue for the browser, and nothing a contact can see is sent. "
-                        "Runs after the normal export, into <first --out>/server-queue/<time>/.")
+                        "Written to <first --out>/server-queue/<time>/, and its messages are merged "
+                        "into the export, each row marked source=server-queue.")
     g.add_argument("--install-node", action="store_true",
                    help="allow --history to INSTALL Node.js via winget if none is found. Not covered "
                         "by --yes, because it modifies this machine and asks for elevation; a "
@@ -2429,8 +2434,14 @@ def main():
         _usage("--queue signs in to WhatsApp's server, and --offline forbids going online")
     if getattr(a, "queue", False):
         def _decrypt_then_queue(a):
-            rc = cmd_run(a) if a.out else 0          # with no --out: only the queue
-            return rc or cmd_queue(a)
+            # The queue first, so the export can fold it in: one timeline per chat, every row saying
+            # whether it came from the browser's store or the server queue.
+            rc = cmd_queue(a)
+            if rc or not a.out: return rc            # with no --out: only the queue
+            qf = getattr(a, "queue_export_file", None)
+            if qf and os.path.isfile(qf) and not getattr(a, "history_file", None):
+                a.history_file = qf
+            return cmd_run(a)
         a.cmd, action = "decrypt+queue", _decrypt_then_queue
     elif a.history:
         a.cmd, action = "history", cmd_history

@@ -402,13 +402,14 @@ if HIST:
             'timestamp': int(r.get('ts') or 0) * 1000, 'message_type': MTYPE.get(typ, 0),
             'text_data': (r.get('text') or None) if (r.get('text') or '').strip() else None,   # as sent
             'status': 0, 'starred': 0, 'media': None, 'thumb': None, 'mentioned': [],
-            'quoted_id': None, 'quoted_type': None, 'quoted_text': None, 'source': 'phone',
+            'quoted_id': None, 'quoted_type': None, 'quoted_text': None, 'source': r.get('source') or 'phone',
         })
         have.add(sid); appended += 1
         jid_id(cj); chat_rowid(cj)
         if sender: jid_id(norm_jid(sender))
     messages.sort(key=lambda m: (m['chat_jid'], m['timestamp']))
-    print(f"[+] history: appended {appended} message(s) recovered from the phone "
+    _from = 'the server queue' if all(r.get('source') == 'server-queue' for r in HIST) else 'the phone'
+    print(f"[+] merged: appended {appended} message(s) from {_from} "
           f"({len(HIST) - appended} already in the store)")
 
 for c in contacts:
