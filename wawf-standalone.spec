@@ -15,6 +15,8 @@ for pkg in ("ccl_chromium_reader", "cramjam", "websocket"):
     d, b, h = collect_all(pkg)
     datas += d; binaries += b; hiddenimports += h
 hiddenimports += collect_submodules("cryptography")
+# The Python history client (history_extract.py, wa_client.py) runs from data the same way.
+hiddenimports += ["urllib.request", "urllib.error", "urllib.parse", "queue", "secrets", "gzip", "collections"]
 datas += [(f, "scripts") for f in glob.glob("scripts/*.py")]
 datas += [("assets/wawf.png", "assets")]          # window icon for the GUI
 

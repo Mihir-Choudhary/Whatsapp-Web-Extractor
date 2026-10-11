@@ -21,6 +21,8 @@ hiddenimports += collect_submodules("cryptography")
 # stdlib submodule in that position (wa_reconnect.py, mediafetch.py, fetch_history_blobs.py);
 # urllib.error rides along with it and is named explicitly so it cannot be dropped either.
 hiddenimports += ["urllib.request", "urllib.error"]
+# The Python history client (history_extract.py, wa_client.py) runs from data the same way.
+hiddenimports += ["urllib.request", "urllib.error", "urllib.parse", "queue", "secrets", "gzip", "collections"]
 
 # Bundle every helper script as data so runpy + the runtime sys.path insert resolve them
 # (chromium_reader, wa_decrypt, export_baileys_creds, wa_forensic, export_sqlite,
