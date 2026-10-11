@@ -50,10 +50,64 @@ device credentials, capture the at-rest key (reconnect), and decrypt:
 wawf <PROFILE>
 ```
 
-`<PROFILE>` is the browser profile folder (Chromium: the one containing `IndexedDB`; Firefox: the profile
+`<PROFILE>` is the browser profile folder (Chromium: `Default`, `Profile 1`, ...; Firefox: the profile
 folder, or `--origin` for its `web.whatsapp.com` storage folder). Nothing is auto-detected — which profile
 gets examined is always your explicit choice. `wawf -h` prints the profile locations for your machine as
 full, copy-pasteable paths.
+
+**Prefer a window?** Double-click `wawf-windows-x64.exe`, or run `wawf` with no arguments. It lists the
+profiles on the machine that hold WhatsApp Web, lets you pick where to save and how to get the key, and
+runs exactly the command line shown in its log — the same run, the same audit trail.
+
+### Acquiring the profile
+
+Close the browser completely first (on Windows also Edge's *Startup boost* / Chrome's *Continue running
+background apps*), then copy the profile folder. A browser that is running keeps writing its LevelDB
+stores, and a copy taken meanwhile is torn: tables come out zero-length or half-written, the write-ahead
+log is cut mid-record, and IndexedDB can lose its own database and store names. On such a copy the tool
+still reads everything that survived, names the stores by their record fields, and reports exactly what
+could not be read — but what was lost is lost. Measured on one profile: a live copy kept 388,967 of
+409,165 messages and lost the key store, so it could not be decrypted at all.
+
+Current Chromium/Edge builds can keep WhatsApp Web under a *partitioned* storage key, in
+`WebStorage/<n>/IndexedDB` with its own localStorage, instead of the classic
+`IndexedDB/https_web.whatsapp.com_0.indexeddb.leveldb`. Every partition is found and recorded; the one
+holding the signed-in session is examined. If a profile holds more than one signed-in WhatsApp account,
+the run says so and `--partition` selects each in turn (`--list-partitions` shows them).
+
+### No profile folder? Point at the stores
+
+When only the stores were collected, pass them directly. They can be anywhere and renamed; their
+relative layout no longer matters:
+
+```bash
+wawf --idb "E:\item7\IndexedDB" --local-storage "E:\item7\Local Storage" --out D:\case\out
+wawf --idb "E:\item7\WebStorage\4\IndexedDB" --local-storage "E:\item7\Local Storage" --media-cache "E:\item7\WebStorage\4\CacheStorage" --offline --key key.txt --out D:\case\out
+```
+
+| What | Where it is in a Chromium profile | Needed for |
+|---|---|---|
+| `--idb` | `IndexedDB\https_web.whatsapp.com_0.indexeddb.leveldb`, or `WebStorage\<n>\IndexedDB\indexeddb.leveldb` | everything: messages, chats, contacts, groups, calls, the root key |
+| `--local-storage` | `Local Storage\leveldb` | the key salt, the device keys and which account is signed in |
+| `--media-cache` (optional) | `WebStorage\<n>\CacheStorage`, `Service Worker\CacheStorage`, `Cache\Cache_Data` | media WhatsApp Web had cached |
+
+The folder itself or the one around it is accepted (`...\IndexedDB` for `--idb`, `Local Storage` for
+`--local-storage`). For Firefox, `--origin` already takes the one folder that holds both
+(`storage\default\https+++web.whatsapp.com`). The window offers the same choice under *Separate folders*.
+
+### Where the profile came from
+
+A profile folder can be copied anywhere and renamed, so the tool reads its origin from the folder's
+own files and records it in the audit trail: the browser (files only that browser writes), the version
+that last wrote it, the label the browser showed for it, and the **original path**. Every Chromium
+LevelDB keeps a `LOG` whose lines carry the absolute path it was opened at, so:
+
+```
+profile: Microsoft Edge 154.0.4258.62, originally C:\Users\<user>\AppData\Local\Microsoft\Edge\User Data\Profile 8, labelled 'Profile 9' in the browser
+```
+
+The label and the folder name are different things (the example is a real pair). Stores passed with
+`--idb`/`--local-storage` are traced the same way, from their own `LOG` files.
 
 ### Choosing the output — `--out [FORMAT:]PATH`
 
@@ -181,10 +235,13 @@ A Windows drive letter is never mistaken for a `FORMAT`, so `D:\case\out` works 
 | Option | What it does |
 |---|---|
 | `--key FILE` | A `companion_enc_static.txt` captured earlier — decrypt without touching the network. Usually unnecessary: a copy left beside the output is found automatically. A **file**, never the key itself, so no secret reaches your shell history, process list or command auditing. |
+| `--offline` | Never contact WhatsApp. Decrypts with `--key` (or a key file found beside the output); with no key, exports **everything except message text** — chats, senders, timestamps, types, media keys and cached media, reactions, polls, calls, contacts, groups. |
+| `--partition WHICH` | When a profile holds more than one WhatsApp session: the account number, storage key or layout name to examine. |
+| `--list-partitions` | List every WhatsApp session in the profile (account, messages, key present) and stop. |
 | `--origin DIR` | Firefox `web.whatsapp.com` storage folder instead of a profile folder. |
 | `--raw-include-keys` | With `--out raw:` — also dump `signal-storage` and `wawc_db_enc`. Those are key material; a dump including them must not travel with a case. |
 | `--history` | **Also** pull chat history older than the browser cache from your phone, iteratively, resuming across runs, and append it to the export. Needs Node (offers to install it). Phone-side and rate-limited — see below. |
-| `--fetch-media` | With `--history --out sqlite:PATH`: after the pull, ask the CDN for media the browser never cached. Networked, and it downloads real bytes — a large account can be a lot of them. Urls whose signature has already expired are skipped without a request. |
+| `--fetch-media` | With `--out sqlite:PATH` (with or without `--history`): download, decrypt and verify from the CDN the media the browser never cached, newest first. Networked, and it downloads real bytes — a large account can be a lot of them. Urls whose signature has already expired are skipped without a request. |
 | `--history-refetch` | With `--history`: re-ask for history already recovered, to fill in fields an earlier run did not capture (the group sender). Finds nothing new by design. |
 | `--install-node` | Allow `--history` to install Node.js via winget when none is found. **Not** covered by `--yes`: it modifies the machine and asks for elevation. A portable Node unzipped beside the tool, or `WAWF_NODE` pointing at one, needs neither. |
 | `--no-audit` | Do **not** write the chain-of-custody database. It is written by default (see below). |
@@ -199,6 +256,31 @@ senders identified: address-book=14,250  pushname=7,325  phone=543  unresolved=0
 `unresolved` counts messages from jids the profile itself holds no name and no number for. On a
 healthy profile it is zero; anything else is a gap in the evidence, not a gap in the tool.
 | `-v`, `--log-file FILE` | Full logs and tracebacks; mirror them to a file. |
+
+## What a browser holds — and what it does not
+
+Measured on one account by examining a freshly linked Edge profile and comparing it, record by record,
+with a decrypted Android backup of the same phone taken minutes later. Expect the proportions to vary;
+the kinds of gap do not.
+
+| | In the browser | Notes |
+|---|---|---|
+| **Messages** | about the last **90 days** per chat (409,165 here; the phone held 3.49 million going back years) | the window is what the phone sends at link time. Within it, 96% of the phone's messages for the same chats were present; whole chats can be missing (the phone had more chats active in those 90 days than the browser received). `--history` asks the phone for more. |
+| Message text | decrypted with the key from sign-in; 99.5% identical to the phone's own text | view-once captions and messages WhatsApp Web recorded as `unknown` ("waiting for this message") have no content in the browser |
+| Link previews, locations, polls (with options), events | yes, as separate fields and Android tables | decoded with WhatsApp Web's own schema for the message record |
+| **Ticks** (sent / delivered / read / played) | yes, for every message sent from the account; 99.8% equal to the phone | |
+| Per-recipient receipts (who read it when) | **only** for messages whose *Message info* was opened in the browser | 32 records here, against 692,804 on the phone |
+| **Calls** | the recent window only (here the last ~12 days: 201 calls, exactly the phone's count for the same days) | outcome, duration, video, participants |
+| **Contacts** | yes: name, pushname, lid ↔ phone number, username, *about* text, business names | `contacts.csv`, `identities.json`, `wa.db` |
+| **Groups** | members, admins, past members with *left/removed* and when, subject, description, settings | 99.3% of memberships match the phone; the difference is the owner, whom the phone stores as itself |
+| Reactions, mentions, pins, labels, channels, blocklist | yes | |
+| Statuses (stories) | **no** — not written to disk | |
+| Profile pictures | addresses and hashes only; the image only if still cached | |
+| Media files | keys and hashes for all; the bytes only for what the browser cached (it caches some already decrypted) | `--fetch-media` downloads the rest while their links are valid |
+| History before the link | not on disk | each history chunk is downloaded once and deleted from the server; a network log of the sync shows the downloads but cannot be decrypted after the fact (its keys never leave the browser's memory) |
+
+Where a number above says the browser has less, that is the browser's content, not a reading gap: the
+export says so in its counts and in `body_status`, rather than filling anything in.
 
 ## Chain of custody (on by default)
 
@@ -280,8 +362,8 @@ route B. The command-line options were withdrawn rather than shipped half-coveri
 message text.
 
 ```bash
-wawf <PROFILE> --out D:\case\out
-#   ^ if key capture fails, it says so and writes the offline inventory
+wawf <PROFILE> --offline --out D:\case\out
+#   ^ never goes online; if key capture fails in a normal run, the same export is written
 ```
 
 The key capture does the WhatsApp Noise handshake in **pure Python**, so it works from the standalone
