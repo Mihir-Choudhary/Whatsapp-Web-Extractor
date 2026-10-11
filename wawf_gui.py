@@ -25,45 +25,72 @@ FONT_MONO = ("Consolas", 9)
 
 
 # ---------------------------------------------------------------- profile discovery
-def _browser_roots():
+_SKIP = {"Cache", "Code Cache", "GPUCache", "Service Worker", "IndexedDB", "Local Storage", "WebStorage",
+         "Extensions", "node_modules", "Packages", "Temp", "CrashDumps", "Crashpad", "ShaderCache", "storage",
+         "cache2", "pip", "npm-cache", "Docker", "JetBrains"}
+
+def _search_roots():
     home = os.path.expanduser("~")
     if sys.platform == "win32":
-        la = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
-        ad = os.environ.get("APPDATA") or os.path.join(home, "AppData", "Roaming")
-        chromium = [("Edge", os.path.join(la, "Microsoft", "Edge", "User Data")),
-                    ("Chrome", os.path.join(la, "Google", "Chrome", "User Data")),
-                    ("Brave", os.path.join(la, "BraveSoftware", "Brave-Browser", "User Data")),
-                    ("Vivaldi", os.path.join(la, "Vivaldi", "User Data")),
-                    ("Opera", os.path.join(ad, "Opera Software"))]
-        firefox = os.path.join(ad, "Mozilla", "Firefox", "Profiles")
-    elif sys.platform == "darwin":
-        a = os.path.join(home, "Library", "Application Support")
-        chromium = [("Chrome", os.path.join(a, "Google", "Chrome")), ("Edge", os.path.join(a, "Microsoft Edge")),
-                    ("Brave", os.path.join(a, "BraveSoftware", "Brave-Browser"))]
-        firefox = os.path.join(a, "Firefox", "Profiles")
-    else:
-        c = os.path.join(home, ".config")
-        chromium = [("Chrome", os.path.join(c, "google-chrome")), ("Edge", os.path.join(c, "microsoft-edge")),
-                    ("Chromium", os.path.join(c, "chromium")), ("Brave", os.path.join(c, "BraveSoftware", "Brave-Browser"))]
-        firefox = os.path.join(home, ".mozilla", "firefox")
-    return chromium, firefox
+        return [r for r in (os.environ.get("LOCALAPPDATA"), os.environ.get("APPDATA")) if r]
+    if sys.platform == "darwin":
+        return [os.path.join(home, "Library", "Application Support")]
+    return [os.path.join(home, ".config"), os.path.join(home, ".mozilla"), os.path.join(home, "snap"),
+            os.path.join(home, ".var", "app")]
 
-def find_profiles():
-    """[(label, path)] for every local browser profile that holds WhatsApp Web storage."""
-    out = []
-    chromium, firefox = _browser_roots()
-    for name, root in chromium:
-        for prof in sorted(glob.glob(os.path.join(root, "*"))):
-            if not os.path.isdir(prof): continue
-            legacy = os.path.join(prof, "IndexedDB", "https_web.whatsapp.com_0.indexeddb.leveldb")
-            ls = os.path.join(prof, "Local Storage", "leveldb")
-            has_ws = os.path.isdir(os.path.join(prof, "WebStorage"))
-            if os.path.isdir(legacy) or (has_ws and os.path.isdir(ls) and _ls_mentions_wa(ls)):
-                out.append((f"{name}  ·  {os.path.basename(prof)}", prof))
-    for prof in sorted(glob.glob(os.path.join(firefox, "*"))):
-        if os.path.isdir(os.path.join(prof, "storage", "default", "https+++web.whatsapp.com")):
-            out.append((f"Firefox  ·  {os.path.basename(prof)}", prof))
-    return out
+def _wa_profile(d):
+    """'chromium' / 'firefox' if folder `d` is a browser profile holding WhatsApp Web, else None.
+    Decided by structure only, so any Chromium- or Firefox-based browser is found."""
+    if os.path.isdir(os.path.join(d, "storage", "default", "https+++web.whatsapp.com")):
+        return "firefox"
+    if os.path.isdir(os.path.join(d, "IndexedDB", "https_web.whatsapp.com_0.indexeddb.leveldb")):
+        return "chromium"
+    ls = os.path.join(d, "Local Storage", "leveldb")
+    if os.path.isdir(os.path.join(d, "WebStorage")) and os.path.isdir(ls) and _ls_mentions_wa(ls):
+        return "chromium"
+    return None
+
+def _label(root, d):
+    """'Microsoft Edge · Profile 8' style label from the path below the search root."""
+    parts = [x for x in os.path.relpath(d, root).split(os.sep) if x not in ("User Data", "Profiles", "config")]
+    name = parts[-1] if parts else d
+    app = " ".join(parts[:-1][-2:]) or name
+    return f"{app}  ·  {name}" if app != name else name
+
+def find_profiles(max_depth=4):
+    """[(label, path)] for every local browser profile holding WhatsApp Web, from any Chromium- or
+    Firefox-based browser. Browser data roots are recognised by their own marker -- Chromium's
+    `Local State` beside its profiles, Firefox's `profiles.ini` -- so only their profiles are tested."""
+    out, seen = [], set()
+    def consider(root, d):
+        kind = _wa_profile(d)
+        k = os.path.normcase(os.path.realpath(d))
+        if kind and k not in seen:
+            seen.add(k); out.append((_label(root, d), d))
+    for root in _search_roots():
+        if not os.path.isdir(root): continue
+        stack = [(root, 0)]
+        while stack:
+            d, depth = stack.pop()
+            try:
+                names = {e.name: e for e in os.scandir(d)}
+            except OSError:
+                continue
+            if "Local State" in names or "profiles.ini" in names:
+                consider(root, d)                                    # e.g. Opera keeps its profile here
+                for sub in ("", "Profiles"):
+                    base = os.path.join(d, sub) if sub else d
+                    try:
+                        for e in os.scandir(base):
+                            if e.is_dir(follow_symlinks=False): consider(root, e.path)
+                    except OSError:
+                        pass
+                continue
+            if depth >= max_depth: continue
+            for n, e in names.items():
+                if n not in _SKIP and e.is_dir(follow_symlinks=False):
+                    stack.append((e.path, depth + 1))
+    return sorted(out)
 
 def _ls_mentions_wa(ls_dir):
     """Cheap check (no parsing): does this profile's localStorage hold any web.whatsapp.com key?"""
@@ -346,11 +373,16 @@ class App(tk.Tk):
 
     # ----- actions
     def refresh_profiles(self):
-        found = find_profiles()
+        self.profile_help.configure(text="Searching this computer for browser profiles with WhatsApp Web…")
+        threading.Thread(target=lambda: self.q.put(("__profiles__", find_profiles())), daemon=True).start()
+
+    def _show_profiles(self, found):
         self._labels = {lbl: p for lbl, p in found}
         self.profile_box["values"] = [lbl for lbl, _ in found]
         if found and not self.profile.get():
             self.profile.set(found[0][0]); self._picked()
+        elif found:
+            self._check_profile()
         if not found:
             self.profile_help.configure(text="No browser profile with WhatsApp Web was found on this computer. "
                                              "Use Browse… to pick a profile folder (or a copy of one).")
@@ -475,7 +507,9 @@ class App(tk.Tk):
         try:
             while True:
                 item = self.q.get_nowait()
-                if isinstance(item, tuple) and item[0] == "__accounts__":
+                if isinstance(item, tuple) and item[0] == "__profiles__":
+                    self._show_profiles(item[1])
+                elif isinstance(item, tuple) and item[0] == "__accounts__":
                     self._show_accounts(item[1], item[2])
                 elif isinstance(item, tuple) and item[0] == "__identity__":
                     if item[1] == self._profile_path() and item[2]:

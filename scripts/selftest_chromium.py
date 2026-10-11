@@ -128,6 +128,15 @@ try:
           and info.get("original_path", "").endswith("\\Edge\\User Data\\Profile 8"))
     check("...and the OS user it lived under", info.get("os_user") == "examiner")
     check("the in-browser label is kept apart from the folder name", info.get("display_name") == "Work")
+    lin = os.path.join(tmp, "evidence", "item-08")                 # a Linux Brave profile, renamed
+    os.makedirs(os.path.join(lin, "Local Storage", "leveldb"))
+    with open(os.path.join(lin, "Local Storage", "leveldb", "LOG"), "w") as f:
+        f.write("2026/10/11-16:55:16.243 7f2a Creating DB /home/analyst/.config/BraveSoftware/Brave-Browser"
+                "/Profile 2/Local Storage/leveldb since it was missing.\n")
+    li = PI.identify(lin)
+    check("a Linux profile's original path and folder are recovered too",
+          li.get("original_folder_name") == "Profile 2" and li.get("os_user") == "analyst"
+          and "/.config/BraveSoftware/" in li.get("original_path", ""))
 
     # ------------------------------------------------------------ stores given without their profile
     print("stores given on their own")

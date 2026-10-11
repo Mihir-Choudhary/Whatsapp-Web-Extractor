@@ -199,7 +199,25 @@ def identify(profile: str) -> dict:
                                          "example_log": next(x[2] for x in paths if x[0] == best)}
         others = [k for k in cnt if k != best]
         if others: out["other_paths_seen"] = others[:5]
+        b = browser_from_path(best)
+        if b and (not out.get("browser") or out["browser"].startswith("Chromium-based")):
+            out["browser"], out["browser_evidence"] = b, ["install path in LevelDB LOG lines"]
     return out
+
+
+_PATH_BROWSERS = (("Microsoft Edge", (r"\microsoft\edge", "/microsoft-edge", "/microsoft edge")),
+                  ("Google Chrome", (r"\google\chrome", "/google-chrome", "/google/chrome")),
+                  ("Brave", ("bravesoftware",)), ("Vivaldi", ("vivaldi",)), ("Opera", ("opera software", "/opera")),
+                  ("Chromium", ("\\chromium\\", "/chromium/")), ("Arc", ("\\arc\\", "/arc/")),
+                  ("Yandex", ("yandex",)))
+
+def browser_from_path(path):
+    """The browser a profile path belongs to, by its install folder; None when unrecognised."""
+    low = (path or "").lower()
+    for name, needles in _PATH_BROWSERS:
+        if any(n in low for n in needles):
+            return name
+    return None
 
 
 def summary(info: dict) -> str:
