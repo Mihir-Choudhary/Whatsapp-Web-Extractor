@@ -11,6 +11,38 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from wawf_help import TIPS, STEPS, GUIDE
+
+
+# which tip explains which toggle (matched on the start of its label)
+_TOGGLE_TIPS = {"Profile folder": "profile_mode", "Separate folders": "stores_mode",
+                "Readable chats": "fmt_text", "SQLite database": "fmt_sqlite", "Raw store dump": "fmt_raw",
+                "Also download media": "fetch_media", "Also recover history": "history",
+                "Get it from WhatsApp": "key_online", "Use a saved key": "key_file", "Don't go online": "key_offline",
+                "Record every step": "audit_on", "…including raw key values": "audit_secrets", "Don't record": "audit_off",
+                "Only re-ask chats": "refetch", "Allow installing Node.js": "install_node",
+                "Include key material": "raw_keys", "Detailed log": "verbose"}
+
+
+class Tooltip:
+    """Explanation shown when the pointer rests on a control (and while it has keyboard focus)."""
+    def __init__(self, widget, text):
+        self.w, self.text, self.tip, self.job = widget, text, None, None
+        widget.bind("<Enter>", self._later, add="+"); widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<FocusIn>", self._later, add="+"); widget.bind("<FocusOut>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+    def _later(self, _e=None):
+        self._hide(); self.job = self.w.after(450, self._show)
+    def _show(self):
+        if self.tip or not self.w.winfo_viewable(): return
+        x, y = self.w.winfo_rootx() + 12, self.w.winfo_rooty() + self.w.winfo_height() + 4
+        self.tip = t = tk.Toplevel(self.w); t.wm_overrideredirect(True); t.wm_geometry(f"+{x}+{y}")
+        tk.Label(t, text=self.text, justify="left", wraplength=460, bg="#111B21", fg="#FFFFFF",
+                 font=("Segoe UI", 9), padx=10, pady=7).pack()
+    def _hide(self, _e=None):
+        if self.job: self.w.after_cancel(self.job); self.job = None
+        if self.tip: self.tip.destroy(); self.tip = None
 
 # palette: WhatsApp Web's own light theme -- panel grey, white cards, its text greys and greens
 # (white on #008069 and #111B21 on #F0F2F5 both clear 4.5:1)
@@ -243,14 +275,48 @@ class App(tk.Tk):
                   padx=2, pady=2, anchor="w", takefocus=1)
         if value is not None: kw["value"] = value
         if command: kw["command"] = command
-        return cls(parent, **kw)
+        w = cls(parent, **kw)
+        key = _TOGGLE_TIPS.get(text if not text.startswith("Also ") else text.split(" (")[0][:40])
+        if key is None:
+            key = next((k for lbl, k in _TOGGLE_TIPS.items() if text.startswith(lbl)), None)
+        if key in TIPS: Tooltip(w, TIPS[key])
+        return w
 
     def _card(self, parent, step, title):
         f = ttk.Frame(parent, style="Card.TFrame", padding=(16, 12))
         f.pack(fill="x", pady=(0, 10))
-        ttk.Label(f, text=f"{step}   {title}", style="Step.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
+        head = ttk.Frame(f, style="Card.TFrame", padding=0); head.configure(borderwidth=0)
+        head.grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(head, text=f"{step}   {title}", style="Step.TLabel").pack(side="left")
+        if step in STEPS: self._info(head, STEPS[step][0], STEPS[step][1]).pack(side="left", padx=(8, 0))
         f.columnconfigure(0, weight=1)
         return f
+
+    def _info(self, parent, title, text):
+        """A small ⓘ: hover shows the explanation, click opens it in full."""
+        b = tk.Label(parent, text="ⓘ", fg=PRIMARY, bg=CARD, font=("Segoe UI", 11), cursor="hand2", takefocus=1)
+        b.bind("<Button-1>", lambda e: messagebox.showinfo(title, text, parent=self))
+        b.bind("<Return>", lambda e: messagebox.showinfo(title, text, parent=self))
+        Tooltip(b, text if len(text) < 400 else text[:380].rsplit(" ", 1)[0] + " …  (click for more)")
+        return b
+
+    def _tip(self, widget, key):
+        if key in TIPS: Tooltip(widget, TIPS[key])
+        return widget
+
+    def show_help(self):
+        if getattr(self, "_help", None) and self._help.winfo_exists():
+            self._help.deiconify(); self._help.lift(); return
+        self._help = h = tk.Toplevel(self); h.title("Help — WhatsApp Web Extractor"); h.configure(bg=BG)
+        if getattr(self, "_icon", None): h.iconphoto(False, self._icon)
+        t = tk.Text(h, wrap="word", font=("Segoe UI", 10), bg=CARD, fg=FG, relief="flat", padx=18, pady=14,
+                    width=96, height=34)
+        sb = ttk.Scrollbar(h, command=t.yview); t.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y"); t.pack(fill="both", expand=True)
+        t.tag_configure("h", font=("Segoe UI Semibold", 11), foreground=PRIMARY, spacing1=10)
+        for line in GUIDE.splitlines():
+            t.insert("end", line + "\n", "h" if line.isupper() and line.strip() else None)
+        t.configure(state="disabled")
 
     def _build(self):
         head = tk.Frame(self, bg=HEADER)
@@ -261,6 +327,9 @@ class App(tk.Tk):
             tk.Label(inner, image=self._icon_small, bg=HEADER).pack(side="left", padx=(0, 12))
         txt = tk.Frame(inner, bg=HEADER); txt.pack(side="left", fill="x")
         tk.Label(txt, text="WhatsApp Web Extractor", bg=HEADER, fg="#FFFFFF", font=FONT_TITLE).pack(anchor="w")
+        hb = tk.Button(inner, text="Help", command=self.show_help, bg="#FFFFFF", fg=PRIMARY, relief="flat",
+                       font=FONT_LABEL, padx=14, pady=4, cursor="hand2", activebackground="#E9EDEF")
+        hb.pack(side="right")
         tk.Label(txt, text="Forensic export of WhatsApp Web from an acquired browser profile.  "
                            "Use only on accounts you own or are authorised to examine.",
                  bg=HEADER, fg="#FFFFFF", font=FONT_SMALL).pack(anchor="w")
@@ -296,12 +365,12 @@ class App(tk.Tk):
         self.prof_frame = pf = ttk.Frame(c, style="Card.TFrame", padding=0); pf.configure(borderwidth=0)
         pf.grid(row=2, column=0, columnspan=3, sticky="ew"); pf.columnconfigure(0, weight=1)
         self.profile = tk.StringVar()
-        self.profile_box = ttk.Combobox(pf, textvariable=self.profile, font=FONT)
+        self.profile_box = ttk.Combobox(pf, textvariable=self.profile, font=FONT); self._tip(self.profile_box, "profile_box")
         self.profile_box.grid(row=0, column=0, sticky="ew", pady=(8, 0))
         self.profile_box.bind("<<ComboboxSelected>>", self._picked)
         self.profile_box.bind("<FocusOut>", lambda e: self._check_profile())
         ttk.Button(pf, text="Browse…", command=self.pick_profile).grid(row=0, column=1, padx=(8, 0), pady=(8, 0))
-        ttk.Button(pf, text="Rescan", command=self.refresh_profiles).grid(row=0, column=2, padx=(8, 0), pady=(8, 0))
+        self._tip(ttk.Button(pf, text="Rescan", command=self.refresh_profiles), "rescan").grid(row=0, column=2, padx=(8, 0), pady=(8, 0))
         self.profile_help = ttk.Label(pf, style="Help.TLabel", wraplength=880, justify="left",
                                       text="Pick the acquired profile folder with Browse…  "
                                            "Profiles found on this computer are listed for convenience.")
@@ -311,6 +380,7 @@ class App(tk.Tk):
                   style="Card.TLabel").pack(side="left")
         self.account = tk.StringVar()
         self.acct_box = ttk.Combobox(self.acct_row, textvariable=self.account, state="readonly", width=24, font=FONT)
+        self._tip(self.acct_box, "account")
         self.acct_box.pack(side="left", padx=(8, 0))
         self._accounts = []
         self._labels = {}
@@ -324,7 +394,8 @@ class App(tk.Tk):
                 ("Local Storage folder", self.st_ls, "Chromium: 'Local Storage' (or its 'leveldb').  Not needed for Firefox"),
                 ("Media cache (optional)", self.st_cache, "CacheStorage / Cache_Data, to recover cached media"))):
             ttk.Label(sf, text=label, style="Card.TLabel").grid(row=2 * i, column=0, sticky="w", pady=(8, 0), padx=(0, 10))
-            ttk.Entry(sf, textvariable=var, font=FONT).grid(row=2 * i, column=1, sticky="ew", pady=(8, 0))
+            self._tip(ttk.Entry(sf, textvariable=var, font=FONT), ("st_idb", "st_ls", "st_cache")[i]).grid(
+                row=2 * i, column=1, sticky="ew", pady=(8, 0))
             ttk.Button(sf, text="Browse…", command=lambda v=var, t=label: self._pick_dir(v, t)).grid(
                 row=2 * i, column=2, padx=(8, 0), pady=(8, 0))
             ttk.Label(sf, text=hint, style="Help.TLabel").grid(row=2 * i + 1, column=1, sticky="w")
@@ -333,7 +404,7 @@ class App(tk.Tk):
         c = self._card(form, "2", "Save results to")
         self.out = tk.StringVar(value=os.path.join(os.path.expanduser("~"), "Documents", "wawf-output",
                                                    dt.datetime.now().strftime("case-%Y%m%d-%H%M")))
-        ttk.Entry(c, textvariable=self.out, font=FONT).grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        self._tip(ttk.Entry(c, textvariable=self.out, font=FONT), "out").grid(row=1, column=0, sticky="ew", pady=(8, 0))
         ttk.Button(c, text="Browse…", command=self.pick_out).grid(row=1, column=1, padx=(8, 0), pady=(8, 0))
         fm = ttk.Frame(c, style="Card.TFrame", padding=0)
         fm.configure(borderwidth=0)
@@ -378,11 +449,11 @@ class App(tk.Tk):
         row = ttk.Frame(c4, style="Card.TFrame", padding=0); row.configure(borderwidth=0)
         row.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0)); row.columnconfigure(1, weight=1); row.columnconfigure(3, weight=1)
         ttk.Label(row, text="Case / exhibit no.", style="Card.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Entry(row, textvariable=self.case_id, font=FONT).grid(row=0, column=1, sticky="ew")
+        self._tip(ttk.Entry(row, textvariable=self.case_id, font=FONT), "case_id").grid(row=0, column=1, sticky="ew")
         ttk.Label(row, text="Examiner", style="Card.TLabel").grid(row=0, column=2, sticky="w", padx=(16, 8))
-        ttk.Entry(row, textvariable=self.examiner, font=FONT).grid(row=0, column=3, sticky="ew")
+        self._tip(ttk.Entry(row, textvariable=self.examiner, font=FONT), "examiner").grid(row=0, column=3, sticky="ew")
         ttk.Label(row, text="Notes", style="Card.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        ttk.Entry(row, textvariable=self.case_notes, font=FONT).grid(row=1, column=1, columnspan=3, sticky="ew", pady=(6, 0))
+        self._tip(ttk.Entry(row, textvariable=self.case_notes, font=FONT), "case_notes").grid(row=1, column=1, columnspan=3, sticky="ew", pady=(6, 0))
         aud = ttk.Frame(c4, style="Card.TFrame", padding=0); aud.configure(borderwidth=0)
         aud.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
         self._toggle(aud, "Record every step and file hash (wawf_audit.db)", self.audit_mode, value="on").pack(side="left")
@@ -414,10 +485,11 @@ class App(tk.Tk):
         self._toggle(c, "Include key material in the raw store dump (do not share that dump)",
                      self.raw_keys).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
         ttk.Label(c, text="Saved credentials (creds_in.json)", style="Card.TLabel").grid(row=3, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(c, textvariable=self.creds, font=FONT).grid(row=3, column=1, sticky="ew", pady=(8, 0), padx=(10, 0))
+        self._tip(ttk.Entry(c, textvariable=self.creds, font=FONT), "creds").grid(row=3, column=1, sticky="ew", pady=(8, 0), padx=(10, 0))
         ttk.Button(c, text="Browse…", command=self.pick_creds).grid(row=3, column=2, padx=(8, 0), pady=(8, 0))
         self._toggle(c, "Detailed log (full tracebacks)", self.verbose).grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
-        ttk.Button(c, text="List the WhatsApp sessions in this profile", command=self.list_sessions).grid(
+        self._tip(ttk.Button(c, text="List the WhatsApp sessions in this profile", command=self.list_sessions),
+                  "list_sessions").grid(
             row=6, column=0, columnspan=3, sticky="w", pady=(10, 0))
         ttk.Button(c, text="Done", style="Run.TButton", command=self._toggle_adv).grid(row=7, column=2, sticky="e", pady=(12, 0))
 
@@ -425,7 +497,8 @@ class App(tk.Tk):
         cl = ttk.Frame(bottom); cl.pack(fill="x", pady=(0, 6))
         ttk.Label(cl, text="Command line", style="Sub.TLabel").pack(side="left", padx=(0, 8))
         self.cmd_text = tk.StringVar()
-        ttk.Entry(cl, textvariable=self.cmd_text, state="readonly", font=FONT_MONO).pack(side="left", fill="x", expand=True)
+        self._tip(ttk.Entry(cl, textvariable=self.cmd_text, state="readonly", font=FONT_MONO), "cmd").pack(
+            side="left", fill="x", expand=True)
         ttk.Button(cl, text="Copy", command=self.copy_cmd).pack(side="left", padx=(8, 0))
         self.after(300, self._refresh_cmd)
 
@@ -433,7 +506,7 @@ class App(tk.Tk):
         bar = ttk.Frame(bottom); bar.pack(fill="x", pady=(4, 8))
         self._bar_row = bar
         self.run_btn = ttk.Button(bar, text="Start", style="Run.TButton", command=self.start)
-        self.run_btn.pack(side="left")
+        self.run_btn.pack(side="left"); self._tip(self.run_btn, "start")
         self.stop_btn = ttk.Button(bar, text="Stop", style="Stop.TButton", command=self.stop, state="disabled")
         self.stop_btn.pack(side="left", padx=(8, 0))
         self.open_btn = ttk.Button(bar, text="Open results folder", command=self.open_out, state="disabled")
@@ -507,7 +580,10 @@ class App(tk.Tk):
         want = self._form.winfo_reqheight()
         self._canvas.configure(height=max(200, min(want, avail - fixed)))
         self.update_idletasks()
-        self.geometry(f"{max(self._form.winfo_reqwidth() + 60, 760)}x{min(self.winfo_reqheight(), avail)}")
+        w, h = max(self._form.winfo_reqwidth() + 60, 760), min(self.winfo_reqheight(), avail)
+        x = max(0, (self.winfo_screenwidth() - w) // 2)
+        y = max(0, (avail - h) // 2)                           # placed inside the usable area, never under a taskbar
+        self.geometry(f"{w}x{h}+{x}+{y}")
         self.minsize(760, min(560, avail))
 
     def _refresh_cmd(self):
