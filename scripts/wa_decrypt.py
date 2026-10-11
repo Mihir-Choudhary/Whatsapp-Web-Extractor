@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from snappy_pure import uncompress
 from idbutil import store_id
 import sclone
+import wa_opaque
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -139,7 +140,9 @@ def _norm_msg(o):
     return {"id": idv, "chat": parts[1] if len(parts) > 1 else "?",
             "from_me": parts[0] == "true", "type": o.get("type"), "t": o.get("t") or 0,
             "sender": as_str(o.get("author")) or as_str(o.get("from")),
-            "iv": iv, "data": data, "scheme": op.get("_scheme") if op else None}
+            "iv": iv, "data": data, "scheme": op.get("_scheme") if op else None,
+            "filename": as_str(o.get("filename")),
+            "ack": o.get("ack") if isinstance(o.get("ack"), int) else None}
 def as_str(x):
     if isinstance(x, str): return x
     if isinstance(x, dict): return x.get("_serialized") or (f"{x.get('user')}@{x.get('server')}" if x.get("user") else None)
@@ -206,6 +209,7 @@ class Identities:
     """
     def __init__(self, stores=None, ls=None):
         st = stores or {}
+        self.contact_records = [o for o in st.get("contact", []) if isinstance(o, dict)]   # verbatim, for contacts.csv
         self._id = {}      # canon jid -> identity dict (several keys share one object: that IS the merge)
         self._subject = {} # canon group jid -> subject, from group-metadata (authoritative)
         self._chat = {}    # canon chat jid -> WhatsApp's own display name, from the chat store
@@ -533,8 +537,32 @@ def _scrape(buf, cap):
     lv = list(dict.fromkeys(([p] if p else []) + rest))
     return " ".join(lv)[:cap]
 
+def _schema_text(msg, cap=None):
+    """The text of one decoded MsgOpaqueData: its `body`, or its `caption` when the body is not text.
+
+    For media WhatsApp Web keeps a base64 JPEG thumbnail in `body` and the caption in `caption`; a
+    link preview's title/description/url are separate fields and are NOT part of the text (they are
+    exported as `link`). A body that is only an address or a message key is routing data."""
+    if not msg: return ""
+    body = msg.get("body") or ""
+    if body and (not body.strip() or _is_encoded_image(body) or _ADDRESS.match(body.strip())
+                 or _MSGKEY.match(body.strip())):
+        body = ""
+    # A poll or an event has no body; its question / name is what Android shows as the message text.
+    t = body or msg.get("caption") or msg.get("pollName") or msg.get("eventName") or ""
+    return t[:cap] if cap else t
+
+def body_details(pt):
+    """Structured parts of a body (link preview, location, poll, event...) or {} -- see wa_opaque.details."""
+    row = wa_opaque.decode_row(pt) if pt else None
+    return wa_opaque.details(row[0]) if row else {}
+
 def texts(pt, cap=None):
     """-> (own text, quoted text) from ONE parse of the body.
+
+    Decoded by WhatsApp Web's own schema (wa_opaque) when the body fits it, which keeps a link
+    preview's title and description out of the text. A body that does not fit falls back to the
+    schema-free reader below, so an unfamiliar shape still loses nothing.
 
     Both writers want both strings for every message, and calling `message_text` then `quoted_text`
     parsed each body twice and walked the tree twice -- 22,121 bodies in the hot loop of both
@@ -543,6 +571,9 @@ def texts(pt, cap=None):
     No length cap by default. JSON used to cut every message at 2,000 characters and SQLite at
     8,000, so a long forward or a pasted document lost its tail without a word -- 16 messages and
     3 quotes in the reference store, and the two exports disagreed about them."""
+    row = wa_opaque.decode_row(pt) if pt else None
+    if row is not None:
+        return _schema_text(row[0], cap), _schema_text(row[1], cap)
     own, q = split_body(pt)
     return _scrape(own, cap), _scrape(q, cap)
 
@@ -553,6 +584,11 @@ def message_text(pt, cap=None):
 def quoted_text(pt, cap=None):
     """The text of the message this one replies to, or "" -- kept apart, never merged into the above."""
     return texts(pt, cap)[1]
+
+ACK_STATUS = {-1: "error", 0: "pending", 1: "sent", 2: "delivered", 3: "read", 4: "played"}
+# entries that are not messages anyone sent: no delivery state applies, so none is written
+_SYSTEM_TYPES = {"e2e_notification", "gp2", "notification_template", "notification", "pinned_message",
+                 "protocol", "revoked", "ciphertext", "call_log", "message_history_notice"}
 
 def msg_row(m, when, pt, ids):
     """One chats.json record, built from the decrypted body in one place so no writer can derive the
@@ -569,7 +605,12 @@ def msg_row(m, when, pt, ids):
     me = (ids.is_me(m.get("sender")) if (m.get("sender") and ids.me)
           else bool(m["from_me"]))      # is_me() compares identities, so either form of mine counts
     own, quoted = texts(pt)
-    return {"id": m.get("id"), "t": when, "dir": "me" if me else "them", "type": m["type"],
+    # WhatsApp Web stores a document's FILENAME in the caption field when it has no caption; a
+    # "caption" equal to the filename is not something anyone wrote (the filename is its own field).
+    if m.get("type") == "document" and own and own.strip() == (m.get("filename") or "").strip():
+        own = ""
+    det = body_details(pt)
+    row = {"id": m.get("id"), "t": when, "dir": "me" if me else "them", "type": m["type"],
             "chat": m.get("chat"), "chat_name": ids.label(m.get("chat")),
             "sender": m.get("sender"), "sender_name": ids.label(m.get("sender")),
             "sender_lid": e.get("lid"), "sender_phone": e.get("pn"),
@@ -580,6 +621,12 @@ def msg_row(m, when, pt, ids):
             # pull, over the network, at the time of the run. Same timeline, different provenance,
             # and an export that merges them has to say which is which.
             "source": "cache"}
+    if m.get("filename"): row["filename"] = m["filename"]
+    # Delivery state of a message I sent, as WhatsApp Web last recorded it (the ticks).
+    if m.get("from_me") and m.get("ack") in ACK_STATUS and (m["ack"] != 0 or m.get("type") not in _SYSTEM_TYPES):
+        row["ack"] = m["ack"]; row["status"] = ACK_STATUS[m["ack"]]
+    row.update(det)                     # link / location / poll / event / payment, only when present
+    return row
 
 # ONE cap for every place a label is written. Capping per call site (40 on a message line, 60 in the
 # legend, 80 in a header) rendered the same person two different ways in one file and made a line
@@ -752,6 +799,52 @@ def merge_history(chats, recovered, ids, ts):
         chats[c].sort(key=lambda x: x["t"])
     return added, skipped, touched
 
+def _disambiguate(who):
+    """{sender key: legend row} -> {sender key: label as printed in this chat}.
+
+    Different people can share a display name -- one group here has five members called the same
+    thing -- and a transcript line naming only that name cannot be attributed. Within a chat, each
+    such label gets the last digits of that person's own number (or lid) appended, as many as it
+    takes to tell them apart. Labels that are already unique are printed unchanged."""
+    base = {k: _oneline(r["label"], _LABEL_MAX) for k, r in who.items() if r is not None}
+    out = dict(base)
+    groups = collections.defaultdict(list)
+    for k, lab in base.items(): groups[lab].append(k)
+    for lab, keys in groups.items():
+        if len(keys) < 2: continue
+        ids_ = {k: re.sub(r"\D", "", ((who[k].get("phone") or who[k].get("lid") or k) or "").split("@")[0])
+                for k in keys}
+        n = 4
+        while n < 16 and len({ids_[k][-n:] for k in keys}) < len(keys): n += 2
+        for k in keys:
+            out[k] = "%s ·%s" % (lab, ids_[k][-n:] or "?")
+    return out
+
+CONTACT_COLUMNS = (("jid", "id"), ("phone_number", "phoneNumber"), ("name", "name"), ("short_name", "shortName"),
+                   ("pushname", "pushname"), ("username", "username"), ("about", "textStatusString"),
+                   ("about_updated", "textStatusLastUpdateTime"), ("in_address_book", "isAddressBookContact"),
+                   ("type", "type"), ("display_name_lid", "displayNameLID"))
+
+def write_contacts_csv(path, ids):
+    """contacts.csv -- the `contact` store, one row per stored record, as stored. WhatsApp keeps a
+    person under both their lid and their phone jid; `phone_number` on the lid row links the two."""
+    import csv
+    def v(x):
+        if x is None or type(x).__name__ == "_Undefined": return ""
+        if isinstance(x, bool): return "yes" if x else "no"
+        return as_str(x) if not isinstance(x, (int, float)) else x
+    seen = set()
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:      # BOM: Excel opens it as UTF-8
+        w = csv.writer(f)
+        w.writerow([c for c, _ in CONTACT_COLUMNS])
+        n = 0
+        for o in ids.contact_records:
+            row = [v(o.get(src)) for _, src in CONTACT_COLUMNS]
+            k = tuple(row)
+            if k in seen: continue                 # superseded copies of an identical record
+            seen.add(k); w.writerow(row); n += 1
+    return n
+
 def write_transcripts(path, chats, ids):
     """transcripts.txt -- the artifact people actually read. Every line names its sender, and each
     chat header lists its senders with every jid form they appear under, so any line can be traced
@@ -779,12 +872,13 @@ def write_transcripts(path, chats, ids):
                 # `key.participant` has no author at all, and that absence is itself worth stating.
                 k = ids.key(m["sender"]) if m.get("sender") else ""
                 if k not in who: who[k] = ids.row(m["sender"]) if m.get("sender") else None
+            disp = _disambiguate(who)
             for cj, r in sorted(who.items(), key=lambda kv: ((kv[1] or {}).get("label") or "~").lower()):
                 if r is None:
                     f.write("  - %s  (no sender recorded in the message)\n" % "(unknown)".ljust(24))
                     continue
                 forms = "  ".join(x for x in (r["lid"], r["phone"]) if x and x != cj)
-                f.write("  - %s  %s%s%s\n" % (_oneline(r["label"], _LABEL_MAX).ljust(24), cj,
+                f.write("  - %s  %s%s%s\n" % (disp[cj].ljust(24), cj,
                                                ("  " + forms) if forms else "",
                                                "  (me)" if r["is_me"] else ""))
             for m in ml:
@@ -802,7 +896,8 @@ def write_transcripts(path, chats, ids):
                 # uses for its own header. Continuations are now indented under a '|' so every line
                 # is attributable and no message content can be mistaken for structure.
                 head = "[%s] %s %22s: " % (m["t"], "->" if m["dir"] == "me" else "<-",
-                                           _oneline(m.get("sender_name") or m["dir"], _LABEL_MAX))
+                                           disp.get(ids.key(m["sender"]) if m.get("sender") else "")
+                                           or _oneline(m.get("sender_name") or m["dir"], _LABEL_MAX))
                 cont = " " * (len(head) - 2) + "| "
                 lines = _printable_line(body).replace("\r\n", "\n").replace("\r", "\n").split("\n")
                 f.write(head + lines[0] + "\n")
@@ -906,10 +1001,14 @@ def _ff_store(con, name):
         except Exception as e: log.debug("firefox %s record skipped: %s", name, e)
     return out
 
+def _is_chromium(path):
+    import chromium_reader as cr
+    return cr.is_chromium_profile(path)
+
 def load(profile=None, origin=None):
     """-> (engine, localStorage, root_key, messages, store_counts, Identities)"""
     if origin: engine, parts = "firefox", load_firefox(origin)
-    elif os.path.isdir(os.path.join(profile, "IndexedDB")): engine, parts = "chromium", load_chromium(profile)
+    elif _is_chromium(profile): engine, parts = "chromium", load_chromium(profile)
     else:
         cand = os.path.join(profile, "storage/default/https+++web.whatsapp.com")
         if not os.path.isdir(cand):

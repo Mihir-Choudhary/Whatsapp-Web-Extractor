@@ -58,11 +58,18 @@ print("=== chats.json: %d chats, %d messages ===" % (len(ch), len(msgs)))
 
 FIELDS = {'id', 't', 'dir', 'type', 'chat', 'chat_name', 'sender', 'sender_name', 'sender_lid',
           'sender_phone', 'sender_source', 'text', 'quoted_text', 'source'}
-# `body_status` is the one optional field: present only on a row whose body could not be turned into
-# text ("none" / "other-scheme" / "failed"), so such a message is written rather than dropped.
+# Optional fields, present only when they apply:
+#   body_status -- a row whose body could not be turned into text ("none" / "other-scheme" / "failed",
+#                  or "encrypted" in an export made without a key), written rather than dropped;
+#   filename, ack/status, and the structured parts of a body (link, location, poll, event, payment,
+#   target_message_key).
+OPTIONAL = {'filename', 'ack', 'status', 'link', 'location', 'poll', 'event', 'payment', 'target_message_key'}
 def _fields_ok(m):
-    return set(m) == FIELDS or (set(m) == FIELDS | {'body_status'} and not (m.get('text') or '').strip()
-                                and m['body_status'] in ('none', 'other-scheme', 'failed'))
+    extra = set(m) - FIELDS
+    if not FIELDS <= set(m) or extra - OPTIONAL - {'body_status'}: return False
+    if 'body_status' in m:
+        return not (m.get('text') or '').strip() and m['body_status'] in ('none', 'other-scheme', 'failed', 'encrypted')
+    return True
 chk("every row has exactly the documented fields",
     all(_fields_ok(m) for m in msgs),
     next((sorted(set(m) ^ FIELDS) for m in msgs if not _fields_ok(m)), ''))
