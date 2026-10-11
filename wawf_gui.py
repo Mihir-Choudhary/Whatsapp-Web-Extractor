@@ -305,7 +305,7 @@ class App(tk.Tk):
         self._toggle(c, "Get it from WhatsApp (signs in once as this linked device)", self.key_mode, value="online", command=self._key_mode).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
         r = ttk.Frame(c, style="Card.TFrame", padding=0); r.configure(borderwidth=0)
         r.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(4, 0)); r.columnconfigure(1, weight=1)
-        self._toggle(r, "Use a key file", self.key_mode, value="file", command=self._key_mode).grid(row=0, column=0, sticky="w")
+        self._toggle(r, "Use a saved key (companion_enc_static.txt)", self.key_mode, value="file", command=self._key_mode).grid(row=0, column=0, sticky="w")
         self.key = tk.StringVar()
         self.key_entry = ttk.Entry(r, textvariable=self.key, font=FONT, state="disabled")
         self.key_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0))
@@ -313,9 +313,10 @@ class App(tk.Tk):
         self.key_btn.grid(row=0, column=2, padx=(8, 0))
         self._toggle(c, "Don't go online (everything except message text)", self.key_mode, value="offline", command=self._key_mode).grid(row=3, column=0, columnspan=3, sticky="w", pady=(4, 0))
         ttk.Label(c, style="Help.TLabel", wraplength=660, justify="left",
-                  text="Message text is encrypted with a key WhatsApp issues at sign-in; it is never on disk. "
-                       "Getting it online is recorded as activity on the account. A key file saved by an "
-                       "earlier run decrypts offline.").grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
+                  text="Message text is encrypted with a key WhatsApp issues to the browser at sign-in and "
+                       "never writes to disk. Getting it online signs in once as this linked device (recorded "
+                       "as activity on the account) and saves it as companion_enc_static.txt in the results "
+                       "folder; choose that file here on later runs to decrypt without going online.").grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         # run row
         bar = ttk.Frame(root); bar.pack(fill="x", pady=(4, 8))
@@ -386,7 +387,9 @@ class App(tk.Tk):
         if d: self.out.set(os.path.normpath(d))
 
     def pick_key(self):
-        f = filedialog.askopenfilename(title="Choose the key file", filetypes=[("Key file", "*.txt"), ("All files", "*.*")])
+        f = filedialog.askopenfilename(title="Choose companion_enc_static.txt saved by an earlier run",
+                                       filetypes=[("Saved key", "companion_enc_static*.txt"), ("Text files", "*.txt"),
+                                                  ("All files", "*.*")])
         if f: self.key.set(os.path.normpath(f))
 
     def _key_mode(self):
@@ -417,7 +420,7 @@ class App(tk.Tk):
         if self.fetch_media.get() and not self.fmt_sqlite.get():
             raise ValueError("Downloading media needs the SQLite database output ticked.")
         if self.key_mode.get() == "file" and not os.path.isfile(self.key.get().strip()):
-            raise ValueError("Choose the key file, or switch to getting the key from WhatsApp.")
+            raise ValueError("Choose the companion_enc_static.txt saved by an earlier run, or get the key from WhatsApp.")
         if getattr(sys, "frozen", False):
             cmd = [sys.executable]
         else:
