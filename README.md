@@ -400,7 +400,9 @@ records every stanza the server delivers:
   decrypted, written and synced to disk before anything else happens;
 - `queue_messages.json` — one row per message: chat, group / 1:1 / status / channel / broadcast, sender
   (with device number and phone number), time, type, text, reactions and edits with the message they
-  apply to, deletions, media keys (downloadable while the links are valid), and view-once stubs;
+  apply to, deletions, media keys (downloadable while the links are valid), and view-once stubs.
+  Edits sent in WhatsApp's newer encrypted form are decrypted when the original message is in the same
+  capture (its secret is the key, as in WhatsApp Web); otherwise the row says the original is missing;
 - `queue_summary.json` — counts, and whether the server's end-of-queue marker was received.
 
 **Nothing is acknowledged.** An acknowledgement is what makes the server delete a stanza from the

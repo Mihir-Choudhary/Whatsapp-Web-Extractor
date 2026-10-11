@@ -123,6 +123,49 @@ PROTOCOL_ACTIONS = {0: "delete for everyone", 3: "disappearing-messages setting"
                     30: "group member label change"}
 
 
+# Encrypted add-ons (WhatsApp's newer edits): the new content is AES-GCM encrypted under a key derived from
+# the ORIGINAL message's messageSecret -- as WhatsApp Web's WAUseCaseSecret / WAWebAddonEncryption do:
+# HKDF-SHA256(messageSecret, info = message id + original sender + modifying sender + use case), 32 bytes.
+_SECRET_ENC = {1: ("targetMessageKey", "m", WP.MESSAGE_KEY), 2: ("encPayload", "y"), 3: ("encIv", "y"),
+               4: ("secretEncType", "e")}
+_SECRET_USE = {1: b"Event Edit", 2: b"Message Edit"}
+
+def _user_jid(jid):
+    """'user:device@server' -> 'user@server' (the form the add-on key is derived from)."""
+    jid = jid or ""
+    return jid.split("@")[0].split(":")[0] + ("@" + jid.split("@")[-1] if "@" in jid else "")
+
+def _secret_of(pt: bytes):
+    try:
+        ctx = WP.decode(pt, {35: ("ctx", "m", {3: ("messageSecret", "y")})}).get("ctx") or {}
+        dsm = WP.decode(pt, {31: ("d", "m", {2: ("m", "y")})}).get("d") or {}
+        if not ctx.get("messageSecret") and dsm.get("m"):
+            ctx = WP.decode(dsm["m"], {35: ("ctx", "m", {3: ("messageSecret", "y")})}).get("ctx") or {}
+        return ctx.get("messageSecret")
+    except Exception:
+        return None
+
+def decrypt_secret_message(pt: bytes, editor: str, originals: dict):
+    """A secretEncryptedMessage -> (decrypted Message bytes or None, target id, why not)."""
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    sec = WP.decode(pt, {82: ("s", "m", _SECRET_ENC)}).get("s") or {}
+    tid = (sec.get("targetMessageKey") or {}).get("id")
+    use = _SECRET_USE.get(sec.get("secretEncType"))
+    if not (tid and use and sec.get("encPayload") and sec.get("encIv")):
+        return None, tid, "unsupported encrypted add-on"
+    if tid not in originals:
+        return None, tid, "the original message is not in this capture (its secret decrypts the edit)"
+    secret, orig_sender = originals[tid]
+    info = tid.encode() + _user_jid(orig_sender).encode() + _user_jid(editor).encode() + use
+    try:
+        key = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=info).derive(secret)
+        return AESGCM(key).decrypt(sec["encIv"], sec["encPayload"], None), tid, None
+    except Exception as e:
+        return None, tid, "could not decrypt (%s)" % type(e).__name__
+
+
 def _content(pt: bytes) -> dict:
     """What a decrypted Message says, for the readable row: type, text, and for reactions, edits and
     deletions the action and the message it applies to. Own messages synced from the phone arrive
@@ -158,6 +201,16 @@ def readable(journal_path: str, own=()) -> list:
     dropped by id + sender). A stanza can carry several encrypted parts -- typically a group key
     handover plus the message itself -- and the row describes the message, noting the handover."""
     own = {o for o in own if o}
+    # first pass: every original message's secret (needed for encrypted edits) and who sent it
+    originals = {}
+    for line in open(journal_path, encoding="utf-8"):
+        try: r = json.loads(line)
+        except ValueError: continue
+        if r.get("tag") != "message": continue
+        for p in r.get("decrypted") or []:
+            if p.get("plaintext_b64"):
+                sec = _secret_of(base64.b64decode(p["plaintext_b64"]))
+                if sec: originals[r["attrs"].get("id")] = (sec, r["attrs"].get("participant") or r["attrs"].get("from"))
     rows, seen = [], set()
     for line in open(journal_path, encoding="utf-8"):
         try: r = json.loads(line)
@@ -186,7 +239,16 @@ def readable(journal_path: str, own=()) -> list:
         good = [p for p in parts if p.get("plaintext_b64")]
         contents = []
         for p in good:
-            try: contents.append(_content(base64.b64decode(p["plaintext_b64"])))
+            try:
+                pt = base64.b64decode(p["plaintext_b64"])
+                c = _content(pt)
+                if c.get("type") == "secretEncryptedMessage":
+                    dec, tid, why = decrypt_secret_message(pt, sender, originals)
+                    if dec is not None:
+                        c = dict(_content(dec), encrypted_addon="decrypted")
+                    else:
+                        c.update(action="edit (encrypted)", target_id=tid, encrypted_addon=why)
+                contents.append(c)
             except Exception as e: contents.append({"type": None, "decode_error": str(e)})
         row["key_handover"] = any(c.get("type") == "senderKeyDistributionMessage" for c in contents)
         main = next((c for c in contents if c.get("type") not in ("senderKeyDistributionMessage", None)), None)

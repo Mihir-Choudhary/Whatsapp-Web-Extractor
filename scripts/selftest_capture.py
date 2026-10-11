@@ -42,10 +42,10 @@ def msg_bytes(fields):
     return WP.encode(fields, WP.MESSAGE)
 
 tmp = tempfile.mkdtemp(prefix="wawf_cap_")
-def client(ack):
+def client(ack, name=None):
     me, me_bundle = party(1001)
     c = WC.Client({"user": "15550000000", "lid": "99990000000@lid"}, me, log=lambda m: None,
-                  journal=os.path.join(tmp, "j_%s.jsonl" % ack), ack=ack)
+                  journal=os.path.join(tmp, "j_%s.jsonl" % (name or ack)), ack=ack)
     c.sent = []
     c.send = lambda node: c.sent.append(node)
     return c, me, me_bundle
@@ -114,12 +114,42 @@ m = pc.encrypt(WC._pad(WP.encode({"deviceSentMessage": {"destinationJid": "15551
                                                         "message": WP.decode(react, WP.MESSAGE)}}, WP.MESSAGE)))
 feed(c, {"tag": "message", "attrs": {"id": "S2", "from": "15550000000@s.whatsapp.net", "recipient": "15551112222@s.whatsapp.net",
                                       "t": "1760000021", "type": "reaction"}, "content": [enc_node(m["type"], m["body"])]})
+# an encrypted edit (secretEncryptedMessage) of a message whose secret is in the same capture
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 rows = {r["id"]: r for r in QC.readable(os.path.join(tmp, "j_none.jsonl"), own=("15550000000",))}
 s1, s2 = rows.get("S1", {}), rows.get("S2", {})
 check("an own message from the phone is filed under the chat it went to, marked from me",
       s1.get("chat") == "15551112222@s.whatsapp.net" and s1.get("from_me") is True and s1.get("text") == "sent from my phone")
 check("a reaction names the message it reacts to", s2.get("action") == "reaction" and s2.get("target_id") == "S1"
       and s2.get("text") == "👍")
+c, me, me_bundle = client("none", "edit")                 # a fresh device: its one-time prekey is still unused
+alice2, _ = party(5005)
+S.SessionBuilder(alice2, "x").init_outgoing(me_bundle)
+alice2.sessions["15557778888.0"] = alice2.sessions.pop("x")
+a2 = S.SessionCipher(alice2, "15557778888.0")
+secret = os.urandom(32)
+orig = WP.encode({"conversation": "teh original"}, WP.MESSAGE) + bytes([0x9a, 0x02, 34, 0x1a, 32]) + secret   # messageContextInfo{messageSecret}
+m = a2.encrypt(WC._pad(orig))
+feed(c, {"tag": "message", "attrs": {"id": "O1", "from": "15557778888@s.whatsapp.net", "t": "1760000030", "type": "text"},
+         "content": [enc_node(m["type"], m["body"])]})
+edited = WP.encode({"protocolMessage": {"key": {"remoteJid": "15557778888@s.whatsapp.net", "fromMe": False, "id": "O1"},
+                                        "type": 14, "editedMessage": {"conversation": "the original"}}}, WP.MESSAGE)
+key = HKDF(algorithm=hashes.SHA256(), length=32, salt=None,
+           info=b"O1" + b"15557778888@s.whatsapp.net" * 2 + b"Message Edit").derive(secret)
+iv = os.urandom(12)
+inner = (WP.encode({"key": {"remoteJid": "15557778888@s.whatsapp.net", "fromMe": False, "id": "O1"}}, {1: ("key", "m", WP.MESSAGE_KEY)})
+         + bytes([0x12]) + WP._varint(len(AESGCM(key).encrypt(iv, edited, None))) + AESGCM(key).encrypt(iv, edited, None)
+         + bytes([0x1a, 12]) + iv + bytes([0x20, 2]))
+sec = bytes([0x92, 0x05]) + WP._varint(len(inner)) + inner                       # Message field 82
+m = a2.encrypt(WC._pad(sec))
+feed(c, {"tag": "message", "attrs": {"id": "E1", "from": "15557778888@s.whatsapp.net", "t": "1760000031", "type": "text"},
+         "content": [enc_node(m["type"], m["body"])]})
+rows = {r["id"]: r for r in QC.readable(os.path.join(tmp, "j_edit.jsonl"), own=("15550000000",))}
+e1 = rows.get("E1", {})
+check("an encrypted edit is decrypted with the original message's secret",
+      (e1.get("action"), e1.get("target_id"), e1.get("text"), e1.get("encrypted_addon")) == ("edit", "O1", "the original", "decrypted"))
 
 # ---------------------------------------------------------------- group handover + message, sender = Baileys
 mods = os.environ.get("WAWF_XTEST_NODE_MODULES") or os.path.join(os.path.dirname(HERE), "tools", "reconnect", "node_modules")
