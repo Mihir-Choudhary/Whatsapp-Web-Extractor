@@ -66,13 +66,17 @@ def load_chromium(profile):
     meta = [o for o in idb.get("signal-storage", {}).get("signal-meta-store", []) if isinstance(o, dict)]
     return ls, root, meta
 
+def _is_chromium(path):
+    import chromium_reader as cr
+    return cr.is_chromium_profile(path)
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--profile"); ap.add_argument("--origin")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools/reconnect/creds_in.json"))
     a = ap.parse_args()
     if a.origin: engine, (ls, root, meta) = "firefox", load_firefox(a.origin)
-    elif a.profile and os.path.isdir(os.path.join(a.profile, "IndexedDB")): engine, (ls, root, meta) = "chromium", load_chromium(a.profile)
+    elif a.profile and _is_chromium(a.profile): engine, (ls, root, meta) = "chromium", load_chromium(a.profile)
     elif a.profile: engine, (ls, root, meta) = "firefox", load_firefox(os.path.join(a.profile, "storage/default/https+++web.whatsapp.com"))
     else: raise SystemExit("pass --profile or --origin")
     print(f"[*] engine={engine}")

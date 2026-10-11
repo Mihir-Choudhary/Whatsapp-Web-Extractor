@@ -11,6 +11,26 @@ the SAME shapes our Firefox path produces, so the decryption + SQLite export log
 Binary values come back as Python `bytes` (Firefox wrapped them as {'__bytes': b'..'}); callers should
 use `as_bytes()` to accept either shape.
 
+Where the store lives
+---------------------
+A profile can hold WhatsApp Web under more than one *storage key*. The plain origin keeps the legacy
+layout, `IndexedDB/https_web.whatsapp.com_0.indexeddb.leveldb`, but current Chromium/Edge builds can put
+the session under a partitioned key instead (`https://web.whatsapp.com/^1<hi>^2<lo>`, a nonce
+partition), whose IndexedDB is `WebStorage/<bucket id>/IndexedDB/indexeddb.leveldb` and whose
+localStorage is a separate storage key in `Local Storage/leveldb`. The bucket id -> storage key map is
+`WebStorage/QuotaManager`. Every partition is enumerated, each localStorage is paired with the IndexedDB
+of the SAME storage key, and the partition holding the signed-in session is the one returned. All of
+them are reported in `ACQUISITION`.
+
+Damaged acquisitions
+--------------------
+A profile copied while the browser is still writing typically contains zero-length or half-written
+tables and a torn write-ahead log. A forensic reader must not die on the first bad block, and must not
+pretend nothing was lost either: unreadable tables and torn log records are skipped, counted, and
+reported. If the IndexedDB metadata itself was lost (database and object-store names), records are
+still read by their numeric ids and the stores are identified by the fields their records carry
+(`wa_store_signatures`); such names are flagged as inferred.
+
 Requires: ccl_chromium_reader  (pip install "git+https://github.com/cclgroupltd/ccl_chromium_reader.git")
 
 Default Chromium profile locations:
@@ -20,19 +40,191 @@ Default Chromium profile locations:
   (Windows: %LOCALAPPDATA%\\Google\\Chrome\\User Data\\Default , ...\\Microsoft\\Edge\\User Data\\Default)
 """
 from __future__ import annotations
-import os, glob, json, shutil, tempfile
+import os, glob, io, json, re, shutil, sqlite3, struct, tempfile
 from pathlib import Path
 import logging
 log = logging.getLogger('wawf.chromium')
 
 WA_ORIGIN = "https://web.whatsapp.com"
+WA_HOST = "web.whatsapp.com"
 WA_IDB_GLOB = "IndexedDB/https_web.whatsapp.com_0.indexeddb.leveldb"
+
+# What the last load_source() found: every partition, which one was used, and what could not be read.
+ACQUISITION: dict = {}
+
+# A "profile" can also be a folder holding only this file, naming the stores to read wherever they are:
+#   {"idb": [<IndexedDB leveldb dir>, ...], "local_storage": <Local Storage leveldb dir>, "media_cache": [...]}
+# so an examiner who has the stores but not the profile around them can still run the tool.
+PARTS_FILE = "wawf_parts.json"
+
+def parts(profile):
+    """The given-stores description, or None for an ordinary profile folder."""
+    f = os.path.join(profile or "", PARTS_FILE)
+    if not os.path.isfile(f): return None
+    with open(f, encoding="utf-8") as fh:
+        return json.load(fh)
+
+def resolve_idb(d):
+    """Accept the LevelDB folder itself, or the folder around it (".../IndexedDB", a WebStorage bucket)."""
+    for c in (d, os.path.join(d, "indexeddb.leveldb"), os.path.join(d, "IndexedDB", "indexeddb.leveldb"),
+              os.path.join(d, "https_web.whatsapp.com_0.indexeddb.leveldb"),
+              os.path.join(d, "IndexedDB", "https_web.whatsapp.com_0.indexeddb.leveldb")):
+        if os.path.isdir(c) and any(n.startswith("MANIFEST-") or n.endswith((".ldb", ".log")) for n in os.listdir(c)):
+            return c
+    return None
+
 
 def as_bytes(v):
     """Accept CCL bytes OR Firefox {'__bytes': b'..'} and return bytes (or None)."""
     if isinstance(v, (bytes, bytearray)): return bytes(v)
     if isinstance(v, dict) and '__bytes' in v: return bytes(v['__bytes'])
     return None
+
+
+# ---------------------------------------------------------------- damaged-LevelDB tolerance
+_DAMAGE = {"tables_skipped": [], "log_records_torn": 0}
+_HARDENED = False
+
+def _harden_ccl():
+    """Make ccl's LevelDB reader skip what a live copy breaks, and count it, instead of raising.
+
+    - a table (.ldb/.sst) that is zero-length or has no valid footer is skipped as a whole;
+    - in a write-ahead log, a record cut off by the copy is dropped, and a zero-filled tail (LevelDB
+      pre-allocates) ends the block, as LevelDB's own reader does.
+    """
+    global _HARDENED
+    if _HARDENED: return
+    from ccl_chromium_reader.storage_formats import ccl_leveldb as L
+    BS = L.LogFile.LOG_BLOCK_SIZE
+
+    def _batches(self):
+        in_rec, start, buf = False, 0, b""
+        for idx, chunk in enumerate(self._get_raw_blocks()):
+            with io.BytesIO(chunk) as b:
+                while b.tell() < BS - 6:
+                    hdr = b.read(7)
+                    if len(hdr) < 7: break
+                    _crc, length, typ = struct.unpack("<IHB", hdr)
+                    if typ not in (1, 2, 3, 4):           # zero padding or garbage: rest of block unusable
+                        if in_rec: _DAMAGE["log_records_torn"] += 1
+                        in_rec = False
+                        break
+                    data = b.read(length)
+                    if len(data) < length:                # record runs past the end of what was copied
+                        if in_rec or typ in (1, 2): _DAMAGE["log_records_torn"] += 1
+                        in_rec = False
+                        break
+                    off = idx * BS + b.tell()
+                    if typ == 1:
+                        if in_rec: _DAMAGE["log_records_torn"] += 1
+                        in_rec = False
+                        yield off, data
+                    elif typ == 2:
+                        if in_rec: _DAMAGE["log_records_torn"] += 1
+                        start, buf, in_rec = off, data, True
+                    elif not in_rec:                      # middle/last fragment with no first
+                        _DAMAGE["log_records_torn"] += 1
+                    elif typ == 3:
+                        buf += data
+                    else:
+                        in_rec = False
+                        yield start, buf + data
+        if in_rec: _DAMAGE["log_records_torn"] += 1
+
+    def _init(self, in_dir):
+        self._in_dir = Path(in_dir)
+        if not self._in_dir.is_dir():
+            raise ValueError("in_dir is not a directory")
+        self._files, latest = [], (0, None)
+        for f in self._in_dir.iterdir():
+            if not f.is_file(): continue
+            if re.match(L.RawLevelDb.DATA_FILE_PATTERN, f.name):
+                try:
+                    if f.suffix.lower() == ".log":
+                        self._files.append(L.LogFile(f))
+                    elif f.suffix.lower() in (".ldb", ".sst"):
+                        if f.stat().st_size == 0: raise ValueError("zero-length table")
+                        self._files.append(L.LdbFile(f))
+                except Exception as e:
+                    _DAMAGE["tables_skipped"].append({"file": f.name, "bytes": f.stat().st_size,
+                                                      "reason": str(e).split(" in ")[0][:80]})
+            m = re.match(L.ManifestFile.MANIFEST_FILENAME_PATTERN, f.name)
+            if m and f.is_file():
+                n = int(m.group(1), 16)
+                if latest[0] < n: latest = (n, f)
+        try:
+            self.manifest = L.ManifestFile(latest[1]) if latest[1] is not None else None
+        except Exception as e:
+            log.warning("leveldb %s: MANIFEST unreadable (%s); reading tables without it", in_dir, e)
+            self.manifest = None
+
+    L.LogFile._get_batches = _batches
+    L.ManifestFile._get_batches = _batches
+    L.RawLevelDb.__init__ = _init
+    _HARDENED = True
+
+
+# ---------------------------------------------------------------- partitions
+def _norm_key(k: str) -> str:
+    """'https://web.whatsapp.com/' and 'https://web.whatsapp.com' are the same storage key."""
+    return re.sub(r"/(?=\^|$)", "", k or "")
+
+def _is_wa_key(k: str) -> bool:
+    return bool(re.match(r"https://web\.whatsapp\.com(/|\^|$)", k or ""))
+
+def _quota_buckets(profile: str) -> list:
+    """[(bucket_id, storage_key)] for web.whatsapp.com from WebStorage/QuotaManager (empty if unreadable)."""
+    qm = os.path.join(profile, "WebStorage", "QuotaManager")
+    if not os.path.isfile(qm): return []
+    tmp = tempfile.mkdtemp(prefix="waquota_"); _TMP.append(tmp)
+    shutil.copy2(qm, tmp)
+    j = qm + "-journal"
+    if os.path.isfile(j): shutil.copy2(j, tmp)
+    try:
+        con = sqlite3.connect(os.path.join(tmp, "QuotaManager"))
+        rows = con.execute("SELECT id, storage_key FROM buckets").fetchall()
+        con.close()
+    except Exception as e:
+        log.warning("QuotaManager unreadable (%s); WebStorage buckets will be identified by content", e)
+        return [(None, None)]
+    return [(i, k) for i, k in rows if _is_wa_key(k)]
+
+def find_partitions(profile: str) -> list:
+    """Every web.whatsapp.com IndexedDB in the profile: [{storage_key, leveldb, blob, layout}]."""
+    out = []
+    given = parts(profile)
+    if given is not None:
+        for d in given.get("idb") or []:
+            ldb = resolve_idb(d)
+            if not ldb: continue
+            blob = ldb[:-len(".leveldb")] + ".blob"
+            out.append({"storage_key": None, "leveldb": ldb, "layout": "given: " + ldb,
+                        "blob": blob if os.path.isdir(blob) else None})
+        return out
+    legacy = os.path.join(profile, WA_IDB_GLOB)
+    if os.path.isdir(legacy):
+        out.append({"storage_key": WA_ORIGIN, "leveldb": legacy, "layout": "IndexedDB (legacy)",
+                    "blob": legacy[:-len(".leveldb")] + ".blob"})
+    ws = os.path.join(profile, "WebStorage")
+    if os.path.isdir(ws):
+        buckets = _quota_buckets(profile)
+        known = {str(i): k for i, k in buckets if i is not None}
+        unknown_map = buckets == [(None, None)]
+        for d in sorted(os.listdir(ws)):
+            ldb = os.path.join(ws, d, "IndexedDB", "indexeddb.leveldb")
+            if not os.path.isdir(ldb): continue
+            if d in known or unknown_map:
+                out.append({"storage_key": known.get(d), "leveldb": ldb, "layout": f"WebStorage/{d}",
+                            "blob": os.path.join(ws, d, "IndexedDB", "indexeddb.blob")})
+    for p in out:
+        if not os.path.isdir(p["blob"]): p["blob"] = None
+    return out
+
+def is_chromium_profile(path) -> bool:
+    """A Chromium profile: legacy IndexedDB dir, or the WebStorage bucket layout newer builds use."""
+    return bool(path) and (os.path.isdir(os.path.join(path, "IndexedDB")) or
+                           os.path.isdir(os.path.join(path, "WebStorage")) or
+                           os.path.isfile(os.path.join(path, PARTS_FILE)))
 
 def find_profiles():
     """Return candidate Chromium profile dirs that have web.whatsapp.com IndexedDB."""
@@ -44,8 +236,7 @@ def find_profiles():
     hits = []
     for r in roots:
         for prof in glob.glob(os.path.expanduser(r) + "/*/"):
-            if os.path.isdir(os.path.join(prof, WA_IDB_GLOB.split("/")[0])) and \
-               glob.glob(os.path.join(prof, WA_IDB_GLOB)):
+            if find_partitions(prof.rstrip("/")):
                 hits.append(prof.rstrip("/"))
     return hits
 
@@ -61,70 +252,324 @@ def cleanup():
     for d in _TMP: shutil.rmtree(d, ignore_errors=True)
     _TMP.clear()
 
-def read_localstorage(profile: str) -> dict:
+
+# ---------------------------------------------------------------- localStorage
+def read_localstorage_all(profile: str) -> dict:
+    """{normalised storage key: {key: value}} for every web.whatsapp.com storage key."""
+    _harden_ccl()
     from ccl_chromium_reader import ccl_chromium_localstorage as cls
-    src = os.path.join(profile, "Local Storage/leveldb")
+    given = parts(profile)
+    src = (given.get("local_storage") or "") if given is not None else os.path.join(profile, "Local Storage/leveldb")
+    if src and not os.path.isfile(os.path.join(src, "CURRENT")) and os.path.isdir(os.path.join(src, "leveldb")):
+        src = os.path.join(src, "leveldb")                # the "Local Storage" folder itself was given
+    if not src or not os.path.isdir(src): return {}
     db = cls.LocalStoreDb(Path(_copy(src)))
     out = {}
-    for rec in db.iter_records_for_storage_key(WA_ORIGIN):
-        out[rec.script_key] = rec.value
-    db.close()
+    try:
+        for sk in db.iter_storage_keys():
+            if not _is_wa_key(sk): continue
+            best = {}
+            for rec in db.iter_records_for_storage_key(sk):
+                seq = getattr(rec, "leveldb_seq_number", 0) or 0
+                cur = best.get(rec.script_key)
+                if getattr(rec, "is_live", True) and (cur is None or seq > cur[0]):
+                    best[rec.script_key] = (seq, rec.value)
+            out[_norm_key(sk)] = {k: v for k, (_s, v) in best.items()}
+    finally:
+        db.close()
     return out
 
+def read_localstorage(profile: str) -> dict:
+    """localStorage of the selected (signed-in) partition."""
+    return load_source(profile)["localStorage"]
+
+
+# ---------------------------------------------------------------- IndexedDB
 def _recency(rec):
-    """Sort key for an IndexedDbRecord: live records first, then newest LevelDB write first.
+    """Sort key for a record: live records first, then newest LevelDB write first.
 
     LevelDB never overwrites in place, so an object store holds older versions of a key next to
-    the current one. ccl surfaces `is_live` (this is the value a read would return) and
-    `ldb_seq_no` (monotonic write order), which together give a reliable recency ordering — far
-    better than guessing from the record's contents.
+    the current one. `is_live` (this is the value a read would return) and `seq` (monotonic write
+    order) together give a reliable recency ordering — far better than guessing from contents.
     """
-    try: seq = int(getattr(rec, "ldb_seq_no", 0) or 0)
-    except (TypeError, ValueError): seq = 0
-    return (1 if getattr(rec, "is_live", False) else 0, seq)
+    return (1 if rec[0] else 0, rec[1])
+
+def _store_fields(values, sample=400):
+    from collections import Counter
+    c, k = Counter(), 0
+    for v in values:
+        if isinstance(v, dict):
+            c.update(v.keys()); k += 1
+            if k >= sample: break
+    return {f for f, n in c.items() if n >= 0.5 * k} if k else set()
+
+def _infer_names(unnamed: dict) -> dict:
+    """{(db_id, store_id): fieldset} -> {(db_id, store_id): (db_name, store_name, score)} by signature."""
+    try:
+        from wa_store_signatures import SIGNATURES
+    except ImportError:
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        try:
+            from wa_store_signatures import SIGNATURES
+        except ImportError:
+            log.warning("store signatures unavailable; stores without metadata keep numeric names")
+            return {}
+    flat = [(db, st, set(f)) for db, stores in SIGNATURES.items() for st, f in stores.items() if f]
+    out = {}
+    for key, fields in unnamed.items():
+        if not fields: continue
+        best = max(flat, key=lambda s: len(fields & s[2]) / len(fields | s[2]))
+        score = len(fields & best[2]) / len(fields | best[2])
+        if score >= 0.6: out[key] = (best[0], best[1], round(score, 3))
+    # one database id -> one database name: the name most of its stores voted for
+    from collections import Counter
+    votes = {}
+    for (dbid, _sid), (dbn, _stn, _sc) in out.items():
+        votes.setdefault(dbid, Counter())[dbn] += 1
+    return {k: v for k, v in out.items() if votes[k[0]].most_common(1)[0][0] == v[0]}
+
+def _read_idb_dir(ldb_dir: str, blob_dir: str | None) -> tuple:
+    """-> ({db_name: {store_name: [values newest-first]}}, report). One pass over the LevelDB."""
+    _harden_ccl()
+    from ccl_chromium_reader import ccl_chromium_indexeddb as idb
+    from ccl_chromium_reader.serialization_formats import ccl_blink_value_deserializer, ccl_v8_value_deserializer
+    from ccl_chromium_reader.storage_formats import ccl_leveldb as L
+    _DAMAGE["tables_skipped"], _DAMAGE["log_records_torn"] = [], 0
+    raw = idb.IndexedDb(ldb_dir, blob_dir)
+    names = {d.dbid_no: d.name for d in raw.global_metadata.db_ids}
+    T = idb.ObjectStoreMetadataType
+
+    # bucket data records (index id 1) by (db, store) in ONE pass; ccl's per-store iteration rescans
+    # every record of the database for every store.
+    groups = {}
+    for r in raw._fetched_records:
+        k = r.key
+        if not k: continue
+        try:
+            dbid, sid, iid, plen = idb.IndexedDb.read_prefix(io.BytesIO(k))
+        except ValueError:
+            continue
+        if dbid == 0 or sid == 0 or iid != 1: continue      # metadata, not object data
+        groups.setdefault((dbid, sid), []).append((r, k[plen:]))
+
+    blink = ccl_blink_value_deserializer.BlinkV8Deserializer()
+    bad = {}
+    decoded = {}
+    for (dbid, sid), recs in groups.items():
+        vals = []
+        for r, kraw in recs:
+            live = r.state == L.KeyState.Live
+            if not r.value:
+                vals.append((live, r.seq, None)); continue
+            key = idb.IdbKey(kraw)
+            def _bad(*_a, _c=(dbid, sid)): bad[_c] = bad.get(_c, 0) + 1
+            try:
+                _ver, vraw = idb._le_varint_from_bytes(r.value)
+                pre = raw.read_record_precursor(key, dbid, sid, r.value[len(vraw):], _bad)
+                if pre is None: continue
+                _bv, obj_raw, _tr, _ext = pre
+                v = ccl_v8_value_deserializer.Deserializer(obj_raw, host_object_delegate=blink.read).read()
+            except Exception:
+                _bad(); continue
+            vals.append((live, r.seq, v))
+        vals.sort(key=_recency, reverse=True)
+        decoded[(dbid, sid)] = [v for _l, _s, v in vals]
+
+    out, inferred = {}, {}
+    unnamed = {}
+    for (dbid, sid), vals in decoded.items():
+        dbn = names.get(dbid)
+        stn = None
+        if dbn is not None:
+            try: stn = raw.get_object_store_metadata(dbid, sid, T.StoreName)
+            except Exception: stn = None
+        if dbn is None or not stn:
+            unnamed[(dbid, sid)] = _store_fields(vals)
+            continue
+        out.setdefault(dbn, {})[stn] = vals
+    if unnamed:
+        guess = _infer_names(unnamed)
+        for (dbid, sid), vals in decoded.items():
+            if (dbid, sid) not in unnamed: continue
+            if (dbid, sid) in guess:
+                dbn, stn, sc = guess[(dbid, sid)]
+                if stn in out.get(dbn, {}):                   # never shadow a store that kept its name
+                    stn = f"{stn}#{sid}"
+                inferred[f"{dbn}/{stn}"] = {"db_id": dbid, "store_id": sid, "score": sc, "records": len(vals)}
+            else:
+                dbn, stn = names.get(dbid) or f"db{dbid}", f"store{sid}"
+                inferred[f"{dbn}/{stn}"] = {"db_id": dbid, "store_id": sid, "score": None, "records": len(vals)}
+            out.setdefault(dbn, {})[stn] = vals
+    rep = {
+        "databases": {d: {s: len(v) for s, v in st.items()} for d, st in out.items()},
+        "metadata_intact": not unnamed,
+        "inferred_stores": inferred,
+        "undeserializable": {f"{names.get(d, d)}/{s}": n for (d, s), n in bad.items()},
+        "tables_skipped": list(_DAMAGE["tables_skipped"]),
+        "log_records_torn": _DAMAGE["log_records_torn"],
+    }
+    try: raw.close()
+    except Exception: pass
+    return out, rep
+
+def _given_ls_key(lss, dbs, partition=None):
+    """Pair a store given on its own with a localStorage storage key. Only a store holding a session
+    (messages + key store) is paired; with several signed-in keys, --partition picks the account."""
+    if not dbs.get("model-storage", {}).get("message"): return None
+    signed = [k for k, v in lss.items() if _account(v)]
+    if partition:
+        want = str(partition).split(":")[0].lstrip("+")
+        hit = [k for k in signed if _account(lss[k]) == want or k == _norm_key(partition)]
+        if hit: return hit[0]
+    if len(signed) == 1: return signed[0]
+    if len(signed) > 1:
+        log.warning("the given localStorage holds %d signed-in sessions (%s); pass --partition <account> "
+                    "to say which one the given IndexedDB belongs to", len(signed),
+                    ", ".join(_account(lss[k]) for k in signed))
+    return None
+
+def _account(ls: dict):
+    """The signed-in account of one partition, from its own localStorage ('<number>:<device>@...')."""
+    for k in ("last-wid-md", "last-wid"):
+        v = ls.get(k)
+        if not v: continue
+        try: v = json.loads(v)
+        except Exception: pass
+        if isinstance(v, str) and "@" in v:
+            return v.split("@")[0].split(":")[0]          # '<number>:<device>@s.whatsapp.net' -> number
+    return None
+
+def _score(idb_dbs: dict, ls: dict) -> tuple:
+    """How much this partition looks like the signed-in session (higher = more)."""
+    keys = bool(idb_dbs.get("wawc_db_enc", {}).get("keys"))
+    msgs = len(idb_dbs.get("model-storage", {}).get("message", []))
+    return (1 if keys and "WAWebEncKeySalt" in ls else 0, 1 if "WALid" in ls or "last-wid-md" in ls else 0, msgs)
+
+def choose_partition(results, partition=None):
+    """results: [(info, storage_key, idb, localStorage, report)]. An explicit `partition` (storage key,
+    layout name or account) must match; otherwise the signed-in session with the most messages."""
+    if partition is not None:
+        hit = [r for r in results if r[1] == _norm_key(partition) or r[0].get("layout") == partition
+               or _account(r[3]) == str(partition).split(":")[0].lstrip("+")]
+        if not hit:
+            raise SystemExit(f"partition {partition!r} not found; present: "
+                             f"{[(r[0].get('layout'), _account(r[3]), r[1]) for r in results]}")
+        return hit[0]
+    return max(results, key=lambda r: _score(r[2], r[3])) if results else None
+
+_CACHE = {}
+
+def load_source(profile: str, partition: str | None = None) -> dict:
+    """Normalised WhatsApp Web source from a Chromium profile: {'localStorage':{}, 'idb':{db:{store:[..]}}}.
+
+    `partition` selects a storage key explicitly (as printed in ACQUISITION); by default the partition
+    holding the signed-in session is chosen. Results are cached per profile for the process: callers
+    ask for the same profile several times in one run and the read is the expensive part.
+    """
+    partition = partition or os.environ.get("WAWF_PARTITION") or None
+    ck = (os.path.abspath(profile), partition)
+    if ck in _CACHE:
+        return _CACHE[ck]
+    disk = _disk_cache_path(ck)
+    if disk and os.path.isfile(disk):
+        try:
+            import pickle
+            with open(disk, "rb") as fh:
+                res, acq = pickle.load(fh)
+            ACQUISITION.clear(); ACQUISITION.update(acq)
+            _CACHE[ck] = res
+            return res
+        except Exception as e:
+            log.debug("source cache unreadable (%s); reading the profile", e)
+    try:
+        lss = read_localstorage_all(profile)
+        parts = find_partitions(profile)
+        results = []
+        for p in parts:
+            ldb = _copy(p["leveldb"])
+            blob = _copy(p["blob"]) if p["blob"] else None
+            try:
+                dbs, rep = _read_idb_dir(ldb, blob)
+            except Exception as e:
+                log.warning("IndexedDB %s could not be read: %s", p["layout"], e)
+                dbs, rep = {}, {"error": str(e)}
+            sk = _norm_key(p["storage_key"]) if p["storage_key"] else None
+            if sk is None and p["layout"].startswith("given: "):
+                sk = _given_ls_key(lss, dbs, partition)    # a given store has no storage key: pair by content
+            ls = lss.get(sk, {}) if sk else {}
+            results.append((p, sk, dbs, ls, rep))
+            cleanup()                                     # free the copy before the next partition
+        chosen = choose_partition(results, partition)
+        ACQUISITION.clear()
+        ACQUISITION.update({
+            "profile": os.path.abspath(profile),
+            "partitions": [{"storage_key": r[1], "layout": r[0]["layout"], "leveldb": r[0]["leveldb"],
+                            "localStorage_keys": len(r[3]),
+                            "messages": len(r[2].get("model-storage", {}).get("message", [])),
+                            "has_root_key": bool(r[2].get("wawc_db_enc", {}).get("keys")),
+                            "signed_in": "WALid" in r[3] or "last-wid-md" in r[3],
+                            "account": _account(r[3]),
+                            "read": r[4]} for r in results],
+            "localStorage_keys_without_idb": sorted(set(lss) - {r[1] for r in results}),
+            "selected": chosen[1] if chosen else None,
+            "selected_layout": chosen[0]["layout"] if chosen else None,
+        })
+        if len(results) > 1:
+            for r in results:
+                log.info("partition %-16s account=%-22s messages=%-8d root_key=%-3s %s%s", r[0]["layout"],
+                         _account(r[3]) or "-", len(r[2].get("model-storage", {}).get("message", [])),
+                         "yes" if r[2].get("wawc_db_enc", {}).get("keys") else "no", r[1],
+                         "   <- selected" if r is chosen else "")
+        signed = [r for r in results if _account(r[3]) and r[2].get("model-storage", {}).get("message")]
+        if len(signed) > 1 and partition is None:
+            ACQUISITION["multiple_accounts"] = [_account(r[3]) for r in signed]
+            log.warning("this profile holds %d signed-in WhatsApp sessions (%s). Exporting %s only; run again "
+                        "with --partition <account or storage key> for each of the others.", len(signed),
+                        ", ".join(_account(r[3]) for r in signed), _account(chosen[3]) if chosen else "?")
+        if chosen:
+            rep = chosen[4]
+            if rep.get("tables_skipped") or rep.get("log_records_torn"):
+                log.warning("damaged acquisition: %d table(s) unreadable, %d torn log record(s) — "
+                            "records in them are missing from every output",
+                            len(rep.get("tables_skipped", [])), rep.get("log_records_torn", 0))
+            if rep.get("inferred_stores"):
+                log.warning("IndexedDB metadata is missing (copied while the browser was writing?); "
+                            "%d store(s) identified by their record fields instead of by name",
+                            len(rep["inferred_stores"]))
+        res = {"localStorage": chosen[3] if chosen else {}, "idb": chosen[2] if chosen else {}}
+        _CACHE[ck] = res
+        if disk:
+            try:
+                import pickle
+                with open(disk, "wb") as fh:
+                    pickle.dump((res, dict(ACQUISITION)), fh, protocol=pickle.HIGHEST_PROTOCOL)
+            except Exception as e:
+                log.debug("could not write source cache: %s", e)
+        return res
+    finally:
+        cleanup()
+
+def _disk_cache_path(ck):
+    """Per-run cache shared with helper subprocesses, only when the parent run set WAWF_SOURCE_CACHE.
+
+    The parent creates that directory privately and removes it when the run ends. It holds what the
+    profile itself holds (including key material), parsed, so a helper does not spend minutes
+    re-reading the same LevelDB.
+    """
+    d = os.environ.get("WAWF_SOURCE_CACHE")
+    if not d or not os.path.isdir(d): return None
+    import hashlib
+    st = []
+    for p in find_partitions(ck[0]):
+        for f in (p["leveldb"], os.path.join(ck[0], "Local Storage", "leveldb")):
+            try: st += [(e.name, e.stat().st_size, e.stat().st_mtime_ns) for e in os.scandir(f)]
+            except OSError: pass
+    h = hashlib.sha256(repr((ck, sorted(st))).encode()).hexdigest()[:24]
+    return os.path.join(d, f"src_{h}.pkl")
 
 def read_indexeddb(profile: str) -> dict:
-    from ccl_chromium_reader import ccl_chromium_indexeddb as idb
-    src = glob.glob(os.path.join(profile, WA_IDB_GLOB))
-    if not src: return {}
-    ldb = _copy(src[0])                                   # <origin>.indexeddb.leveldb
-    blob_src = src[0][:-len(".leveldb")] + ".blob"        # sibling <origin>.indexeddb.blob (external values)
-    blob = _copy(blob_src) if os.path.isdir(blob_src) else None
-    w = idb.WrappedIndexDB(ldb, blob)
-    skipped = {}                                          # (db,store) -> count of records that failed to deserialize
-    out = {}
-    for dbid in w.database_ids:
-        db = w[dbid.dbid_no]
-        stores = {}
-        for osn in db.object_store_names:
-            recs = []
-            _sk = [0]
-            def _skip(*a, _c=_sk, **k): _c[0] += 1        # count bad records instead of silently dropping them
-            try:
-                for r in db.get_object_store_by_name(osn).iterate_records(bad_deserializer_data_handler=_skip):
-                    recs.append(r)
-            except Exception as e:                        # a forensic store must not truncate silently -> warn, loud
-                log.warning("idb %s/%s: iteration stopped early after %d records (%s) — store may be INCOMPLETE",
-                            dbid.name, osn, len(recs), e)
-            if _sk[0]: skipped[f"{dbid.name}/{osn}"] = _sk[0]
-            # We deliberately read superseded and deleted versions too (they are evidence), so the
-            # same key can appear several times. Order NEWEST FIRST — live before stale, then by
-            # descending LevelDB sequence number — so a caller that wants the current value can
-            # just take the first match, while the older copies stay available behind it.
-            recs.sort(key=_recency, reverse=True)
-            stores[osn] = [r.value for r in recs]
-        out[dbid.name] = stores
-    if skipped:                                           # surface dropped records at default log level
-        log.warning("idb: %d record(s) across %d store(s) could not be deserialized and were skipped: %s",
-                    sum(skipped.values()), len(skipped), skipped)
-    return out
-
-def load_source(profile: str) -> dict:
-    """Normalised WhatsApp Web source from a Chromium profile: {'localStorage':{}, 'idb':{db:{store:[..]}}}."""
-    try:
-        return {"localStorage": read_localstorage(profile), "idb": read_indexeddb(profile)}
-    finally:
-        cleanup()   # records are fully materialised above; safe to delete temp copies
+    return load_source(profile)["idb"]
 
 if __name__ == "__main__":
     import sys
@@ -133,6 +578,7 @@ if __name__ == "__main__":
         print("No Chromium profile with web.whatsapp.com IndexedDB found.")
         print("Log into WhatsApp Web on Chrome/Edge first, or pass a profile dir.")
         sys.exit(1)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     for p in profs:
         print(f"=== {p} ===")
         src = load_source(p)
@@ -141,3 +587,4 @@ if __name__ == "__main__":
             print(f"    {k}: {'present' if k in src['localStorage'] else 'MISSING'}")
         for dbn, stores in src["idb"].items():
             print(f"  IDB '{dbn}': " + ", ".join(f"{s}={len(r)}" for s, r in list(stores.items())[:8]))
+        print(json.dumps(ACQUISITION, indent=1, default=str)[:6000])
