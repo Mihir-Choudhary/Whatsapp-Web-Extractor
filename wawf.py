@@ -2080,6 +2080,9 @@ def cmd_sqlite(a):
     hf = getattr(a, "history_file", None)
     if hf and os.path.isfile(hf): extra += ["--history", hf]
     if not a.enc_static: extra += ["--metadata-only"]
+    if a.profile and _is_chromium(a.profile):
+        import chromium_reader as _cr
+        _cr.release()          # the helper reads the parsed store from the run cache; don't hold two copies
     rc = _sub("export_sqlite.py", extra, secret_env={"WAWF_ENC_STATIC": a.enc_static})
     if rc == 0:
         # Same receipt as the text/JSON side, so a later --history run can name what it found here

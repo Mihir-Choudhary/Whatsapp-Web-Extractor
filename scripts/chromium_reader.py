@@ -550,6 +550,13 @@ def load_source(profile: str, partition: str | None = None) -> dict:
     finally:
         cleanup()
 
+def release():
+    """Drop this process's parsed copy of the store. A helper process about to read the same store
+    gets it from the run's disk cache, so holding a second copy here only doubles peak memory."""
+    _CACHE.clear()
+    import gc
+    gc.collect()
+
 def _disk_cache_path(ck):
     """Per-run cache shared with helper subprocesses, only when the parent run set WAWF_SOURCE_CACHE.
 
