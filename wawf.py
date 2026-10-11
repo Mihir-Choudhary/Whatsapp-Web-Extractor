@@ -2296,6 +2296,10 @@ def main():
                         "touched, key derivation, network request, artifact with its SHA-256, and "
                         "error, crash-safe, as wawf_audit.db beside the output)")
     g.add_argument("--audit-db", metavar="DB", help="path for the audit database (default: beside the output)")
+    g.add_argument("--case-id", metavar="ID", help="case / exhibit number recorded in the audit database "
+                                                    "(default: generated from the date)")
+    g.add_argument("--examiner", metavar="NAME", help="who ran this, recorded with the case and with each run")
+    g.add_argument("--case-notes", metavar="TEXT", help="free-text note recorded with the case")
     g.add_argument("--audit-secrets", action="store_true",
                    help="also store raw key material in the audit database (default: only SHA-256 "
                         "fingerprints plus derivation parameters, so the log is not a secret store)")
@@ -2344,12 +2348,21 @@ def main():
     for _spec in (a.out or []): _parse_out(_spec)
     global AUDIT
     if not getattr(a, "no_audit", False):            # the trail is written unless asked not to
-        AUDIT = audit.open_db(_audit_db_path(a), record_secrets=getattr(a, "audit_secrets", False))
+        AUDIT = audit.open_db(_audit_db_path(a), case_id=getattr(a, "case_id", None),
+                              record_secrets=getattr(a, "audit_secrets", False),
+                              examiner=getattr(a, "examiner", None), notes=getattr(a, "case_notes", None))
         if AUDIT.enabled:
             AUDIT.start_run(a.cmd, sys.argv)
             # mirror EVERY log record (and any exc_info traceback) into the DB, so the trail is complete
             logging.getLogger().addHandler(AUDIT.logging_handler())
             log.info("audit: case %s  run %s  -> %s", AUDIT.case_id, AUDIT.run_id, AUDIT.path)
+            if getattr(AUDIT, "case_id_conflict", None):
+                log.warning("this audit database already belongs to case %s; --case-id %s was not applied "
+                            "(one database is one case -- use another --audit-db for another case)",
+                            AUDIT.case_id, AUDIT.case_id_conflict)
+            if getattr(a, "examiner", None) or getattr(a, "case_notes", None):
+                AUDIT.event("case details", category="case",
+                            detail={"examiner": getattr(a, "examiner", None), "notes": getattr(a, "case_notes", None)})
             if AUDIT.record_secrets:
                 log.warning("--audit-secrets: raw key material WILL be stored in %s — protect it accordingly.",
                             AUDIT.path)

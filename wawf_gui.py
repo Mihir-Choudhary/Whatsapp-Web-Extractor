@@ -266,9 +266,26 @@ class App(tk.Tk):
                  bg=HEADER, fg="#FFFFFF", font=FONT_SMALL).pack(anchor="w")
         root = ttk.Frame(self, padding=(20, 14, 20, 16))
         root.pack(fill="both", expand=True)
+        # Controls stay pinned at the bottom; the steps above them scroll, so no screen size can push
+        # the Start button or the log out of the window.
+        bottom = ttk.Frame(root); bottom.pack(side="bottom", fill="x")
+        self._canvas = cv = tk.Canvas(root, bg=BG, highlightthickness=0, bd=0)
+        vsb = ttk.Scrollbar(root, orient="vertical", command=cv.yview)
+        cv.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y"); cv.pack(side="left", fill="both", expand=True)
+        self._form = form = ttk.Frame(cv)
+        win = cv.create_window((0, 0), window=form, anchor="nw")
+        form.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
+        cv.bind("<Configure>", lambda e: cv.itemconfigure(win, width=e.width))
+        def _wheel(e):
+            if cv.winfo_height() < form.winfo_reqheight():
+                cv.yview_scroll(int(-e.delta / 120) if e.delta else (1 if e.num == 5 else -1), "units")
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            cv.bind_all(seq, lambda e, f=_wheel: f(e) if str(e.widget).startswith(str(cv)) else None)
+        self._bottom = bottom
 
         # 1 — source: a whole profile folder, or its stores given separately
-        c = self._card(root, "1", "Browser data")
+        c = self._card(form, "1", "Browser data")
         self.src_mode = tk.StringVar(value="profile")
         modes = ttk.Frame(c, style="Card.TFrame", padding=0); modes.configure(borderwidth=0)
         modes.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
@@ -313,7 +330,7 @@ class App(tk.Tk):
             ttk.Label(sf, text=hint, style="Help.TLabel").grid(row=2 * i + 1, column=1, sticky="w")
 
         # 2 — output
-        c = self._card(root, "2", "Save results to")
+        c = self._card(form, "2", "Save results to")
         self.out = tk.StringVar(value=os.path.join(os.path.expanduser("~"), "Documents", "wawf-output",
                                                    dt.datetime.now().strftime("case-%Y%m%d-%H%M")))
         ttk.Entry(c, textvariable=self.out, font=FONT).grid(row=1, column=0, sticky="ew", pady=(8, 0))
@@ -330,9 +347,13 @@ class App(tk.Tk):
         self.fetch_media = tk.BooleanVar(value=False)
         self._toggle(c, "Also download media the browser did not cache, from WhatsApp's servers (online)",
                      self.fetch_media).grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.history = tk.BooleanVar(value=False)
+        self._toggle(c, "Also recover history older than the browser's ~90 days, from the phone "
+                        "(online; can take hours; needs Node.js)",
+                     self.history).grid(row=4, column=0, columnspan=3, sticky="w", pady=(2, 0))
 
         # 3 — key
-        c = self._card(root, "3", "Message key")
+        c = self._card(form, "3", "Message key")
         self.key_mode = tk.StringVar(value="online")
         self._toggle(c, "Get it from WhatsApp (signs in once as this linked device)", self.key_mode, value="online", command=self._key_mode).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
         r = ttk.Frame(c, style="Card.TFrame", padding=0); r.configure(borderwidth=0)
@@ -350,8 +371,26 @@ class App(tk.Tk):
                        "as activity on the account) and saves it as companion_enc_static.txt in the results "
                        "folder; choose that file here on later runs to decrypt without going online.").grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
+        # 4 — the case: recorded in the chain-of-custody database beside the results
+        c4 = self._card(form, "4", "Case (chain of custody)")
+        self.case_id, self.examiner, self.case_notes = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        self.audit_mode = tk.StringVar(value="on")
+        row = ttk.Frame(c4, style="Card.TFrame", padding=0); row.configure(borderwidth=0)
+        row.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0)); row.columnconfigure(1, weight=1); row.columnconfigure(3, weight=1)
+        ttk.Label(row, text="Case / exhibit no.", style="Card.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(row, textvariable=self.case_id, font=FONT).grid(row=0, column=1, sticky="ew")
+        ttk.Label(row, text="Examiner", style="Card.TLabel").grid(row=0, column=2, sticky="w", padx=(16, 8))
+        ttk.Entry(row, textvariable=self.examiner, font=FONT).grid(row=0, column=3, sticky="ew")
+        ttk.Label(row, text="Notes", style="Card.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        ttk.Entry(row, textvariable=self.case_notes, font=FONT).grid(row=1, column=1, columnspan=3, sticky="ew", pady=(6, 0))
+        aud = ttk.Frame(c4, style="Card.TFrame", padding=0); aud.configure(borderwidth=0)
+        aud.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self._toggle(aud, "Record every step and file hash (wawf_audit.db)", self.audit_mode, value="on").pack(side="left")
+        self._toggle(aud, "…including raw key values", self.audit_mode, value="secrets").pack(side="left", padx=(14, 0))
+        self._toggle(aud, "Don't record", self.audit_mode, value="off").pack(side="left", padx=(14, 0))
+
         # advanced options: everything else the command line offers, out of the way until asked for
-        adv_head = ttk.Frame(root); adv_head.pack(fill="x", pady=(0, 6))
+        adv_head = ttk.Frame(bottom); adv_head.pack(fill="x", pady=(8, 6))
         self.adv_btn = ttk.Button(adv_head, text="Advanced options…", style="Link.TButton", command=self._toggle_adv)
         self.adv_btn.pack(side="left")
         self.adv_summary = ttk.Label(adv_head, text="", style="Sub.TLabel")
@@ -363,11 +402,11 @@ class App(tk.Tk):
         if getattr(self, "_icon", None): self.adv.iconphoto(False, self._icon)
         c = ttk.Frame(self.adv, style="Card.TFrame", padding=(16, 12)); c.pack(fill="both", expand=True, padx=12, pady=12)
         c.columnconfigure(1, weight=1)
-        self.history, self.refetch, self.install_node = tk.BooleanVar(), tk.BooleanVar(), tk.BooleanVar()
+        self.refetch, self.install_node = tk.BooleanVar(), tk.BooleanVar()
         self.raw_keys, self.verbose = tk.BooleanVar(), tk.BooleanVar()
-        self.audit_mode, self.creds = tk.StringVar(value="on"), tk.StringVar()
-        self._toggle(c, "Also recover older history from the phone (online; can take hours; needs Node.js)",
-                     self.history).grid(row=0, column=0, columnspan=3, sticky="w")
+        self.creds = tk.StringVar()
+        ttk.Label(c, text="Older history from the phone (ticked in the main window):", style="Card.TLabel").grid(
+            row=0, column=0, columnspan=3, sticky="w")
         sub = ttk.Frame(c, style="Card.TFrame", padding=(26, 0, 0, 0)); sub.configure(borderwidth=0)
         sub.grid(row=1, column=0, columnspan=3, sticky="w")
         self._toggle(sub, "Only re-ask chats whose senders are missing", self.refetch).pack(side="left")
@@ -377,19 +416,13 @@ class App(tk.Tk):
         ttk.Label(c, text="Saved credentials (creds_in.json)", style="Card.TLabel").grid(row=3, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(c, textvariable=self.creds, font=FONT).grid(row=3, column=1, sticky="ew", pady=(8, 0), padx=(10, 0))
         ttk.Button(c, text="Browse…", command=self.pick_creds).grid(row=3, column=2, padx=(8, 0), pady=(8, 0))
-        aud = ttk.Frame(c, style="Card.TFrame", padding=0); aud.configure(borderwidth=0)
-        aud.grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
-        ttk.Label(aud, text="Chain of custody:", style="Card.TLabel").pack(side="left", padx=(0, 8))
-        self._toggle(aud, "Record (default)", self.audit_mode, value="on").pack(side="left")
-        self._toggle(aud, "Record with raw key values", self.audit_mode, value="secrets").pack(side="left", padx=(14, 0))
-        self._toggle(aud, "Don't record", self.audit_mode, value="off").pack(side="left", padx=(14, 0))
         self._toggle(c, "Detailed log (full tracebacks)", self.verbose).grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
         ttk.Button(c, text="List the WhatsApp sessions in this profile", command=self.list_sessions).grid(
             row=6, column=0, columnspan=3, sticky="w", pady=(10, 0))
         ttk.Button(c, text="Done", style="Run.TButton", command=self._toggle_adv).grid(row=7, column=2, sticky="e", pady=(12, 0))
 
         # the command line this window will run, always visible and copyable
-        cl = ttk.Frame(root); cl.pack(fill="x", pady=(0, 6))
+        cl = ttk.Frame(bottom); cl.pack(fill="x", pady=(0, 6))
         ttk.Label(cl, text="Command line", style="Sub.TLabel").pack(side="left", padx=(0, 8))
         self.cmd_text = tk.StringVar()
         ttk.Entry(cl, textvariable=self.cmd_text, state="readonly", font=FONT_MONO).pack(side="left", fill="x", expand=True)
@@ -397,7 +430,7 @@ class App(tk.Tk):
         self.after(300, self._refresh_cmd)
 
         # run row
-        bar = ttk.Frame(root); bar.pack(fill="x", pady=(4, 8))
+        bar = ttk.Frame(bottom); bar.pack(fill="x", pady=(4, 8))
         self._bar_row = bar
         self.run_btn = ttk.Button(bar, text="Start", style="Run.TButton", command=self.start)
         self.run_btn.pack(side="left")
@@ -407,11 +440,11 @@ class App(tk.Tk):
         self.open_btn.pack(side="right")
         self.status = ttk.Label(bar, text="Ready.", style="Status.TLabel")
         self.status.pack(side="left", padx=(16, 0))
-        self.bar = ttk.Progressbar(root, mode="indeterminate")    # shown only while a run is going
+        self.bar = ttk.Progressbar(bottom, mode="indeterminate")    # shown only while a run is going
         self._bar_after = bar
 
         # log
-        lf = ttk.Frame(root); lf.pack(fill="both", expand=True, pady=(8, 0))
+        lf = ttk.Frame(bottom); lf.pack(fill="both", expand=True, pady=(8, 0))
         self.log = tk.Text(lf, height=5, font=FONT_MONO, bg=LOG_BG, fg=LOG_FG, insertbackground=LOG_FG,
                            relief="flat", wrap="word", padx=10, pady=8, state="disabled")
         sb = ttk.Scrollbar(lf, command=self.log.yview); self.log.configure(yscrollcommand=sb.set)
@@ -467,12 +500,15 @@ class App(tk.Tk):
         if d: var.set(os.path.normpath(d))
 
     def _fit_screen(self):
-        """Never taller than the screen's usable height: the log, packed last, gives up the space."""
+        """Show all the steps when the screen allows it; otherwise the steps scroll and the controls stay."""
         self.update_idletasks()
         avail = self.winfo_screenheight() - 90                 # leave room for a taskbar / dock
-        h = min(max(self.winfo_reqheight() + 120, 640), avail)
-        self.geometry(f"{max(self.winfo_reqwidth(), 760)}x{h}")
-        self.minsize(760, min(640, avail))
+        fixed = self.winfo_reqheight() - self._canvas.winfo_reqheight()
+        want = self._form.winfo_reqheight()
+        self._canvas.configure(height=max(200, min(want, avail - fixed)))
+        self.update_idletasks()
+        self.geometry(f"{max(self._form.winfo_reqwidth() + 60, 760)}x{min(self.winfo_reqheight(), avail)}")
+        self.minsize(760, min(560, avail))
 
     def _refresh_cmd(self):
         try:
@@ -500,11 +536,10 @@ class App(tk.Tk):
             self.adv.deiconify(); self.adv.lift(); self.adv.focus_set()
 
     def _adv_text(self):
-        on = [t for v, t in ((self.history, "history from the phone"), (self.refetch, "refetch"),
+        on = [t for v, t in ((self.refetch, "history: refetch only"),
                              (self.install_node, "may install Node.js"), (self.raw_keys, "key material in raw dump"),
                              (self.verbose, "detailed log")) if v.get()]
         if self.creds.get().strip(): on.append("saved credentials")
-        on += {"secrets": ["audit with key values"], "off": ["no audit"]}.get(self.audit_mode.get(), [])
         return ("on: " + " · ".join(on)) if on else ""
 
     def pick_creds(self):
@@ -599,10 +634,15 @@ class App(tk.Tk):
             if self.refetch.get(): cmd += ["--history-refetch"]
             if self.install_node.get(): cmd += ["--install-node"]
         if self.audit_mode.get() == "off":
+            if self.case_id.get().strip() or self.examiner.get().strip() or self.case_notes.get().strip():
+                raise ValueError("Case details are recorded in the chain-of-custody database; "
+                                 "choose to record it, or clear the case fields.")
             cmd += ["--no-audit"]
         else:
             cmd += ["--audit-db", os.path.join(out, "wawf_audit.db")]
             if self.audit_mode.get() == "secrets": cmd += ["--audit-secrets"]
+            for flag, var in (("--case-id", self.case_id), ("--examiner", self.examiner), ("--case-notes", self.case_notes)):
+                if var.get().strip(): cmd += [flag, var.get().strip()]
         if self.verbose.get(): cmd += ["-v"]
         cmd += ["--log-file", os.path.join(out, "wawf.log")]
         return cmd, out

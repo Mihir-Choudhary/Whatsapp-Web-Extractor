@@ -43,6 +43,7 @@ try:
         app.key_mode.set("online"); app.key.set(""); app.fetch_media.set(False)
         app.history.set(False); app.refetch.set(False); app.install_node.set(False)
         app.raw_keys.set(False); app.verbose.set(False); app.audit_mode.set("on"); app.creds.set("")
+        app.case_id.set(""); app.examiner.set(""); app.case_notes.set("")
         app.st_idb.set(""); app.st_ls.set(""); app.st_cache.set("")
     def args():
         cmd, _ = app._command()
@@ -88,6 +89,10 @@ try:
     check("no audit", "--no-audit" in a and "--audit-db" not in a)
     reset(); app.verbose.set(True); a = args()
     check("detailed log", "-v" in a)
+    reset(); app.case_id.set("EX-07"); app.examiner.set("A. Examiner"); app.case_notes.set("item 7, laptop"); a = args()
+    check("case number, examiner and notes go to the audit database",
+          pair(a, "--case-id") == "EX-07" and pair(a, "--examiner") == "A. Examiner"
+          and pair(a, "--case-notes") == "item 7, laptop")
 
     print("sources")
     reset(); app.src_mode.set("stores"); app.st_idb.set(idb); app.st_ls.set(ls); app.st_cache.set(cache); a = args()
@@ -117,6 +122,8 @@ try:
     check("a missing key file", refused("companion_enc_static"))
     reset(); app.src_mode.set("stores"); app.st_idb.set(idb)
     check("Chromium stores without Local Storage", refused("Local Storage"))
+    reset(); app.audit_mode.set("off"); app.examiner.set("A. Examiner")
+    check("case details with recording switched off", refused("chain-of-custody"))
 
     print("the command shown for copying")
     reset(); app.out.set(os.path.join(tmp, "a folder with spaces & \"quotes\"")); cmd, _ = app._command()

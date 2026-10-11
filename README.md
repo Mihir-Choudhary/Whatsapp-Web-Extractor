@@ -55,9 +55,12 @@ folder, or `--origin` for its `web.whatsapp.com` storage folder). Nothing is aut
 gets examined is always your explicit choice. `wawf -h` prints the profile locations for your machine as
 full, copy-pasteable paths.
 
-**Prefer a window?** Double-click `wawf-windows-x64.exe`, or run `wawf` with no arguments. It lists the
-profiles on the machine that hold WhatsApp Web, lets you pick where to save and how to get the key, and
-runs exactly the command line shown in its log — the same run, the same audit trail.
+**Prefer a window?** Double-click `wawf-windows-x64.exe`, or run `wawf` with no arguments (`wawf --gui`
+also works). It finds the profiles on the machine that hold WhatsApp Web — for any Chromium- or
+Firefox-based browser — or takes a copied profile, or the stores on their own; then where to save and how
+to get the key. Everything else the command line offers is under *Advanced options…*. The window shows
+the exact command it will run, live, with a **Copy** button: every run from the window is an ordinary
+command-line run, with the same audit trail, and can be repeated from a terminal or quoted in a report.
 
 ### Acquiring the profile
 
