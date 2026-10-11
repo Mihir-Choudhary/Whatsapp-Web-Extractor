@@ -443,7 +443,8 @@ class App(tk.Tk):
         os.makedirs(out, exist_ok=True)
         self.out_dir = out
         self._clear(); self._append("$ " + " ".join(_q(c) for c in cmd) + "\n\n")
-        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", WAWF_FROM_GUI="1")
+        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", WAWF_FROM_GUI="1",
+                   PYINSTALLER_RESET_ENVIRONMENT="1")      # the run unpacks its own copy of the exe
         try:
             self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                          env=env, cwd=out, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -535,8 +536,8 @@ def hide_own_console():
     try:
         import ctypes
         k = ctypes.windll.kernel32
-        buf = (ctypes.c_uint * 4)()
-        if k.GetConsoleProcessList(buf, 4) <= 1:
+        buf = (ctypes.c_uint * 8)()
+        if k.GetConsoleProcessList(buf, 8) <= (2 if getattr(sys, "frozen", False) else 1):
             hwnd = k.GetConsoleWindow()
             if hwnd: ctypes.windll.user32.ShowWindow(hwnd, 0)
     except Exception:

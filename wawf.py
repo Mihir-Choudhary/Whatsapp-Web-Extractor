@@ -2130,12 +2130,14 @@ def _given_stores_profile(idb, local_storage, media_cache):
     return d
 
 def _own_console():
-    """True when this process is the only one attached to its console (it was double-clicked)."""
+    """True when nothing but this program is attached to its console (it was double-clicked). A
+    one-file build runs as two processes -- the bootloader and this one -- so for it two is alone; a
+    shell it was started from would be a third."""
     if sys.platform != "win32": return False
     try:
         import ctypes
-        buf = (ctypes.c_uint * 4)()
-        return ctypes.windll.kernel32.GetConsoleProcessList(buf, 4) <= 1
+        buf = (ctypes.c_uint * 8)()
+        return ctypes.windll.kernel32.GetConsoleProcessList(buf, 8) <= (2 if getattr(sys, "frozen", False) else 1)
     except Exception:
         return False
 
@@ -2156,7 +2158,10 @@ def main():
         # the window (Windows Terminal ignores requests to hide it). Start the window detached, with no
         # console, and exit so this one closes. Run from a shell, the console is shared and stays.
         if len(sys.argv) == 1 and getattr(sys, "frozen", False) and _own_console():
+            # PYINSTALLER_RESET_ENVIRONMENT: the new process must unpack its own copy rather than reuse
+            # this one's, which is deleted the moment this process exits.
             subprocess.Popen([sys.executable, "--gui"], close_fds=True,
+                             env=dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1"),
                              creationflags=0x00000008 | 0x00000200)   # DETACHED_PROCESS | NEW_PROCESS_GROUP
             return 0
         try:
