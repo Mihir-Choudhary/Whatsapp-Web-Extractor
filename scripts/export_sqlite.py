@@ -596,6 +596,38 @@ for o in store(REACT_SID):
     db.execute("INSERT INTO message_add_on_reaction(message_add_on_row_id,reaction) VALUES(?,?)", (addon_id, as_text(o.get('reactionText'))))
     rx += 1
 
+# ---- message associations: album items, HD copies, motion photos -> message_association ----
+# The browser's own labels are MEDIA_ALBUM and UNKNOWN. Checked record by record against an Android
+# msgstore.db of the same account: MEDIA_ALBUM is Android's album item (2) in every case; UNKNOWN under a
+# VIDEO parent is the HD copy of that video (7) in every case; UNKNOWN under a PHOTO parent is either the
+# HD copy of the photo (12) or a motion photo (11), and nothing the browser stores tells the two apart
+# (same row type, same body). So those -- and anything else -- go only to wawf_message_association, with
+# the browser's label, instead of a guessed Android type. The HD/motion child itself is a stub in the
+# browser: WhatsApp Web keeps no media key for it.
+db.execute("""CREATE TABLE wawf_message_association(child_message_row_id INTEGER, parent_message_row_id INTEGER,
+              child_key TEXT, parent_key TEXT, browser_association_type TEXT, meaning TEXT)""")
+na = nwa = 0
+for o in store('message-association'):
+    if not isinstance(o, dict): continue
+    ck, pk, bt = as_text(o.get('msgKey')), as_text(o.get('parentMsgKey')), as_text(o.get('associationType'))
+    cid, pid = WEBID2ID.get(ck), WEBID2ID.get(pk)
+    ptype = db.execute("SELECT message_type FROM message WHERE _id=?", (pid,)).fetchone() if pid else None
+    ptype = ptype[0] if ptype else None
+    if bt == 'MEDIA_ALBUM':
+        atype, meaning = 2, 'album item'
+    elif bt == 'UNKNOWN' and ptype in (3, 43):
+        atype, meaning = 7, 'HD copy of a video (the browser keeps no media key for it)'
+    elif bt == 'UNKNOWN' and ptype in (1, 42):
+        atype, meaning = None, 'HD copy or motion photo of a photo (the browser does not record which; no media key kept)'
+    else:
+        atype, meaning = None, 'association %s' % bt
+    db.execute("INSERT INTO wawf_message_association VALUES(?,?,?,?,?,?)", (cid, pid, ck, pk, bt, meaning))
+    nwa += 1
+    if atype and cid and pid:
+        db.execute("INSERT INTO message_association(child_message_row_id,parent_message_row_id,association_type) VALUES(?,?,?)",
+                   (cid, pid, atype))
+        na += 1
+
 # ---- receipts -> receipt_user (outgoing per-recipient) ----
 rc = 0
 for o in store(MSGINFO_SID):
@@ -741,7 +773,8 @@ A.artifact(mp, kind="Android msgstore.db (decrypted messages)", records=mid)
 A.artifact(wp, kind="Android wa.db (contacts)", records=len(contacts))
 A.event("export_sqlite complete", category="stage",
         detail={"jids": len(_jid_id), "chats": len(_chat_id), "messages": mid, "mentions": ment_id,
-                "reactions": rx, "receipts": rc, "polls": pl, "votes": pv, "media_written": decrypted})
+                "reactions": rx, "receipts": rc, "polls": pl, "votes": pv, "media_written": decrypted,
+                "associations": na, "associations_browser": nwa})
 A.end_run(0, status="ok")
 # ---- human-readable summary ----
 import datetime as _dt
@@ -756,6 +789,7 @@ print(f'  date range  : {(_d(min(_secs)) if _secs else "?")}  →  {(_d(max(_sec
 print(f'  chats       : {len(_cset)}   ({len(_cset)-_grp} direct, {_grp} groups)')
 print(f'  contacts    : {len(contacts):,}   ·   groups: {len(groups):,}   ·   chats(saved): {len(chats):,}')
 print(f'  media msgs  : {_media:,}   ·   reactions: {rx:,}   ·   calls: {len(call_objs):,}')
+print(f'  associations: {na:,} albums / HD video copies linked   ·   {nwa:,} as the browser recorded them (wawf_message_association)')
 print('─────────────────────────────────')
 print(f"  media       : {decrypted:,} file(s) from {blobs:,} cached blob(s)"
       + (f"; {len(byench):,} distinct media object(s) have keys" if byench else ""))

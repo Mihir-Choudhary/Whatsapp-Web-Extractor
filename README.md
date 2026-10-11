@@ -277,6 +277,7 @@ the kinds of gap do not.
 | **Contacts** | yes: name, pushname, lid ↔ phone number, username, *about* text, business names | `contacts.csv`, `identities.json`, `wa.db` |
 | **Groups** | members, admins, past members with *left/removed* and when, subject, description, settings | 99.3% of memberships match the phone; the difference is the owner, whom the phone stores as itself |
 | Reactions, mentions, pins, labels, channels, blocklist | yes | |
+| Albums, HD copies, motion photos | the links between them: albums and HD video copies in `message_association` (1,519 of 1,520 rows identical to the phone's), every link as the browser recorded it in `wawf_message_association` | the browser labels HD photo copies and motion photos alike, so those are not given an Android type; it keeps no media key for any HD copy (the HD file is only in the live server queue) |
 | Statuses (stories) | **no** — not written to disk | status updates posted while the browser was closed are in the server queue: `--queue` records them, with media keys |
 | Profile pictures | addresses and hashes only; the image only if still cached | |
 | Media files | keys and hashes for all; the bytes only for what the browser cached (it caches some already decrypted) | `--fetch-media` downloads the rest while their links are valid |
