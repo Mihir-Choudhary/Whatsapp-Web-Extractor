@@ -23,10 +23,9 @@ after a while. Smart App Control **cannot be re-enabled once turned off**, so di
 one-way decision about the whole machine, not a workaround; running from Python instead avoids the
 question entirely. See [BUILD.md](BUILD.md).
 
-`--history` (pulling messages older than the browser cache from your phone) is the one feature the
-`.exe` cannot do alone: it runs a Node.js client that is not bundled. For it, clone this repository,
-install [Node.js](https://nodejs.org), run `npm install` in `tools/reconnect`, and run the `.exe` from
-inside the repository (or `python wawf.py`). See [Recovering history](#recovering-history-older-than-the-cache).
+`--history` (pulling messages older than the browser cache from your phone) runs inside the `.exe`
+too: the linked-device client and the Signal protocol are implemented in Python, so no Node.js is
+needed. See [Recovering history](#recovering-history-older-than-the-cache).
 
 ### Linux / macOS — run with Python
 
@@ -243,10 +242,10 @@ A Windows drive letter is never mistaken for a `FORMAT`, so `D:\case\out` works 
 | `--list-partitions` | List every WhatsApp session in the profile (account, messages, key present) and stop. |
 | `--origin DIR` | Firefox `web.whatsapp.com` storage folder instead of a profile folder. |
 | `--raw-include-keys` | With `--out raw:` — also dump `signal-storage` and `wawc_db_enc`. Those are key material; a dump including them must not travel with a case. |
-| `--history` | **Also** pull chat history older than the browser cache from your phone, iteratively, resuming across runs, and append it to the export. Needs Node (offers to install it). Phone-side and rate-limited — see below. |
+| `--history` | **Also** pull chat history older than the browser cache from your phone, iteratively, resuming across runs, and append it to the export. Pure Python, no Node needed. Phone-side and rate-limited — see below. |
 | `--fetch-media` | With `--out sqlite:PATH` (with or without `--history`): download, decrypt and verify from the CDN the media the browser never cached, newest first. Networked, and it downloads real bytes — a large account can be a lot of them. Urls whose signature has already expired are skipped without a request. |
 | `--history-refetch` | With `--history`: re-ask for history already recovered, to fill in fields an earlier run did not capture (the group sender). Finds nothing new by design. |
-| `--install-node` | Allow `--history` to install Node.js via winget when none is found. **Not** covered by `--yes`: it modifies the machine and asks for elevation. A portable Node unzipped beside the tool, or `WAWF_NODE` pointing at one, needs neither. |
+| `--install-node` | Only with the optional Node engine (`WAWF_HISTORY_ENGINE=node`): allow `--history` to install Node.js via winget when none is found. **Not** covered by `--yes`: it modifies the machine and asks for elevation. A portable Node unzipped beside the tool, or `WAWF_NODE` pointing at one, needs neither. |
 | `--no-audit` | Do **not** write the chain-of-custody database. It is written by default (see below). |
 
 Sender resolution is **reported, not assumed** — a run prints where every label came from, so the one
@@ -541,10 +540,16 @@ arrives ~3s later. A first pass over a few hundred chats takes tens of minutes; 
 history runs for hours and will sit idle for two hours at a time when the limit trips. Progress is
 checkpointed after every page, so stopping it costs nothing.
 
-Needs Node + `cd tools/reconnect && npm install` — the Signal/E2E stack isn't ported to Python, so
-`--history` is **not** in the standalone binary.
+The default engine is `scripts/history_extract.py`: the Noise handshake, the binary stanza format, the
+Signal 1:1 session (X3DH + Double Ratchet) and the history-sync protobufs are implemented in Python, so
+`--history` works from the standalone binary with nothing else installed. It reads and writes the same
+work folder, checkpoints and `history_recovered.json` as the Node client, so a sweep can be continued
+with either. The Python Signal code is checked against libsignal-node by `scripts/selftest_signal.py`
+(sessions and session records handed between the two implementations) and the stanza encoder against
+Baileys by `scripts/selftest_binary.py`.
 
-Node is looked for in the places it actually lives: beside the tool (a `node-v*/` folder or
+`WAWF_HISTORY_ENGINE=node` runs the original Node client instead (needs Node +
+`cd tools/reconnect && npm install`). Node is looked for in the places it actually lives: beside the tool (a `node-v*/` folder or
 `node/node.exe`), on `PATH`, in the standard install directories, in nvm / nvs / scoop / chocolatey /
 winget, and wherever `WAWF_NODE` points. Unzipping the official portable build next to the tool is
 the least invasive option on an examination machine — nothing is installed and nothing is elevated.

@@ -1693,33 +1693,38 @@ def _history_export(a, targets, history_file=None):
     return cmd_run(ns)
 
 def cmd_history(a):
-    """On-demand history sync: pull messages OLDER than the browser cache from WhatsApp's servers, per
-    chat, going back toward each chat's start — ITERATIVELY: each pass re-anchors on the oldest message
-    recovered so far and pulls deeper, accumulating (deduped) until it converges. Recovers creds + Signal
-    state + anchors (pure Python) then runs the Node/Baileys extractor. The Signal/E2E stack isn't ported
-    to Python, so this needs Node + `npm install` in tools/reconnect: the .exe will use that folder if it
-    sits next to the executable (e.g. the repo's dist/), but it is not bundled inside the .exe itself."""
+    """On-demand history sync: pull messages OLDER than the browser cache from the account's phone, per
+    chat, going back toward each chat's start -- ITERATIVELY: each pass re-anchors on the oldest message
+    recovered so far and pulls deeper, accumulating (deduped) until it converges. Recovers creds, Signal
+    state and anchors from the profile, then runs the history client: scripts/history_extract.py (pure
+    Python, its own Signal implementation, no Node; works from the .exe), or the Baileys client in
+    tools/reconnect when WAWF_HISTORY_ENGINE=node."""
+    # The history client is pure Python by default (scripts/history_extract.py): no Node.js, and it runs
+    # from the standalone .exe. WAWF_HISTORY_ENGINE=node keeps the Baileys client (tools/reconnect).
+    engine = os.environ.get("WAWF_HISTORY_ENGINE", "python").strip().lower()
     rec = _find_reconnect_dir()
-    if not rec:
-        log.error("history needs the Node client (tools/reconnect/history_extract.js), which is not bundled "
-                  "in the .exe. Run wawf from the repo, or keep the .exe inside the repo (its dist/ folder is "
-                  "fine) so tools/reconnect sits alongside it.")
-        return 2
-    # --install-node, not --yes: see the note in _ensure_node
-    node = _ensure_node(getattr(a, "yes", False), getattr(a, "install_node", False))
-    if not node: return 2
-    node_dir = os.path.dirname(node)                     # make node/npm resolvable for this run's subprocesses
-    if node_dir and node_dir not in os.environ.get("PATH", "").split(os.pathsep):
-        os.environ["PATH"] = node_dir + os.pathsep + os.environ.get("PATH", "")
-    if not _ensure_baileys(rec, node, getattr(a, "yes", False)): return 2   # find Baileys, or offer npm install
-    # Where OUTPUTS (creds/state/anchors/recovered history) go. For a standalone .exe the Node client (rec)
-    # lives inside the temp extraction dir, which is wiped on exit — so write outputs to a persistent folder
-    # next to the executable instead, and keep the resume ledger there across runs.
-    if getattr(sys, "frozen", False) and os.path.abspath(rec) == os.path.abspath(os.path.join(HERE, "tools", "reconnect")):
-        work = _pick_work_dir()                          # exact match on the bundled client, not a prefix test
-        log.info("history data dir: %s", work)
+    node = None
+    if engine == "node":
+        if not rec:
+            log.error("WAWF_HISTORY_ENGINE=node needs the Node client (tools/reconnect/history_extract.js), "
+                      "which is not bundled in the .exe. Run wawf from the repo, or leave the engine at its "
+                      "default (python).")
+            return 2
+        # --install-node, not --yes: see the note in _ensure_node
+        node = _ensure_node(getattr(a, "yes", False), getattr(a, "install_node", False))
+        if not node: return 2
+        node_dir = os.path.dirname(node)                 # make node/npm resolvable for this run's subprocesses
+        if node_dir and node_dir not in os.environ.get("PATH", "").split(os.pathsep):
+            os.environ["PATH"] = node_dir + os.pathsep + os.environ.get("PATH", "")
+        if not _ensure_baileys(rec, node, getattr(a, "yes", False)): return 2
+    # Where OUTPUTS (creds/state/anchors/recovered history) go: beside a repo checkout's tools/reconnect,
+    # so earlier runs' ledgers keep resuming; for the .exe, a persistent folder next to the executable.
+    if rec and not (getattr(sys, "frozen", False) and
+                    os.path.abspath(rec) == os.path.abspath(os.path.join(HERE, "tools", "reconnect"))):
+        work = rec
     else:
-        work = rec                                       # from-source / repo-adjacent: outputs live in tools/reconnect
+        work = _pick_work_dir()
+        log.info("history data dir: %s", work)
     # engine args shared by creds / signal-state / anchors
     _require_source(a, "history")                           # a profile (or --origin) is required; nothing is auto-detected
     if a.profile and _is_chromium(a.profile):
@@ -1802,16 +1807,18 @@ def cmd_history(a):
                 "is distinguishable from a refusal.")
     log.warning("SIDE EFFECT ON THE DEVICE: your phone's replies are end-to-end encrypted to a Signal "
                 "session, and the copy in the browser profile is a snapshot of a ratchet that keeps moving, "
-                "so this renegotiates that session and then keeps its own copy (signal_runtime.json, next "
-                "to the output — treat it as key material). The browser's stored session for this linked "
+                "so this renegotiates that session and then keeps its own copy (signal_runtime.py.json, or "
+                "signal_runtime.json for the Node client, next to the output — treat it as key material). The browser's stored session for this linked "
                 "device therefore goes stale; WhatsApp Web re-establishes it by itself the next time you "
                 "open it. Nothing on the phone or in the profile is modified.")
-    log.warning("KEEP signal_runtime.json (and its .bak) WITH THE CASE — it is NOT a cache. It holds the "
+    log.warning("KEEP signal_runtime.py.json / signal_runtime.json WITH THE CASE — it is NOT a cache. It holds the "
                 "only copy of the prekeys this tool published to WhatsApp's servers, which peers then "
                 "encrypt to, and of ratchet state the phone has already moved past. Delete it and "
                 "anything encrypted to those keys is permanently unreadable, even from the same profile. "
                 "Every run also advances that shared state, so run deliberately, not repeatedly.")
-    env = dict(os.environ, TOP="100000", COUNT="50", MAXPAGES="100000")   # every chat, page until exhausted
+    # every chat, page until exhausted -- unless TOP / MAXPAGES / COUNT are set to bound the sweep
+    env = dict(os.environ, TOP=os.environ.get("TOP", "100000"), COUNT=os.environ.get("COUNT", "50"),
+               MAXPAGES=os.environ.get("MAXPAGES", "100000"))
     anchors_path = os.path.join(work, "anchors.json")
     pass_out = os.path.join(work, "history_recovered.json")   # human-facing final output (full accumulated set)
     accum = os.path.join(work, "history_all.json")            # resume ledger, accumulated across ALL runs
@@ -1891,8 +1898,14 @@ def cmd_history(a):
         for p in range(1, MAX_PASSES + 1):
             log.info("──── history pass %d ────", p)
             if os.path.exists(pass_out): os.remove(pass_out)   # else a node failure re-reads a stale pass as "new"
-            ncmd = [node, os.path.join(rec, "history_extract.js")]
-            AUDIT.event("history pass %d: launching Node extractor" % p, category="stage",
+            if engine == "node":
+                ncmd = [node, os.path.join(rec, "history_extract.js")]
+            elif getattr(sys, "frozen", False):
+                ncmd = [sys.executable, "_runpy", "history_extract.py"]
+            else:
+                ncmd = [sys.executable, os.path.join(HERE, "scripts", "history_extract.py")]
+            env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+            AUDIT.event("history pass %d: launching the %s history client" % (p, engine), category="stage",
                         detail={"argv": ncmd, "cwd": work})
             rc = (_run_node_audited(ncmd, work, env, p) if AUDIT.enabled
                   else subprocess.run(ncmd, cwd=work, env=env).returncode)

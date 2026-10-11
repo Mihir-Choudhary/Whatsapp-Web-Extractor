@@ -79,6 +79,9 @@ class Client:
         self.me_lid = (creds.get("lid") or "").split(":")[0].split("@")[0]
         self.me_pn = str(creds.get("user") or "").split(":")[0].split("@")[0]
         self.stats = {"in": 0, "acked": 0, "decrypted": 0, "decrypt_failed": 0, "sent": 0}
+        # what arrived, counted -- never content: stanza tags, and for messages who sent them and what type
+        import collections
+        self.tally = collections.Counter()
 
     # ---------------------------------------------------------------- connection
     def connect(self, timeout=30):
@@ -186,6 +189,7 @@ class Client:
     def _handle(self, n):
         tag, a = n["tag"], n["attrs"]
         self.stats["in"] += 1
+        self.tally["stanza:" + tag + (":" + a["type"] if tag in ("notification", "receipt") and a.get("type") else "")] += 1
         if tag == "iq":
             if a.get("type") in ("result", "error") and a.get("id") in self._iq:
                 self._iq[a["id"]].put(n); return
@@ -209,6 +213,7 @@ class Client:
         for enc in [c for c in (n["content"] or []) if isinstance(c, dict) and c["tag"] == "enc"]:
             et = enc["attrs"].get("type")
             if et not in ("msg", "pkmsg"):
+                self.tally["message:%s:%s (group, not decrypted)" % (self.sender_kind(sender), et)] += 1
                 continue                                   # group sender keys are not needed for history
             cipher = SC.SessionCipher(self.signal, _addr(sender))
             try:
@@ -216,6 +221,7 @@ class Client:
                 pt = (cipher.decrypt_prekey_whisper_message if et == "pkmsg" else cipher.decrypt_whisper_message)(body)
                 msg = WP.decode(_unpad(pt), WP.MESSAGE)
                 self.stats["decrypted"] += 1
+                self.tally["message:%s:%s" % (self.sender_kind(sender), WP.message_type(msg))] += 1
                 self.signal.save()
                 self.messages.put({"from": sender, "id": a.get("id"), "category": a.get("category"),
                                    "t": a.get("t"), "message": msg})
@@ -223,8 +229,16 @@ class Client:
                     self.send(N("receipt", {"id": a.get("id"), "to": a.get("from"), "type": "peer_msg"}))
             except Exception as e:
                 self.stats["decrypt_failed"] += 1
+                self.tally["undecryptable:%s:%s" % (self.sender_kind(sender), et)] += 1
                 self.log("could not decrypt %s from %s: %s" % (et, sender, e))
                 self.events.put({"tag": "decrypt-failed", "attrs": dict(a, enc_type=et, error=str(e))})
+
+    def sender_kind(self, jid):
+        """own-phone / own-other-device / contact / group-member: who a message came from, for the tally."""
+        user = (jid or "").split("@")[0]; u, _, dev = user.partition(":")
+        if u in (self.me_lid, self.me_pn):
+            return "own-phone" if not dev or dev == "0" else "own-device-%s" % dev
+        return "contact"
 
     def fetch_prekey_bundle(self, jid):
         res = self.query(N("iq", {"to": S_WA, "type": "get", "xmlns": "encrypt"},

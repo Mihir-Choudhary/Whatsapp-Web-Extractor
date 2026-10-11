@@ -36,8 +36,8 @@ TIPS = {
                    "them with each message's own key and verify their hash. Online; newest first; links that have "
                    "expired are skipped.\nCommand line: --fetch-media.",
     "history": "Sign in as the linked device and ask the phone for messages older than the browser's ~90 days, "
-               "chat by chat. The phone must be online; it can take hours; recorded as account activity. "
-               "Needs Node.js (bundled in the standalone build).\nCommand line: --history.",
+               "chat by chat. The phone must be reachable (it answers in the background, sometimes after "
+               "minutes); a full sweep can take hours; recorded as account activity.\nCommand line: --history.",
     # step 3
     "key_online": "Message text is encrypted with a key WhatsApp gives the browser at sign-in. This signs in once "
                   "as the linked device to get it, and saves it as companion_enc_static.txt in the results "
@@ -59,8 +59,9 @@ TIPS = {
     # advanced
     "refetch": "History: re-ask only the chats whose recovered messages lack a sender, instead of going "
                "further back.\nCommand line: --history-refetch.",
-    "install_node": "History: allow installing Node.js with winget if none is found (asks Windows for "
-                    "permission).\nCommand line: --install-node.",
+    "install_node": "Only for the optional Node history engine (WAWF_HISTORY_ENGINE=node): allow installing "
+                    "Node.js with winget if none is found. The default engine needs no Node.\n"
+                    "Command line: --install-node.",
     "raw_keys": "Also dump the Signal state and the key store into the raw dump. That dump is then key material; "
                 "never share it.\nCommand line: --raw-include-keys.",
     "creds": "creds_in.json saved by an earlier run: reuse the device credentials instead of recovering them "

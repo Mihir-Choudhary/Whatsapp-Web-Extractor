@@ -420,7 +420,7 @@ class App(tk.Tk):
                      self.fetch_media).grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
         self.history = tk.BooleanVar(value=False)
         self._toggle(c, "Also recover history older than the browser's ~90 days, from the phone "
-                        "(online; can take hours; needs Node.js)",
+                        "(online; can take hours)",
                      self.history).grid(row=4, column=0, columnspan=3, sticky="w", pady=(2, 0))
 
         # 3 — key
@@ -481,7 +481,7 @@ class App(tk.Tk):
         sub = ttk.Frame(c, style="Card.TFrame", padding=(26, 0, 0, 0)); sub.configure(borderwidth=0)
         sub.grid(row=1, column=0, columnspan=3, sticky="w")
         self._toggle(sub, "Only re-ask chats whose senders are missing", self.refetch).pack(side="left")
-        self._toggle(sub, "Allow installing Node.js", self.install_node).pack(side="left", padx=(18, 0))
+        self._toggle(sub, "Allow installing Node.js (Node engine only)", self.install_node).pack(side="left", padx=(18, 0))
         self._toggle(c, "Include key material in the raw store dump (do not share that dump)",
                      self.raw_keys).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
         ttk.Label(c, text="Saved credentials (creds_in.json)", style="Card.TLabel").grid(row=3, column=0, sticky="w", pady=(8, 0))
