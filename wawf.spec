@@ -26,6 +26,7 @@ hiddenimports += ["urllib.request", "urllib.error"]
 # (chromium_reader, wa_decrypt, export_baileys_creds, wa_forensic, export_sqlite,
 #  wa_reconnect + _wa_tokens, snappy_pure*, sclone, ...). They live under _MEIPASS/scripts at runtime.
 datas += [(f, "scripts") for f in glob.glob("scripts/*.py")]
+datas += [("assets/wawf.png", "assets")]          # window icon for the GUI
 
 a = Analysis(
     ["wawf.py"],
@@ -35,7 +36,7 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
-    excludes=["tkinter", "PySide6", "PyQt5", "matplotlib", "numpy.testing"],
+    excludes=["PySide6", "PyQt5", "matplotlib", "numpy.testing"],
     noarchive=False,
 )
 pyz = PYZ(a.pure)
@@ -43,5 +44,5 @@ exe = EXE(
     pyz, a.scripts, a.binaries, a.datas, [],
     name="wawf",
     debug=False, bootloader_ignore_signals=False, strip=False, upx=False,
-    runtime_tmpdir=None, console=True, disable_windowed_traceback=False,
+    runtime_tmpdir=None, console=True, icon="assets/wawf.ico", disable_windowed_traceback=False,
 )

@@ -16,6 +16,7 @@ for pkg in ("ccl_chromium_reader", "cramjam", "websocket"):
     datas += d; binaries += b; hiddenimports += h
 hiddenimports += collect_submodules("cryptography")
 datas += [(f, "scripts") for f in glob.glob("scripts/*.py")]
+datas += [("assets/wawf.png", "assets")]          # window icon for the GUI
 
 # --- bundle Node.js (a single portable node executable) at node/node(.exe) ---
 NODE_EXE = os.environ.get("WAWF_NODE_EXE")
@@ -37,7 +38,7 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
-    excludes=["tkinter", "PySide6", "PyQt5", "matplotlib", "numpy.testing"],
+    excludes=["PySide6", "PyQt5", "matplotlib", "numpy.testing"],
     noarchive=False,
 )
 a.datas += recon
@@ -46,5 +47,5 @@ exe = EXE(
     pyz, a.scripts, a.binaries, a.datas, [],
     name="wawf-standalone",
     debug=False, bootloader_ignore_signals=False, strip=False, upx=False,
-    runtime_tmpdir=None, console=True, disable_windowed_traceback=False,
+    runtime_tmpdir=None, console=True, icon="assets/wawf.ico", disable_windowed_traceback=False,
 )
