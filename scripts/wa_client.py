@@ -1,5 +1,13 @@
-"""wa_client.py — a minimal WhatsApp linked-device client in Python: log in, keep the connection, send and
-receive Signal-encrypted 1:1 messages. Enough for on-demand history; nothing else.
+"""wa_client.py — a minimal WhatsApp linked-device client in Python: log in, keep the connection, send
+Signal-encrypted 1:1 messages, receive 1:1 and group messages. Enough for on-demand history and for
+capturing what the server holds for the device; nothing else.
+
+Everything the server delivers is written to a journal (JSON lines: the stanza exactly as received after
+transport decryption, and each decrypted payload) and synced to disk BEFORE anything is acknowledged.
+An acknowledgement makes the server delete the stanza from this device's queue -- the queue the browser
+being examined would otherwise receive -- so by default nothing is acknowledged (ack="none"): the server
+delivers it again on the next connection. ack="saved" acknowledges a stanza once it is journalled and, for
+a message, once every part of it decrypted; what could not be decrypted is never acknowledged.
 
 Builds on wa_reconnect (Noise_XX handshake, login payload, stanza decoder), wa_binary (stanza encoder),
 signal_core (the Signal protocol) and wa_proto (protobufs). Networked: it signs in as the linked device
@@ -11,6 +19,7 @@ import base64, json, os, queue, secrets, threading, time
 import wa_reconnect as WR
 import wa_binary as WB
 import signal_core as SC
+import signal_group as SG
 import wa_proto as WP
 
 N = WB.node
@@ -22,6 +31,16 @@ def _addr(jid):
     user = jid.split("@")[0]
     u, _, dev = user.partition(":")
     return f"{u.split('_')[0]}.{int(dev) if dev else 0}"
+
+def chat_kind(jid):
+    """group / status / channel / broadcast list / 1:1, from the chat jid's server."""
+    jid = jid or ""
+    if jid == "status@broadcast": return "status"
+    if jid.endswith("@g.us"): return "group"
+    if jid.endswith("@newsletter"): return "channel"
+    if jid.endswith("@broadcast"): return "broadcast-list"
+    if jid.endswith("@call"): return "call"
+    return "1:1"
 
 def _pub33(b):
     return b if len(b) == 33 else b"\x05" + b
@@ -50,25 +69,42 @@ class SignalState(SC.MemoryStore):
         super().__init__(ident, int(state["registrationId"]), pks, spks, sessions)
         self.path = path
         self.state = state
+        self.sender_keys = dict(state.get("senderKeys") or {})     # '<group>::<user>::<dev>' -> record
+
+    _save_lock = threading.Lock()                 # the reader thread and the sender both persist the state
 
     def save(self):
         if not self.path: return
+        with self._save_lock:
+            self._save()
+
+    def _save(self):
         out = dict(self.state, sessions={a: r.serialize() for a, r in self.sessions.items()},
+                   senderKeys=self.sender_keys,
                    preKeys={str(k): {"public": base64.b64encode(v["pubKey"][1:]).decode(),
                                      "private": base64.b64encode(v["privKey"]).decode()}
                             for k, v in self.pre_keys.items()},
                    savedUtc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f: json.dump(out, f)
-        os.replace(tmp, self.path)
+        for i in range(10):                         # Windows: a scanner or sync client may hold the file briefly
+            try: os.replace(tmp, self.path); break
+            except PermissionError:
+                if i == 9: raise
+                time.sleep(0.2)
 
 
 class Client:
-    def __init__(self, creds: dict, signal: SignalState, log=print):
+    def __init__(self, creds: dict, signal: SignalState, log=print, journal=None, ack="none"):
+        if ack not in ("none", "saved"): raise ValueError("ack must be 'none' or 'saved'")
         self.creds, self.signal, self.log = creds, signal, log
+        self.ack_policy = ack
+        self._journal = open(journal, "a", encoding="utf-8") if journal else None
+        self._last_frame = b""
         self.ws = None
         self.noise = None
         self._send_lock = threading.Lock()
+        self._crypto_lock = threading.RLock()      # one Signal operation at a time (reader thread vs sender)
         self._iq = {}                          # id -> queue for the reply
         self._msg_id = secrets.token_hex(2)
         self._counter = 0
@@ -78,7 +114,8 @@ class Client:
         self.ready = threading.Event()
         self.me_lid = (creds.get("lid") or "").split(":")[0].split("@")[0]
         self.me_pn = str(creds.get("user") or "").split(":")[0].split("@")[0]
-        self.stats = {"in": 0, "acked": 0, "decrypted": 0, "decrypt_failed": 0, "sent": 0}
+        self.stats = {"in": 0, "acked": 0, "not_acked": 0, "journalled": 0, "decrypted": 0,
+                      "decrypt_failed": 0, "sent": 0}
         # what arrived, counted -- never content: stanza tags, and for messages who sent them and what type
         import collections
         self.tally = collections.Counter()
@@ -138,7 +175,9 @@ class Client:
                 size = (self._inbuf[0] << 16) | (self._inbuf[1] << 8) | self._inbuf[2]
                 if len(self._inbuf) >= size + 3:
                     frame = bytes(self._inbuf[3:size + 3]); del self._inbuf[:size + 3]
-                    return frame if raw else WR.decode_binary_node(self.noise.decrypt(frame))
+                    if raw: return frame
+                    self._last_frame = self.noise.decrypt(frame)
+                    return WR.decode_binary_node(self._last_frame)
             self.ws.settimeout(timeout)
             try:
                 self._inbuf.extend(self.ws.recv())
@@ -178,6 +217,26 @@ class Client:
         finally:
             self._iq.pop(node["attrs"]["id"], None)
 
+    def journal(self, n, **extra):
+        """Append the stanza as received (transport-decrypted binary node, base64) and what was made of it,
+        then flush and fsync: on return it is on disk."""
+        if self._journal is None: return
+        a = n.get("attrs") or {}
+        rec = {"received_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "tag": n.get("tag"),
+               "attrs": {k: str(v) for k, v in a.items()},
+               "stanza_b64": base64.b64encode(self._last_frame).decode()}
+        rec.update(extra)
+        self._journal.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        self._journal.flush(); os.fsync(self._journal.fileno())
+        self.stats["journalled"] += 1
+
+    def settle(self, n, decrypted_ok=True):
+        """Acknowledge per policy: only what is journalled, never a message that did not fully decrypt."""
+        if self.ack_policy == "saved" and decrypted_ok and self._journal is not None:
+            self.ack(n)
+        else:
+            self.stats["not_acked"] += 1
+
     def ack(self, n):
         a = n["attrs"]
         attrs = {"id": a.get("id"), "to": a.get("from"), "class": n["tag"]}
@@ -197,41 +256,76 @@ class Client:
                 self.send(N("iq", {"to": a.get("from", S_WA), "type": "result", "id": a.get("id")})); return
             return
         if tag == "message":
-            try: self._on_message(n)
-            finally: self.ack(n)
+            ok, parts = False, []
+            try:
+                with self._crypto_lock: ok, parts = self._on_message(n)
+            except Exception as e: parts = [{"error": "handler: %s" % e}]
+            self.journal(n, decrypted=parts, all_decrypted=ok)
+            self.settle(n, ok)
             return
         if tag in ("receipt", "notification"):
-            self.events.put(n); self.ack(n); return
+            self.journal(n)
+            self.events.put(n); self.settle(n); return
+        # everything else the server pushes (call offers, presence, chat state, <ib> markers, errors) is kept too
+        self.journal(n)
         if tag in ("stream:error", "failure", "xmlstreamend"):
             self.events.put(n); self.closed.set(); return
         self.events.put(n)
 
     # ---------------------------------------------------------------- Signal
     def _on_message(self, n):
+        """Decrypt every <enc> of a message. Returns (all decrypted, [part, ...]); a part carries the
+        unpadded plaintext (base64: the protobuf exactly as sent) or the error and the ciphertext."""
         a = n["attrs"]
         sender = a.get("participant") or a.get("from")
-        for enc in [c for c in (n["content"] or []) if isinstance(c, dict) and c["tag"] == "enc"]:
-            et = enc["attrs"].get("type")
-            if et not in ("msg", "pkmsg"):
-                self.tally["message:%s:%s (group, not decrypted)" % (self.sender_kind(sender), et)] += 1
-                continue                                   # group sender keys are not needed for history
-            cipher = SC.SessionCipher(self.signal, _addr(sender))
+        chat = a.get("from") or ""
+        kids = [c for c in (n["content"] or []) if isinstance(c, dict)]
+        # channel (newsletter) posts are not end-to-end encrypted: the Message protobuf comes in <plaintext>
+        encs = [c for c in kids if c["tag"] in ("enc", "plaintext")]
+        encs.sort(key=lambda e: e["attrs"].get("type") == "skmsg")   # a key handover first, then what it unlocks
+        parts, ok = [], True
+        # content the server withholds from linked devices (view-once media: <unavailable type="view_once"/>)
+        # arrives as a placeholder with no payload at all
+        for u in [c for c in kids if c["tag"] == "unavailable"]:
+            parts.append({"enc": None, "unavailable": (u.get("attrs") or {}).get("type") or "unknown"})
+            self.tally["unavailable:%s:%s" % (chat_kind(chat), parts[-1]["unavailable"])] += 1
+        for enc in encs:
+            et = "plaintext" if enc["tag"] == "plaintext" else enc["attrs"].get("type")
+            body = bytes(enc["content"] or b"")
             try:
-                body = bytes(enc["content"])
-                pt = (cipher.decrypt_prekey_whisper_message if et == "pkmsg" else cipher.decrypt_whisper_message)(body)
-                msg = WP.decode(_unpad(pt), WP.MESSAGE)
+                if et == "plaintext":
+                    pt = body
+                elif et in ("msg", "pkmsg"):
+                    cipher = SC.SessionCipher(self.signal, _addr(sender))
+                    pt = (cipher.decrypt_prekey_whisper_message if et == "pkmsg" else cipher.decrypt_whisper_message)(body)
+                elif et == "skmsg":
+                    pt = SG.GroupCipher(self.signal.sender_keys, SG.sender_key_name(chat, _addr(sender))).decrypt(body)
+                else:
+                    raise SC.SignalError("unsupported encryption type %r" % et)
+                if et != "plaintext": pt = _unpad(pt)
+                msg = WP.decode(pt, WP.MESSAGE)
+                skdm = msg.get("senderKeyDistributionMessage") or {}
+                if skdm.get("axolotlSenderKeyDistributionMessage"):
+                    SG.GroupSessionBuilder(self.signal.sender_keys).process(
+                        SG.sender_key_name(skdm.get("groupId") or chat, _addr(sender)),
+                        bytes(skdm["axolotlSenderKeyDistributionMessage"]))
                 self.stats["decrypted"] += 1
-                self.tally["message:%s:%s" % (self.sender_kind(sender), WP.message_type(msg))] += 1
-                self.signal.save()
-                self.messages.put({"from": sender, "id": a.get("id"), "category": a.get("category"),
+                kind = WP.message_type(msg)
+                self.tally["message:%s:%s:%s" % (self.sender_kind(sender), chat_kind(chat), kind)] += 1
+                parts.append({"enc": et, "type": kind, "plaintext_b64": base64.b64encode(pt).decode()})
+                self.messages.put({"from": sender, "chat": chat, "id": a.get("id"), "category": a.get("category"),
                                    "t": a.get("t"), "message": msg})
                 if a.get("category") == "peer":
                     self.send(N("receipt", {"id": a.get("id"), "to": a.get("from"), "type": "peer_msg"}))
             except Exception as e:
+                ok = False
                 self.stats["decrypt_failed"] += 1
                 self.tally["undecryptable:%s:%s" % (self.sender_kind(sender), et)] += 1
+                parts.append({"enc": et, "error": str(e), "ciphertext_b64": base64.b64encode(body).decode()})
                 self.log("could not decrypt %s from %s: %s" % (et, sender, e))
                 self.events.put({"tag": "decrypt-failed", "attrs": dict(a, enc_type=et, error=str(e))})
+        self.signal.save()
+        return ok, parts
 
     def sender_kind(self, jid):
         """own-phone / own-other-device / contact / group-member: who a message came from, for the tally."""
@@ -271,9 +365,10 @@ class Client:
 
     def send_peer(self, jid, message_bytes, attrs=None):
         """Encrypt a Message to one device of our own account and send it as a peer message. -> message id"""
-        cipher = SC.SessionCipher(self.signal, _addr(jid))
-        enc = cipher.encrypt(_pad(message_bytes))
-        self.signal.save()
+        with self._crypto_lock:
+            cipher = SC.SessionCipher(self.signal, _addr(jid))
+            enc = cipher.encrypt(_pad(message_bytes))
+            self.signal.save()
         content = [N("enc", {"v": "2", "type": enc["type"]}, enc["body"])]
         if enc["type"] == "pkmsg":
             content.append(N("device-identity", {}, base64.b64decode(self.creds["account"])))

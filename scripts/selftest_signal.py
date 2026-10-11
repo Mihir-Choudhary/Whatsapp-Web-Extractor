@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""selftest_signal.py — signal_core against itself and against libsignal-node.
+"""selftest_signal.py — signal_core and signal_group against themselves, libsignal-node and Baileys.
 
 Always: full conversations between two Python parties (session from a prekey bundle, pkmsg then msg,
 replies, several ratchet turns, out-of-order delivery, a replayed message refused, a tampered one refused,
@@ -16,6 +16,7 @@ import os, sys, json, base64, shutil, subprocess, tempfile, random
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import signal_core as S
+import signal_group as G
 
 FAIL = []
 try: sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -148,6 +149,43 @@ else:
         check("libsignal-node resumes from Python's session record",
               js_decrypt("n1", "py.1", pc.encrypt(b"back to node")) == b"back to node"
               and py_decrypt(pc, js_encrypt("n1", "py.1", b"node again")) == b"node again")
+        print("XEdDSA: libsignal-node's signatures checked in Python")
+        nb = js("n3", "new")
+        idk, spk, sig = (base64.b64decode(nb["identityKey"]), base64.b64decode(nb["signedPreKey"]["publicKey"]),
+                         base64.b64decode(nb["signedPreKey"]["signature"]))
+        check("a libsignal signature verifies", G.xeddsa_verify(idk, spk, sig))
+        bad = bytearray(sig); bad[5] ^= 1
+        check("a corrupted signature does not", not G.xeddsa_verify(idk, spk, bytes(bad)))
+        check("a signature over other data does not", not G.xeddsa_verify(idk, spk[::-1], sig))
+
+        print("group sender keys: Baileys (sender) -> python (receiver)")
+        grp = os.path.join(os.path.dirname(HERE), "tests", "crosscheck", "grp.mjs")
+        r = subprocess.run([node, grp, mods, "12"], capture_output=True, text=True)
+        if r.returncode: raise RuntimeError(r.stderr.strip()[-300:])
+        g = json.loads(r.stdout)
+        recs = {}
+        name = G.sender_key_name("123456789-1@g.us", "15550001111.0")
+        G.GroupSessionBuilder(recs).process(name, base64.b64decode(g["skdm"]))
+        gc = G.GroupCipher(recs, name)
+        order = list(range(len(g["msgs"]))); random.shuffle(order)
+        check("Python decrypts Baileys' group messages, out of order",
+              all(gc.decrypt(base64.b64decode(g["msgs"][i]["body"])) == base64.b64decode(g["msgs"][i]["plaintext"]) for i in order))
+        check("a replayed group message is refused", raises(lambda: gc.decrypt(base64.b64decode(g["msgs"][order[0]]["body"]))))
+        recs2 = {}; G.GroupSessionBuilder(recs2).process(name, base64.b64decode(g["skdm"]))
+        t = bytearray(base64.b64decode(g["msgs"][3]["body"])); t[10] ^= 1
+        check("a tampered group message is refused", raises(lambda: G.GroupCipher(recs2, name).decrypt(bytes(t))))
+        check("...and the refusal leaves the chain where it was",
+              G.GroupCipher(recs2, name).decrypt(base64.b64decode(g["msgs"][3]["body"])) == base64.b64decode(g["msgs"][3]["plaintext"]))
+        # the record shape export_signal_state.py writes from the browser: chain at an earlier position,
+        # no private key — stepping forward from it must reach every later message
+        early = {name: [{"senderKeyId": g["record"][0]["senderKeyId"],
+                         "senderChainKey": {"iteration": G.parse_distribution(base64.b64decode(g["skdm"]))["iteration"],
+                                            "seed": base64.b64encode(G.parse_distribution(base64.b64decode(g["skdm"]))["chainKey"]).decode()},
+                         "senderSigningKey": {"public": g["record"][0]["senderSigningKey"]["public"]}}]}
+        check("a stored record (browser export shape) steps forward to a later message",
+              G.GroupCipher(early, name).decrypt(base64.b64decode(g["msgs"][-1]["body"])) == base64.b64decode(g["msgs"][-1]["plaintext"]))
+        check("Baileys' own sender record loads and its key id matches",
+              G.SenderKeyRecord.deserialize(g["record"]).state().key_id == G.parse_message(base64.b64decode(g["msgs"][0]["body"]))["id"])
     except Exception as e:
         check("cross-implementation run (%s)" % e, False)
     finally:

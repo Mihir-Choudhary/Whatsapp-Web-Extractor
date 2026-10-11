@@ -140,6 +140,8 @@ for _f, _n in _MESSAGE_FIELDS.items():
     elif _n == "extendedTextMessage": MESSAGE[_f] = (_n, "m", EXTENDED_TEXT)
     elif _n == "protocolMessage": MESSAGE[_f] = (_n, "m", PROTOCOL_MESSAGE)
     elif _n == "deviceSentMessage": MESSAGE[_f] = (_n, "m", DEVICE_SENT)
+    elif _n == "senderKeyDistributionMessage": MESSAGE[_f] = (_n, "m", {1: ("groupId", "s"),
+                                                                       2: ("axolotlSenderKeyDistributionMessage", "y")})
     elif _n in _WRAPPERS: MESSAGE[_f] = (_n, "m", FUTURE_PROOF)
     elif _n in CAPTIONED: MESSAGE[_f] = (_n, "m", CAPTIONED[_n])
     else: MESSAGE[_f] = (_n, "y")          # kept as raw bytes: present (so the type is known), content untouched

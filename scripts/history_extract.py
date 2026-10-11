@@ -228,7 +228,11 @@ class Run:
         if len(askable) < len(self.anchors["anchors"]):
             say("[i] skipping %d chat(s) the primary has nothing older for" % (len(self.anchors["anchors"]) - len(askable)))
         targets = askable[:TOP]
-        self.c = WC.Client(self.creds, self.signal, log=lambda m: say("  " + m))
+        # everything the server delivers is journalled before anything is acknowledged; by default nothing is
+        # (WAWF_HISTORY_ACK=saved acknowledges what was saved and decrypted) -- see wa_client
+        self.c = WC.Client(self.creds, self.signal, log=lambda m: say("  " + m),
+                           journal=os.path.join(os.getcwd(), "received_journal.jsonl"),
+                           ack=os.environ.get("WAWF_HISTORY_ACK", "none"))
         try:
             self.c.connect()
         except ConnectionError as e:
