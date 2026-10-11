@@ -145,7 +145,9 @@ def main():
     updates = []
     import time as _time
     now = int(_time.time())
-    for (rid, dpath, fhash, ench, mkey, mime, _size, murl) in rows:
+    # Newest first: a media url's signature and the object behind it both age out, so with a --limit
+    # (or an interrupted run) the downloads go to what the CDN can still serve.
+    for (rid, dpath, fhash, ench, mkey, mime, _size, murl) in sorted(rows, key=lambda r: -(r[0] or 0)):
         body = cached.get(ench)
         src = "cache"
         if body is None and a.cdn:
@@ -160,9 +162,11 @@ def main():
                     body = cdn_get(target); src = "cdn"; dl_bytes += len(body)
                 except Exception as e:
                     code = getattr(e, "code", None)
+                    if code is None:                 # no HTTP answer at all: say what happened instead
+                        code = f"{type(e).__name__}: {getattr(e, 'reason', e)}"[:70]
                     gone[code] = gone.get(code, 0) + 1
                     if len(gone) <= 3 and gone[code] <= 2:
-                        print(f"    [cdn {code or type(e).__name__}] msg {rid}")
+                        print(f"    [cdn {code}] msg {rid}")
                     body = None
         if body is None:
             nocache += 1
