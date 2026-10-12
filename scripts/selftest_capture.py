@@ -151,6 +151,17 @@ e1 = rows.get("E1", {})
 check("an encrypted edit is decrypted with the original message's secret",
       (e1.get("action"), e1.get("target_id"), e1.get("text"), e1.get("encrypted_addon")) == ("edit", "O1", "the original", "decrypted"))
 
+print("why the server ended a session")
+check("a replaced connection names the likely cause (the browser open)",
+      "WhatsApp Web" in WC.stream_error_reason({"tag": "stream:error", "attrs": {},
+                                               "content": [{"tag": "conflict", "attrs": {"type": "replaced"}}]}))
+check("a logged-out device says so", "logged out" in WC.stream_error_reason({"tag": "stream:error", "attrs": {"code": "401"}}))
+check("a restart request says nothing was lost", "nothing was lost" in WC.stream_error_reason({"tag": "stream:error", "attrs": {"code": "515"}}))
+c, me, me_bundle = client("none", "err")
+feed(c, {"tag": "stream:error", "attrs": {}, "content": [{"tag": "conflict", "attrs": {"type": "replaced"}}]})
+check("the client keeps the reason, journals the stanza and closes",
+      c.stream_error and c.closed.is_set() and c.stats["journalled"] == 1)
+
 print("queue rows as merged into the export")
 h = QC.as_history([
     {"id": "T1", "chat": "1@g.us", "chat_kind": "group", "from_me": False, "sender": "9:3@lid", "push_name": "P",

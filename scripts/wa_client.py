@@ -42,6 +42,23 @@ def chat_kind(jid):
     if jid.endswith("@call"): return "call"
     return "1:1"
 
+def stream_error_reason(n):
+    """A <stream:error>/<failure> stanza -> one sentence an examiner can act on."""
+    a = n.get("attrs") or {}
+    kids = [c for c in (n.get("content") or []) if isinstance(c, dict)]
+    tags = {c["tag"]: (c.get("attrs") or {}) for c in kids}
+    code = str(a.get("code") or a.get("reason") or "")
+    if "conflict" in tags:
+        return ("another connection signed in as this device and replaced this one (type %s) -- is WhatsApp Web "
+                "open in the browser, or a second copy of this tool running?" % tags["conflict"].get("type", "?"))
+    if code in ("401",) or "device_removed" in str(tags) or tags.get("conflict", {}).get("type") == "device_removed":
+        return "the server says this device is logged out / no longer linked to the account (%s)" % (code or "401")
+    if code == "515":
+        return "the server asked the client to reconnect (515); nothing was lost -- run again"
+    if code == "503":
+        return "WhatsApp's server is unavailable (503); try again later"
+    return "the server ended the session (%s %s)" % (n.get("tag"), code or sorted(tags))
+
 def _pub33(b):
     return b if len(b) == 33 else b"\x05" + b
 
@@ -101,6 +118,7 @@ class Client:
         self.ack_policy = ack
         self._journal = open(journal, "a", encoding="utf-8") if journal else None
         self._last_frame = b""
+        self.stream_error = None                # why the server ended the session, if it did
         self.ws = None
         self.noise = None
         self._send_lock = threading.Lock()
@@ -269,6 +287,9 @@ class Client:
         # everything else the server pushes (call offers, presence, chat state, <ib> markers, errors) is kept too
         self.journal(n)
         if tag in ("stream:error", "failure", "xmlstreamend"):
+            if tag != "xmlstreamend":
+                self.stream_error = stream_error_reason(n)
+                self.log("SESSION ENDED BY THE SERVER: " + self.stream_error)
             self.events.put(n); self.closed.set(); return
         self.events.put(n)
 

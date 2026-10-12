@@ -18,7 +18,8 @@ Outputs: queue_journal.jsonl (append-only, fsynced per stanza), queue_messages.j
 message chat, sender, time, type, text, media keys, HD/SD association), queue_summary.json.
 
 Environment: WAWF_QUEUE_ACK=none|saved (default none), WAWF_QUEUE_MAX=seconds to wait (default 180).
-Exit codes: 0 ok, 2 login rejected / bad inputs, 4 connection failed or inputs missing.
+Exit codes: 0 ok, 2 login rejected / bad inputs, 4 connection failed or inputs missing, 6 the server ended
+the session before the end of the queue (the reason is printed: typically WhatsApp Web open in the browser).
 
 Networked; signs in as the device, so it is recorded as activity on the account. Own account / authorised
 use only.
@@ -338,13 +339,16 @@ def main():
     json.dump(as_history(rows), open("queue_for_export.json", "w", encoding="utf-8"), ensure_ascii=False)
     summ = {"finished_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "ack_policy": ACK,
             "end_of_queue_marker": offline_marker, "seconds": round(time.time() - started),
-            "stats": c.stats, "tally": dict(c.tally),
+            "stats": c.stats, "tally": dict(c.tally), "session_ended_by_server": c.stream_error,
             "messages": len(rows), "decrypted": sum(1 for r in rows if r["status"] == "decrypted"),
             "not_decrypted": sum(1 for r in rows if r["status"] != "decrypted")}
     json.dump(summ, open("queue_summary.json", "w", encoding="utf-8"), indent=1)
     say("[+] %d stanzas journalled (%d acknowledged); %d messages, %d decrypted, %d not; queue end marker %s"
         % (c.stats["journalled"], c.stats["acked"], len(rows), summ["decrypted"], summ["not_decrypted"],
            "seen" if offline_marker is not None else "NOT seen"))
+    if c.stream_error:
+        say("[!] " + c.stream_error)
+        if offline_marker is None: return 6         # the queue may be partial
     return 0
 
 

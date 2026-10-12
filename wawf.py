@@ -1750,8 +1750,12 @@ def cmd_queue(a):
         if os.path.isfile(p): AUDIT.artifact(p, kind=kind)
     AUDIT.event("server queue capture exit rc=%s" % rc, level="INFO" if rc == 0 else "ERROR", category="network",
                 detail={k: summ.get(k) for k in ("stats", "end_of_queue_marker", "messages", "decrypted", "not_decrypted")})
+    if summ.get("session_ended_by_server"):
+        log.warning("server queue: %s", summ["session_ended_by_server"])
     if rc:
-        log.error("queue capture failed (exit %s)", rc); return rc
+        log.error("queue capture failed (exit %s)%s", rc,
+                  " -- close WhatsApp Web in every browser using this profile, then run again" if rc == 6 else "")
+        return rc
     st = summ.get("stats") or {}
     log.info("server queue: %s stanzas recorded, %s acknowledged; %s messages (%s decrypted, %s not); "
              "end-of-queue marker %s", st.get("journalled"), st.get("acked"), summ.get("messages"),
