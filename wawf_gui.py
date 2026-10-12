@@ -19,7 +19,7 @@ from wawf_help import TIPS, STEPS, GUIDE
 _TOGGLE_TIPS = {"Profile folder": "profile_mode", "Separate folders": "stores_mode",
                 "Readable chats": "fmt_text", "SQLite database": "fmt_sqlite", "Raw store dump": "fmt_raw",
                 "Also download media": "fetch_media", "Also recover history": "history", "Also record what": "queue",
-                "Get it from WhatsApp": "key_online", "Use a saved key": "key_file", "Don't go online": "key_offline",
+                "Get it from WhatsApp": "key_online", "Use saved key": "key_file", "Don't go online": "key_offline",
                 "Record every step": "audit_on", "…including raw key values": "audit_secrets", "Don't record": "audit_off",
                 "Only re-ask chats": "refetch", "Allow installing Node.js": "install_node",
                 "Include key material": "raw_keys", "Detailed log": "verbose"}
@@ -442,7 +442,7 @@ class App(tk.Tk):
         self._toggle(c, "Get it from WhatsApp (signs in once as this linked device)", self.key_mode, value="online", command=self._key_mode).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
         r = ttk.Frame(c, style="Card.TFrame", padding=0); r.configure(borderwidth=0)
         r.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(4, 0)); r.columnconfigure(1, weight=1)
-        self._toggle(r, "Use a saved key (companion_enc_static.txt)", self.key_mode, value="file", command=self._key_mode).grid(row=0, column=0, sticky="w")
+        self._toggle(r, "Use saved key(s) (one per linked device)", self.key_mode, value="file", command=self._key_mode).grid(row=0, column=0, sticky="w")
         self.key = tk.StringVar()
         self.key_entry = ttk.Entry(r, textvariable=self.key, font=FONT, state="disabled")
         self.key_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0))
@@ -648,10 +648,13 @@ class App(tk.Tk):
         if d: self.out.set(os.path.normpath(d))
 
     def pick_key(self):
-        f = filedialog.askopenfilename(title="Choose companion_enc_static.txt saved by an earlier run",
-                                       filetypes=[("Saved key", "companion_enc_static*.txt"), ("Text files", "*.txt"),
-                                                  ("All files", "*.*")])
-        if f: self.key.set(os.path.normpath(f))
+        fs = filedialog.askopenfilenames(title="Choose the saved key file(s) -- one per linked device",
+                                         filetypes=[("Saved key", "companion_enc_static*.txt"), ("Text files", "*.txt"),
+                                                    ("All files", "*.*")])
+        if fs: self.key.set("; ".join(os.path.normpath(f) for f in fs))
+
+    def _keys(self):
+        return [k.strip() for k in self.key.get().split(";") if k.strip()]
 
     def _key_mode(self):
         st = "normal" if self.key_mode.get() == "file" else "disabled"
@@ -707,7 +710,7 @@ class App(tk.Tk):
                              "tick that too, or untick them.")
         if self.raw_keys.get() and not self.fmt_raw.get():
             raise ValueError("'Include key material' applies to the raw store dump; tick that output too.")
-        if mode == "file" and not os.path.isfile(self.key.get().strip()):
+        if mode == "file" and (not self._keys() or not all(os.path.isfile(k) for k in self._keys())):
             raise ValueError("Choose the companion_enc_static.txt saved by an earlier run, or get the key from WhatsApp.")
         creds = self.creds.get().strip()
         if creds and not os.path.isfile(creds):
@@ -719,7 +722,9 @@ class App(tk.Tk):
         if self.raw_keys.get(): cmd += ["--raw-include-keys"]
         if mode == "file":
             # a key file never needs the sign-in; stay offline unless something else must go online
-            cmd += ["--key", self.key.get().strip()] + ([] if (fetch or hist or queue) else ["--offline"])
+            for k in self._keys():
+                cmd += ["--key", k]
+            cmd += [] if (fetch or hist or queue) else ["--offline"]
         if mode == "offline": cmd += ["--offline"]
         if creds: cmd += ["--creds", creds]
         if fetch: cmd += ["--fetch-media"]

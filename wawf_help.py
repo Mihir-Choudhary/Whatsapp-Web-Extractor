@@ -50,8 +50,10 @@ TIPS = {
     "key_online": "Message text is encrypted with a key WhatsApp gives the browser at sign-in. This signs in once "
                   "as the linked device to get it, and saves it as companion_enc_static.txt in the results "
                   "folder.\nCommand line: (default).",
-    "key_file": "Use companion_enc_static.txt saved by an earlier run of this tool for the same profile: "
-                "decrypts without going online.\nCommand line: --key FILE --offline.",
+    "key_file": "Use companion_enc_static.txt saved by an earlier run of this tool: decrypts without going "
+                "online. Each linked device has its own key -- a profile with an earlier and a newer login needs "
+                "one for each; choose several files (each session uses the one that opens it).\n"
+                "Command line: --key FILE [--key FILE ...] --offline.",
     "key_offline": "Never contact WhatsApp. Without a key everything except message text is exported "
                    "(chats, senders, times, types, media, reactions, polls, calls, contacts, groups).\n"
                    "Command line: --offline.",
