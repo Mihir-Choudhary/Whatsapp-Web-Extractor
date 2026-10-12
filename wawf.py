@@ -304,28 +304,8 @@ def _require_source(a, cmd="<command>"):
                    "Profile locations on this system:\n%s" % (prof, _profile_help()))
 
 def _browser_running(profile):
-    """True if the browser that owns this profile is running (it holds its lock), False if not, None if
-    unknown. Chromium family: <User Data>/lockfile (Windows, held open) or SingletonLock (Linux/macOS,
-    'host-pid' link). Firefox: parent.lock in the profile (Windows) or its 'lock' link."""
-    cands = [os.path.join(os.path.dirname(os.path.abspath(profile)), n) for n in ("lockfile", "SingletonLock")]
-    cands += [os.path.join(profile, n) for n in ("parent.lock", "lock")]
-    for p in cands:
-        if os.path.islink(p):                       # 'host-pid'
-            try:
-                pid = int(os.readlink(p).rsplit("-", 1)[1])
-                os.kill(pid, 0)
-                return True
-            except (ValueError, IndexError, OSError):
-                return False
-        if os.path.isfile(p) and sys.platform == "win32":
-            try:
-                open(p, "rb").close()
-                return False
-            except PermissionError:
-                return True
-            except OSError:
-                return None
-    return None
+    import profile_identity as _pi
+    return _pi.browser_running(profile)
 
 def _has_whatsapp_storage(d):
     """Cheap test (no store is read): does this profile folder hold WhatsApp Web storage?"""
@@ -431,17 +411,33 @@ def _summary(engine, ls, msgs, meta):
     log.info("  msg types   : %s", top)
     log.info("─────────────────────────────────")
 
+def _run_with_keys(a):
+    """cmd_run with each --key in turn until one opens the session; with none that does, the session's own
+    key is captured (or, offline, it is exported without message text)."""
+    keys = list(getattr(a, "keys", None) or ([a.key] if getattr(a, "key", None) else []))
+    for k in keys:
+        a.key = k
+        rc = cmd_run(a)
+        if rc != 3:
+            return rc
+        log.info("the key in %s does not open this session", k)
+    if keys:
+        log.warning("none of the given keys opens this session (each linked device has its own key); %s",
+                    "exporting it without message text" if getattr(a, "offline", False) else "capturing its own key")
+    a.key = None
+    return cmd_run(a)
+
 def cmd_run_sessions(a):
     """The default action for a profile: every signed-in WhatsApp session in it, each exported into its own
     folder under every --out (most recent login first), unless --partition names one."""
     if getattr(a, "partition", None) or not (a.profile and _is_chromium(a.profile)):
-        return cmd_run(a)
+        return _run_with_keys(a)
     import copy as _copy
     import chromium_reader as cr
     cr.load_source(a.profile)
     rows = [r for r in cr.ACQUISITION.get("partitions", []) if r.get("account") and r.get("messages")]
     if len(rows) <= 1:
-        return cmd_run(a)
+        return _run_with_keys(a)
     rows.sort(key=lambda r: (r.get("device") is None, -(r.get("device") or 0), -(r.get("messages") or 0)))
     labels = cr.session_labels(rows)
     selected = cr.ACQUISITION.get("selected")
@@ -468,13 +464,7 @@ def cmd_run_sessions(a):
         os.environ["WAWF_PARTITION"] = r["storage_key"]
         log.info("=== session %d of %d: %s, device %s (%s) -> %s", i + 1, len(rows), r.get("account"),
                  r.get("device"), labels[i], name)
-        rc = cmd_run(sub)
-        if rc == 3 and getattr(a, "key", None):
-            log.warning("the given key does not open this session (each linked device has its own key); "
-                        "%s", "exporting it without message text" if getattr(a, "offline", False)
-                        else "capturing this session's own key")
-            sub.key = None
-            rc = cmd_run(sub)
+        rc = _run_with_keys(sub)
         done.append({"session": i + 1, "folder": name, "account": r.get("account"), "device": r.get("device"),
                      "label": labels[i], "messages": r.get("messages"), "oldest": r.get("oldest"),
                      "newest": r.get("newest"), "incomplete_tables": r.get("incomplete_tables"),
@@ -1079,8 +1069,9 @@ def cmd_decrypt(a):
         try:
             rec = (json.load(open(hf, encoding="utf-8")) or {}).get("messages") or []
             hist_added, hist_skipped, touched = WD.merge_history(chats, rec, ids, ts)
-            _from = ("the server queue" if rec and all(r.get("source") == "server-queue" for r in rec)
-                     else "the phone")
+            _n = collections.Counter(r.get("source") or "phone" for r in rec)
+            _from = " and ".join("%s (%s offered)" % ({"phone": "the phone", "server-queue": "the server queue"}
+                                                      .get(k, k), f"{v:,}") for k, v in _n.items()) or "the phone"
             log.info("merged: +%s message(s) from %s across %d chat(s); "
                      "%s already present in the browser's own store",
                      f"{hist_added:,}", _from, len(touched), f"{hist_skipped:,}")
@@ -1817,6 +1808,16 @@ def _history_export(a, targets, history_file=None):
     in. Both write the same paths -- the auto-naming that protects an EARLIER run's export happened
     once, before either call."""
     if not targets: return 0
+    qf = getattr(a, "queue_export_file", None)
+    if qf and os.path.isfile(qf):                    # this run also recorded the server queue: merge both
+        merged = []
+        for f in (history_file, qf):
+            if f and os.path.isfile(f):
+                try: merged += (json.load(open(f, encoding="utf-8")) or {}).get("messages") or []
+                except Exception as e: log.warning("could not read %s: %s", f, e)
+        history_file = os.path.join(os.path.dirname(qf), "history_and_queue_for_export.json")
+        with open(history_file, "w", encoding="utf-8") as fh:
+            json.dump({"messages": merged}, fh, ensure_ascii=False)
     ns = argparse.Namespace(profile=a.profile, origin=a.origin, out=["%s:%s" % (f, p) if f else p
                                                                      for f, p in targets],
                             key=getattr(a, "key", None), verbose=getattr(a, "verbose", False),
@@ -2476,8 +2477,10 @@ def main():
                    help="with --out raw: also dump signal-storage and wawc_db_enc. They hold the "
                         "account's Signal sessions, prekeys and the at-rest root key, so a dump that "
                         "includes them is key material and must not travel with a case.")
-    p.add_argument("--key", metavar="FILE",
+    p.add_argument("--key", metavar="FILE", action="append",
                    help="a companion_enc_static.txt captured earlier, to decrypt without touching the "
+                        "network; repeat it for a profile holding several sessions (each linked device has "
+                        "its own key, and every session is decrypted with the one that opens it). "
                         "network. Normally unnecessary: a copy left beside the output is picked up "
                         "automatically. A FILE rather than the key itself, so no secret reaches your "
                         "shell history, process list or command auditing.")
@@ -2567,6 +2570,8 @@ def main():
     g.add_argument("--log-file", metavar="FILE", help="mirror all logs (DEBUG) to this file")
 
     a = p.parse_args()
+    a.keys = a.key or []                               # --key may be repeated; code paths below take one
+    a.key = a.keys[0] if a.keys else None
     if getattr(a, "offline", False) and getattr(a, "fetch_media", False):
         _usage("--offline and --fetch-media contradict each other: downloading media contacts WhatsApp's servers")
     if getattr(a, "media_cache", None):
@@ -2594,11 +2599,17 @@ def main():
         os.environ["WAWF_PARTITION"] = a.partition       # helper subprocesses read the same session
     if getattr(a, "list_partitions", False):
         return cmd_list_partitions(a)
-    if getattr(a, "queue", False) and a.history:
-        _usage("--queue and --history are separate runs: run one, then the other")
     if getattr(a, "queue", False) and getattr(a, "offline", False):
         _usage("--queue signs in to WhatsApp's server, and --offline forbids going online")
-    if getattr(a, "queue", False):
+    if getattr(a, "queue", False) and a.history:
+        def _queue_then_history(a):
+            # the queue first (it is what the server holds now), then history; the export merges both
+            rc = cmd_queue(a)
+            if rc:
+                log.warning("server queue not recorded (exit %s); continuing with history recovery", rc)
+            return cmd_history(a)
+        a.cmd, action = "queue+history", _queue_then_history
+    elif getattr(a, "queue", False):
         def _decrypt_then_queue(a):
             # The queue first, so the export can fold it in: one timeline per chat, every row saying
             # whether it came from the browser's store or the server queue.

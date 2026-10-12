@@ -408,7 +408,10 @@ if HIST:
         jid_id(cj); chat_rowid(cj)
         if sender: jid_id(norm_jid(sender))
     messages.sort(key=lambda m: (m['chat_jid'], m['timestamp']))
-    _from = 'the server queue' if all(r.get('source') == 'server-queue' for r in HIST) else 'the phone'
+    _src = {}
+    for r in HIST: _src[r.get('source') or 'phone'] = _src.get(r.get('source') or 'phone', 0) + 1
+    _from = ' and '.join('%s (%d offered)' % ({'phone': 'the phone', 'server-queue': 'the server queue'}.get(k, k), v)
+                         for k, v in _src.items()) or 'the phone'
     print(f"[+] merged: appended {appended} message(s) from {_from} "
           f"({len(HIST) - appended} already in the store)")
 

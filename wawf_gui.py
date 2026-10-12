@@ -139,7 +139,11 @@ def profile_summary(profile):
     try:
         sys.path.insert(0, os.path.join(HERE, "scripts"))
         import profile_identity as pi
-        return pi.summary(pi.identify(profile))
+        text = pi.summary(pi.identify(profile))
+        if pi.browser_running(profile):
+            text = ("The browser is running on this profile: close it for a complete read. History recovery "
+                    "and the server queue need it closed.\n") + text
+        return text
     except Exception:
         return ""
 
@@ -694,9 +698,6 @@ class App(tk.Tk):
         if queue and mode == "offline":
             raise ValueError("Recording the server queue goes online, and 'Don't go online' is chosen. "
                              "Untick it, or choose another key option.")
-        if queue and hist:
-            raise ValueError("History recovery and recording the server queue are separate runs: "
-                             "tick one, run it, then the other.")
         if fetch and not self.fmt_sqlite.get():
             raise ValueError("Downloading media needs the SQLite database output ticked.")
         if hist and not (self.fmt_text.get() or self.fmt_sqlite.get()):

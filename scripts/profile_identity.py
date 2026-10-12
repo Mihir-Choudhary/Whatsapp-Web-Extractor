@@ -17,7 +17,7 @@ the folder name may have been changed. Its contents still say where it came from
 Everything is read, nothing is written. Each finding names the files it came from.
 """
 from __future__ import annotations
-import collections, datetime as dt, json, os, re
+import collections, datetime as dt, json, os, re, sys
 
 _CHROMIUM_MARKERS = (
     ("Microsoft Edge", ("Edge Profile.ico", "EdgeCoupons", "EdgeHubAppUsage", "EdgeSessions")),
@@ -229,6 +229,31 @@ def summary(info: dict) -> str:
     if info.get("display_name") and info.get("display_name") != info.get("original_folder_name"):
         parts.append(f"labelled '{info['display_name']}' in the browser")
     return ", ".join(parts)
+
+
+def browser_running(profile):
+    """True if the browser that owns this profile is running (it holds its lock), False if not, None if
+    unknown. Chromium family: <User Data>/lockfile (Windows, held open) or SingletonLock (Linux/macOS,
+    'host-pid' link). Firefox: parent.lock in the profile (Windows) or its 'lock' link."""
+    cands = [os.path.join(os.path.dirname(os.path.abspath(profile)), n) for n in ("lockfile", "SingletonLock")]
+    cands += [os.path.join(profile, n) for n in ("parent.lock", "lock")]
+    for p in cands:
+        if os.path.islink(p):                       # 'host-pid'
+            try:
+                pid = int(os.readlink(p).rsplit("-", 1)[1])
+                os.kill(pid, 0)
+                return True
+            except (ValueError, IndexError, OSError):
+                return False
+        if os.path.isfile(p) and sys.platform == "win32":
+            try:
+                open(p, "rb").close()
+                return False
+            except PermissionError:
+                return True
+            except OSError:
+                return None
+    return None
 
 
 if __name__ == "__main__":
