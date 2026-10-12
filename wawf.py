@@ -2289,9 +2289,9 @@ def cmd_list_partitions(a):
     import chromium_reader as cr
     cr.load_source(a.profile)
     rows = cr.ACQUISITION.get("partitions", [])
-    print("WhatsApp sessions in %s:" % a.profile)
-    for line in cr.session_summary(rows):
-        print(line)
+    if len(rows) == 1 and not rows[0].get("incomplete_tables"):     # the reader logs the summary for 2+
+        for line in cr.session_summary(rows):
+            print(line)
     print("Select one with --partition <account>:<device> (for example %s) or its storage key:" %
           next((r.get("wid") for r in rows if r.get("wid")), "919000000000:3"))
     for i, r in enumerate(rows):
