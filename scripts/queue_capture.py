@@ -243,6 +243,7 @@ def readable(journal_path: str, own=()) -> list:
             try:
                 pt = base64.b64decode(p["plaintext_b64"])
                 c = _content(pt)
+                if p.get("state"): c["decrypted_with"] = p["state"]
                 if c.get("type") == "secretEncryptedMessage":
                     dec, tid, why = decrypt_secret_message(pt, sender, originals)
                     if dec is not None:
@@ -306,6 +307,19 @@ def main():
                                                                          len(state.get("senderKeys") or {})))
     jpath = os.path.abspath("queue_journal.jsonl")
     c = WC.Client(creds, signal, log=lambda m: say("  " + m), journal=jpath, ack=ACK)
+    # further states to try (WAWF_QUEUE_EXTRA_STATE, os.pathsep-separated): each is COPIED here first,
+    # so the original is never advanced by this run
+    for i, src in enumerate(p for p in os.environ.get("WAWF_QUEUE_EXTRA_STATE", "").split(os.pathsep) if p):
+        try:
+            st = json.load(open(src, encoding="utf-8"))
+            if int(st.get("registrationId") or -1) != int(state.get("registrationId") or -2):
+                say("[i] extra state %s is for another registration -- not used" % src); continue
+            copy = os.path.abspath("extra_state_%d.json" % (i + 1))
+            json.dump(st, open(copy, "w", encoding="utf-8"))
+            c.fallbacks.append(("extra state %d (%s)" % (i + 1, os.path.basename(src)), WC.SignalState(st, copy)))
+            say("[i] also trying extra state %d: %s" % (i + 1, src))
+        except Exception as e:
+            say("[i] extra state %s not usable: %s" % (src, e))
     say("[i] acknowledgements: %s" % ("NONE -- the server keeps the queue" if ACK == "none"
                                       else "after saving, for fully decrypted messages only"))
     try:

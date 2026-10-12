@@ -119,6 +119,10 @@ class Client:
         self._journal = open(journal, "a", encoding="utf-8") if journal else None
         self._last_frame = b""
         self.stream_error = None                # why the server ended the session, if it did
+        # Further Signal states to try when this one cannot decrypt a message: a state this tool left
+        # after talking to the account's phone is NEWER than the browser's for the phone's sessions
+        # (the phone encrypts to whichever ratchet it last heard from). Never used to send.
+        self.fallbacks = []                     # [(label, SignalState)]
         self.ws = None
         self.noise = None
         self._send_lock = threading.Lock()
@@ -314,13 +318,11 @@ class Client:
             et = "plaintext" if enc["tag"] == "plaintext" else enc["attrs"].get("type")
             body = bytes(enc["content"] or b"")
             try:
+                used = None
                 if et == "plaintext":
                     pt = body
-                elif et in ("msg", "pkmsg"):
-                    cipher = SC.SessionCipher(self.signal, _addr(sender))
-                    pt = (cipher.decrypt_prekey_whisper_message if et == "pkmsg" else cipher.decrypt_whisper_message)(body)
-                elif et == "skmsg":
-                    pt = SG.GroupCipher(self.signal.sender_keys, SG.sender_key_name(chat, _addr(sender))).decrypt(body)
+                elif et in ("msg", "pkmsg", "skmsg"):
+                    pt, used = self._decrypt_any(et, body, sender, chat)
                 else:
                     raise SC.SignalError("unsupported encryption type %r" % et)
                 if et != "plaintext": pt = _unpad(pt)
@@ -334,6 +336,7 @@ class Client:
                 kind = WP.message_type(msg)
                 self.tally["message:%s:%s:%s" % (self.sender_kind(sender), chat_kind(chat), kind)] += 1
                 parts.append({"enc": et, "type": kind, "plaintext_b64": base64.b64encode(pt).decode()})
+                if used: parts[-1]["state"] = used
                 self.messages.put({"from": sender, "chat": chat, "id": a.get("id"), "category": a.get("category"),
                                    "t": a.get("t"), "message": msg})
                 if a.get("category") == "peer":
@@ -347,6 +350,28 @@ class Client:
                 self.events.put({"tag": "decrypt-failed", "attrs": dict(a, enc_type=et, error=str(e))})
         self.signal.save()
         return ok, parts
+
+    def _decrypt_one(self, store, et, body, sender, chat):
+        if et == "skmsg":
+            return SG.GroupCipher(store.sender_keys, SG.sender_key_name(chat, _addr(sender))).decrypt(body)
+        cipher = SC.SessionCipher(store, _addr(sender))
+        return (cipher.decrypt_prekey_whisper_message if et == "pkmsg" else cipher.decrypt_whisper_message)(body)
+
+    def _decrypt_any(self, et, body, sender, chat):
+        """-> (plaintext, None) with the device's state, or (plaintext, label) with a fallback; raises
+        the device state's error when none decrypts. A key handover processed while decrypting with a
+        fallback is processed into the main state too (see _on_message)."""
+        try:
+            return self._decrypt_one(self.signal, et, body, sender, chat), None
+        except Exception as first:
+            for label, store in self.fallbacks:
+                try:
+                    pt = self._decrypt_one(store, et, body, sender, chat)
+                    store.save()
+                    return pt, label
+                except Exception:
+                    continue
+            raise first
 
     def sender_kind(self, jid):
         """own-phone / own-other-device / contact / group-member: who a message came from, for the tally."""

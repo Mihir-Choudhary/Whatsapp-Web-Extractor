@@ -151,6 +151,20 @@ e1 = rows.get("E1", {})
 check("an encrypted edit is decrypted with the original message's secret",
       (e1.get("action"), e1.get("target_id"), e1.get("text"), e1.get("encrypted_addon")) == ("edit", "O1", "the original", "decrypted"))
 
+print("a further Signal state, tried when the device's own cannot decrypt")
+c, me, me_bundle = client("none", "fb")
+other, other_bundle = party(6006)                     # a state that holds the session the sender used
+bob3, _ = party(7007)
+S.SessionBuilder(bob3, "x").init_outgoing(other_bundle)
+bob3.sessions["15550000000.0"] = bob3.sessions.pop("x")
+m = S.SessionCipher(bob3, "15550000000.0").encrypt(WC._pad(WP.encode({"conversation": "only the other state can read this"}, WP.MESSAGE)))
+c.fallbacks.append(("extra state 1", other))
+feed(c, {"tag": "message", "attrs": {"id": "F1", "from": "15552223333@s.whatsapp.net", "t": "1760000040", "type": "text"},
+         "content": [enc_node(m["type"], m["body"])]})
+f1 = {r["id"]: r for r in QC.readable(os.path.join(tmp, "j_fb.jsonl"))}.get("F1", {})
+check("the fallback decrypts it and the row says which state did",
+      f1.get("text") == "only the other state can read this" and f1.get("decrypted_with") == "extra state 1")
+
 print("why the server ended a session")
 check("a replaced connection names the likely cause (the browser open)",
       "WhatsApp Web" in WC.stream_error_reason({"tag": "stream:error", "attrs": {},

@@ -1736,6 +1736,13 @@ def cmd_queue(a):
         qcmd = [sys.executable, os.path.join(HERE, "scripts", "queue_capture.py")]
     env = dict(AUDIT.child_env() or os.environ)
     env.update(PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYINSTALLER_RESET_ENVIRONMENT="1")
+    # The state this tool's own history runs left for this device (if any): after talking to the phone,
+    # its sessions with the phone are newer than the browser's, and the phone encrypts to them.
+    extra = [p for p in (os.path.join(d, "signal_runtime.py.json") for d in
+                         (os.path.join(HERE, "tools", "reconnect"), _pick_work_dir())) if os.path.isfile(p)]
+    if extra and not env.get("WAWF_QUEUE_EXTRA_STATE"):
+        env["WAWF_QUEUE_EXTRA_STATE"] = os.pathsep.join(extra)
+        log.info("also trying the Signal state this tool's history runs left: %s", ", ".join(extra))
     AUDIT.event("server queue capture start", category="network",
                 detail={"argv": qcmd, "cwd": work, "ack_policy": env.get("WAWF_QUEUE_ACK", "none")})
     rc = subprocess.run(qcmd, cwd=work, env=env).returncode
