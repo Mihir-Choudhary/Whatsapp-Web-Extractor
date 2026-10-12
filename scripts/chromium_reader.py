@@ -651,6 +651,17 @@ def load_source(profile: str, partition: str | None = None) -> dict:
     try:
         lss = read_localstorage_all(profile)
         parts = find_partitions(profile)
+        if partition is not None:
+            # a named session: identified from localStorage alone, so only its store is read
+            want = str(partition).lstrip("+")
+            def _matches(p):
+                sk = _norm_key(p["storage_key"]) if p["storage_key"] else None
+                ls = lss.get(sk, {}) if sk else {}
+                return (sk and sk == _norm_key(partition)) or p.get("layout") == partition \
+                    or (_wid(ls) or "") == want or (":" not in want and _account(ls) == want)
+            only = [p for p in parts if _matches(p)]
+            if len(only) == 1:
+                parts = only
         results = []
         for n, p in enumerate(parts, 1):
             mb = _dir_mb(p["leveldb"])
@@ -718,12 +729,19 @@ def load_source(profile: str, partition: str | None = None) -> dict:
         res = {"localStorage": chosen[3] if chosen else {}, "idb": chosen[2] if chosen else {}}
         _CACHE[ck] = res
         if disk:
-            try:
-                import pickle
-                with open(disk, "wb") as fh:
-                    pickle.dump((res, dict(ACQUISITION)), fh, protocol=pickle.HIGHEST_PROTOCOL)
-            except Exception as e:
-                log.debug("could not write source cache: %s", e)
+            # every session's stores, so a run for another session of this profile reads no store again
+            import pickle
+            for r in results:
+                ck_r = (os.path.abspath(profile), r[1]) if r is not chosen else ck
+                path_r = _disk_cache_path(ck_r)
+                if not path_r: continue
+                acq_r = dict(ACQUISITION, selected=r[1], selected_layout=r[0]["layout"],
+                             partitions=[dict(x, selected=(x["storage_key"] == r[1])) for x in ACQUISITION["partitions"]])
+                try:
+                    with open(path_r, "wb") as fh:
+                        pickle.dump(({"localStorage": r[3], "idb": r[2]}, acq_r), fh, protocol=pickle.HIGHEST_PROTOCOL)
+                except Exception as e:
+                    log.debug("could not write source cache: %s", e)
         return res
     finally:
         cleanup()
