@@ -588,6 +588,7 @@ class App(tk.Tk):
                 self.profile_help.configure(style="Help.TLabel", text="This folder holds %d browser profiles with "
                                             "WhatsApp Web; pick one:\n  " % len(found) + "\n  ".join(found))
                 self.profile_box["values"] = found
+                self._accounts = []; self.acct_row.grid_remove()
                 return
         threading.Thread(target=lambda: self.q.put(("__accounts__", p, session_accounts(p))), daemon=True).start()
         threading.Thread(target=lambda: self.q.put(("__identity__", p, profile_summary(p))), daemon=True).start()
