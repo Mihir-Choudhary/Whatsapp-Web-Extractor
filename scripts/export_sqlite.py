@@ -257,7 +257,7 @@ if _refs and _good < len(_refs) * 0.5:
     A.crypto("verify", algorithm="AES-CBC-128", key=MSGKEY, validated="FAILED",
              input_desc="strict PKCS7 on reference bodies", records_in=len(_refs), records_ok=_good)
     A.end_run(3, status="error", error=RuntimeError("companion_enc_static INVALID (%d/%d)" % (_good, len(_refs))))
-    print(f"ERROR: companion_enc_static is INVALID for this profile/device — only {_good}/{len(_refs)} "
+    print(f"{'[i]' if os.environ.get('WAWF_KEY_TRIAL') else 'ERROR:'} companion_enc_static is INVALID for this profile/device — only {_good}/{len(_refs)} "
           f"reference message bodies validate. Refusing to write a garbage msgstore. (Wrong key, empty key, "
           f"or wrong browser's salt.)"); sys.exit(3)
 if MSGKEY:

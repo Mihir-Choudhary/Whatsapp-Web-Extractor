@@ -556,7 +556,7 @@ def session_labels(rows):
     for acct, devs in by_acct.items():
         top = max(devs)[0]
         for d, i in devs:
-            out[i] = "most recent login" if d == top else "earlier login (replaced by device %d)" % top
+            out[i] = "most recent login" if d == top else "earlier login, replaced by device %d" % top
     for i, r in enumerate(rows):
         if i not in out:
             out[i] = "no signed-in account" if not r.get("account") else "signed in (device unknown)"

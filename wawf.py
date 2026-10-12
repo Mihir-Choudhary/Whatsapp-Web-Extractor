@@ -312,30 +312,9 @@ def _browser_running(profile):
     import profile_identity as _pi
     return _pi.browser_running(profile)
 
-def _has_whatsapp_storage(d):
-    """Cheap test (no store is read): does this profile folder hold WhatsApp Web storage?"""
-    if os.path.isdir(os.path.join(d, "storage", "default", "https+++web.whatsapp.com")):
-        return True
-    idb = os.path.join(d, "IndexedDB")
-    if os.path.isdir(idb) and any(n.startswith("https_web.whatsapp.com") for n in os.listdir(idb)):
-        return True
-    if os.path.isdir(os.path.join(d, "WebStorage")):
-        import chromium_reader as _cr
-        return bool(_cr._quota_buckets(d))       # the bucket index names each bucket's site
-    return False
-
 def _nested_profiles(root, depth=4):
-    """Profile folders with WhatsApp Web storage under `root`, at most `depth` levels down."""
-    out = []
-    for cur, dirs, _ in os.walk(root):
-        rel = os.path.relpath(cur, root)
-        level = 0 if rel == "." else rel.count(os.sep) + 1
-        if level > depth:
-            dirs[:] = []; continue
-        if level and (_is_chromium(cur) or os.path.isdir(os.path.join(cur, "storage", "default"))) \
-                and _has_whatsapp_storage(cur):
-            out.append(os.path.normpath(cur)); dirs[:] = []          # do not descend into a profile
-    return sorted(out)
+    import profile_identity as _pi
+    return _pi.nested_profiles(root, depth)
 
 def _require_session(ls, what="that profile"):
     """A browser can hold WhatsApp Web storage without being a logged-in session (site merely visited, or
@@ -420,12 +399,17 @@ def _run_with_keys(a):
     """cmd_run with each --key in turn until one opens the session; with none that does, the session's own
     key is captured (or, offline, it is exported without message text)."""
     keys = list(getattr(a, "keys", None) or ([a.key] if getattr(a, "key", None) else []))
-    for k in keys:
+    for i, k in enumerate(keys):
         a.key = k
-        rc = cmd_run(a)
+        if i < len(keys) - 1:
+            os.environ["WAWF_KEY_TRIAL"] = "1"         # another key follows: a mismatch is expected
+        try:
+            rc = cmd_run(a)
+        finally:
+            os.environ.pop("WAWF_KEY_TRIAL", None)
         if rc != 3:
             return rc
-        log.info("the key in %s does not open this session", k)
+        log.info("the key in %s does not open this session; trying the next", k)
     if keys:
         log.warning("none of the given keys opens this session (each linked device has its own key); %s",
                     "exporting it without message text" if getattr(a, "offline", False) else "capturing its own key")
@@ -476,9 +460,11 @@ def cmd_run_sessions(a):
         log.info("=== session %d of %d: %s, device %s (%s) -> %s", i + 1, len(rows), r.get("account"),
                  r.get("device"), labels[i], name)
         rc = _run_with_keys(sub)
+        utc = lambda t: dt.datetime.fromtimestamp(t, dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if t else None
         done.append({"session": i + 1, "folder": name, "account": r.get("account"), "device": r.get("device"),
                      "label": labels[i], "messages": r.get("messages"), "oldest": r.get("oldest"),
-                     "newest": r.get("newest"), "incomplete_tables": r.get("incomplete_tables"),
+                     "newest": r.get("newest"), "oldest_utc": utc(r.get("oldest")), "newest_utc": utc(r.get("newest")),
+                     "incomplete_tables": r.get("incomplete_tables"),
                      "storage_key": r.get("storage_key"), "exit": rc})
         rc_all = rc_all or rc
     os.environ.pop("WAWF_PARTITION", None)
@@ -913,7 +899,7 @@ def cmd_raw(a):
             if decrypt(_op)[0] is not None:
                 _good += 1
         if _refs and _good < len(_refs) * 0.5:
-            log.error("the at-rest key is INVALID for this profile/device (%d/%d reference bodies "
+            (log.info if os.environ.get("WAWF_KEY_TRIAL") else log.error)("the at-rest key is INVALID for this profile/device (%d/%d reference bodies "
                       "validate). Refusing to write a raw dump with nothing decrypted in it.",
                       _good, len(_refs))
             return 3
@@ -1032,7 +1018,8 @@ def cmd_decrypt(a):
                 if strict(Cipher(algorithms.AES(key), modes.CBC(m["iv"])).decryptor().update(m["data"])): good += 1
             except Exception as e: log.debug("ref decrypt error: %s", e)
         if refs and good < len(refs) * 0.5:
-            log.error("companion_enc_static INVALID for this profile/device (%d/%d refs validate). Not writing garbage.", good, len(refs))
+            (log.info if os.environ.get("WAWF_KEY_TRIAL") else log.error)(
+                "companion_enc_static INVALID for this profile/device (%d/%d refs validate). Not writing garbage.", good, len(refs))
             AUDIT.crypto("verify", algorithm="AES-CBC-128", key=key, validated="FAILED",
                          input_desc="strict PKCS7 on reference ciphertexts", records_in=len(refs), records_ok=good)
             return 3

@@ -134,6 +134,18 @@ def _ls_mentions_wa(ls_dir):
             pass
     return False
 
+def _is_profile(p):
+    return os.path.isdir(os.path.join(p, "IndexedDB")) or os.path.isdir(os.path.join(p, "WebStorage")) \
+        or os.path.isdir(os.path.join(p, "storage", "default"))
+
+def _nested(p):
+    try:
+        sys.path.insert(0, os.path.join(HERE, "scripts"))
+        import profile_identity as pi
+        return pi.nested_profiles(p)
+    except Exception:
+        return []
+
 def profile_summary(profile):
     """Browser, version and original location, read from the folder's own files (see profile_identity)."""
     try:
@@ -163,7 +175,7 @@ def session_accounts(profile):
         cr.cleanup()
         rows.sort(key=lambda r: -(r["device"] or 0))
         labels = cr.session_labels(rows)
-        return [("%s · device %s (%s)" % (r["account"], r["device"] if r["device"] is not None else "?", labels[i]),
+        return [("%s · device %s · %s" % (r["account"], r["device"] if r["device"] is not None else "?", labels[i]),
                  r["wid"]) for i, r in enumerate(rows)]
     except Exception:
         return []
@@ -567,6 +579,16 @@ class App(tk.Tk):
     def _check_profile(self):
         p = self._profile_path()
         if not p: return
+        if os.path.isdir(p) and not _is_profile(p):
+            # the profile may be inside the chosen folder: use it when there is exactly one
+            found = _nested(p)
+            if len(found) == 1:
+                self.profile.set(found[0]); p = found[0]
+            elif len(found) > 1:
+                self.profile_help.configure(style="Help.TLabel", text="This folder holds %d browser profiles with "
+                                            "WhatsApp Web; pick one:\n  " % len(found) + "\n  ".join(found))
+                self.profile_box["values"] = found
+                return
         threading.Thread(target=lambda: self.q.put(("__accounts__", p, session_accounts(p))), daemon=True).start()
         threading.Thread(target=lambda: self.q.put(("__identity__", p, profile_summary(p))), daemon=True).start()
         self.profile_help.configure(style="Help.TLabel", text=p)

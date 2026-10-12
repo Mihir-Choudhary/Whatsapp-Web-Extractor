@@ -866,7 +866,8 @@ def write_transcripts(path, chats, ids):
     chat header lists its senders with every jid form they appear under, so any line can be traced
     back to an identifier. `->` is outgoing, `<-` incoming."""
     with open(path, "w", encoding="utf-8") as f:   # emoji/non-Latin text -> pin UTF-8 (Windows is cp1252)
-        f.write("# Names resolved from the examined profile's own contact/group stores: address-book\n"
+        f.write("# All times are UTC.\n"
+                "# Names resolved from the examined profile's own contact/group stores: address-book\n"
                 "# name, else WhatsApp pushname, else phone number, else the raw jid unchanged.\n"
                 "# Each chat header lists its senders and their jid forms. '->' sent, '<-' received.\n"
                 "# A message that spans lines is continued under '|', and 're:' is the message being\n"
