@@ -68,8 +68,8 @@ background apps*), then copy the profile folder. A browser that is running keeps
 stores, and a copy taken meanwhile is torn: tables come out zero-length or half-written, the write-ahead
 log is cut mid-record, and IndexedDB can lose its own database and store names. On such a copy the tool
 still reads everything that survived, names the stores by their record fields, and reports exactly what
-could not be read — but what was lost is lost. Measured on one profile: a live copy kept 388,967 of
-409,165 messages and lost the key store, so it could not be decrypted at all.
+could not be read — but what was lost is lost. A live copy can lose recent tables, including the key
+store, and then nothing can be decrypted.
 
 Current Chromium/Edge builds can keep WhatsApp Web under a *partitioned* storage key, in
 `WebStorage/<n>/IndexedDB` with its own localStorage, instead of the classic
@@ -262,20 +262,18 @@ healthy profile it is zero; anything else is a gap in the evidence, not a gap in
 
 ## What a browser holds — and what it does not
 
-Measured on one account by examining a freshly linked Edge profile and comparing it, record by record,
-with a decrypted Android backup of the same phone taken minutes later. Expect the proportions to vary;
-the kinds of gap do not.
+What WhatsApp Web keeps in a browser profile, compared with the phone it is linked to.
 
 | | In the browser | Notes |
 |---|---|---|
-| **Messages** | about the last **90 days** per chat (409,165 here; the phone held 3.49 million going back years) | the window is what the phone sends at link time. Within it, 96% of the phone's messages for the same chats were present; whole chats can be missing (the phone had more chats active in those 90 days than the browser received). `--history` asks the phone for more. |
-| Message text | decrypted with the key from sign-in; 99.5% identical to the phone's own text | view-once captions and messages WhatsApp Web recorded as `unknown` ("waiting for this message") have no content in the browser |
+| **Messages** | about the last **90 days** per chat | the window is what the phone sends at link time; whole chats can be missing (the phone sends a selection of its active chats). `--history` asks the phone for more. |
+| Message text | decrypted with the key from sign-in | view-once captions and messages WhatsApp Web recorded as `unknown` ("waiting for this message") have no content in the browser |
 | Link previews, locations, polls (with options), events | yes, as separate fields and Android tables | decoded with WhatsApp Web's own schema for the message record |
-| **Ticks** (sent / delivered / read / played) | yes, for every message sent from the account; 99.8% equal to the phone | |
-| Per-recipient receipts (who read it when) | **only** for messages whose *Message info* was opened in the browser | 32 records here, against 692,804 on the phone |
-| **Calls** | the recent window only (here the last ~12 days: 201 calls, exactly the phone's count for the same days) | outcome, duration, video, participants |
+| **Ticks** (sent / delivered / read / played) | yes, for every message sent from the account | in a group the state covers all members: two ticks only once everyone has it |
+| Per-recipient receipts (who read it when) | **only** for messages whose *Message info* was opened in the browser | the phone keeps far more |
+| **Calls** | the recent window only | outcome, duration, video, participants |
 | **Contacts** | yes: name, pushname, lid ↔ phone number, username, *about* text, business names | `contacts.csv`, `identities.json`, `wa.db` |
-| **Groups** | members, admins, past members with *left/removed* and when, subject, description, settings | 99.3% of memberships match the phone; the difference is the owner, whom the phone stores as itself |
+| **Groups** | members, admins, past members with *left/removed* and when, subject, description, settings | the phone stores the owner as itself |
 | Reactions, mentions, pins, labels, channels, blocklist | yes | |
 | Albums, HD copies, motion photos | the links between them: albums and HD video copies in `message_association`, every link as the browser recorded it in `wawf_message_association` | the browser labels HD photo copies and motion photos alike, so those are not given an Android type; it keeps no media key for any HD copy (the HD file is only in the live server queue) |
 | Statuses (stories) | **no** — not written to disk | status updates posted while the browser was closed are in the server queue: `--queue` records them, with media keys |
@@ -285,7 +283,7 @@ the kinds of gap do not.
 | **What the server is holding** | not on disk until the browser next connects | `--queue` records it — see below |
 | History before the link | not on disk | each history chunk is downloaded once and deleted from the server; a network log of the sync shows the downloads but cannot be decrypted after the fact (its keys never leave the browser's memory) |
 
-Where a number above says the browser has less, that is the browser's content, not a reading gap: the
+Where the browser has less, that is the browser's content, not a reading gap: the
 export says so in its counts and in `body_status`, rather than filling anything in.
 
 ## Chain of custody (on by default)
