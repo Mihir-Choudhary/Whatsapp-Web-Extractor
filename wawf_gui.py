@@ -747,11 +747,32 @@ class App(tk.Tk):
         cmd += ["--log-file", os.path.join(out, "wawf.log")]
         return cmd, out
 
+    def _running(self):
+        try:
+            sys.path.insert(0, os.path.join(HERE, "scripts"))
+            import profile_identity as pi
+            return bool(pi.browser_running(self._profile_path()))
+        except Exception:
+            return False
+
     def start(self):
         try:
             cmd, out = self._command()
         except ValueError as e:
             messagebox.showwarning("WhatsApp Web Extractor", str(e)); return
+        if (self.queue.get() or self.history.get()) and self.src_mode.get() == "profile" and self._running():
+            go = messagebox.askyesno(
+                "The browser is open on this profile",
+                "Recording the server queue and recovering history both need this browser closed:\n\n"
+                "• while WhatsApp Web is open it receives everything itself, so the server holds nothing for "
+                "this device;\n"
+                "• the phone sends history to the device's open connection -- the browser -- not to this tool.\n\n"
+                "Close the browser and press Start again to include them.\n\n"
+                "Continue now without them? (the export, the key and the media download work with it open)")
+            if not go:
+                return
+            self.queue.set(False); self.history.set(False)
+            cmd, out = self._command()
         if self.history.get() and not messagebox.askyesno(
                 "Recover history from the phone",
                 "This signs in as the linked device and asks the phone for older messages, chat by chat. "

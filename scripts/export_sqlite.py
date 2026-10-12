@@ -784,18 +784,22 @@ _secs=[m['timestamp']/1000 for m in messages if m.get('timestamp') and 1e9 < m['
 def _d(t): return _dt.datetime.fromtimestamp(t, _dt.timezone.utc).strftime('%Y-%m-%d')
 _cset=set(m['chat_jid'] for m in messages if m.get('chat_jid'))
 _grp=sum(1 for c in _cset if c.endswith('@g.us')); _sent=sum(1 for m in messages if m.get('from_me'))
-_media=sum(1 for m in messages if m.get('media'))
+_media=sum(1 for m in messages if m.get('media') and m.get('message_type') != 0)
+_previews=sum(1 for m in messages if m.get('media') and m.get('message_type') == 0)   # link-preview images
 print('──────────── summary ────────────')
 print(f'  messages    : {len(messages):,} total   ({_sent:,} sent / {len(messages)-_sent:,} received)')
 print(f'  date range  : {(_d(min(_secs)) if _secs else "?")}  →  {(_d(max(_secs)) if _secs else "?")}')
 print(f'  chats       : {len(_cset)}   ({len(_cset)-_grp} direct, {_grp} groups)')
 print(f'  contacts    : {len(contacts):,}   ·   groups: {len(groups):,}   ·   chats(saved): {len(chats):,}')
-print(f'  media msgs  : {_media:,}   ·   reactions: {rx:,}   ·   calls: {len(call_objs):,}')
+print(f'  media msgs  : {_media:,}' + (f' (+{_previews:,} link-preview images)' if _previews else '')
+      + f'   ·   reactions: {rx:,}   ·   calls: {len(call_objs):,}')
 print(f'  associations: {na:,} albums / HD video copies linked   ·   {nwa:,} as the browser recorded them (wawf_message_association)')
 print('─────────────────────────────────')
 print(f"  media       : {decrypted:,} file(s) from {blobs:,} cached blob(s)"
       + (f"; {len(byench):,} distinct media object(s) have keys" if byench else ""))
-if byench and decrypted < len(byench):
+if byench and decrypted < len(byench) and os.environ.get("WAWF_FETCH_MEDIA") == "1":
+    print("  [i] the rest were never cached by the browser; they are downloaded from WhatsApp's servers next")
+elif byench and decrypted < len(byench):
     print("  [i] the rest were never cached by the browser (or the cache has since been evicted). Their "
           "mediaKeys ARE in message_media — fetch them with:")
     print(f"      python3 scripts/mediafetch.py --db {mp} --profile <profile> --cdn")

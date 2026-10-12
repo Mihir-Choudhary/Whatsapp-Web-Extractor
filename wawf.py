@@ -261,6 +261,8 @@ def _usage(msg):
     log.error("%s", msg)
     raise SystemExit(2)
 
+_WARNED = {}
+
 def _require_source(a, cmd="<command>"):
     """Every data command needs an explicit profile (or Firefox --origin). Nothing is guessed: which
     profile gets examined is always the user's choice. Fail with the paths to look in, not a bare usage line."""
@@ -292,11 +294,14 @@ def _require_source(a, cmd="<command>"):
             elif len(found) > 1:
                 _usage("that folder holds %d browser profiles with WhatsApp Web storage; pass the one to examine:\n  %s"
                        % (len(found), "\n  ".join(found)))
-        if (chromium or firefox) and _browser_running(prof):
-            a.browser_running = True
-            log.warning("the browser is running on this profile. Its storage changes while it is read, and the "
-                        "newest writes may not be in the copy -- close the browser for a complete, consistent "
-                        "read. Signing in as its linked device (--queue, --history) is refused while it runs.")
+        if (chromium or firefox) and not getattr(a, "_running_checked", False):
+            a._running_checked = True
+            a.browser_running = bool(_browser_running(prof))
+        if (chromium or firefox) and a.browser_running and not _WARNED.get("running"):
+            _WARNED["running"] = True
+            log.warning("the browser is running on this profile: what it writes during the read may be missing "
+                        "-- close it for a complete read. The export and the key work while it runs; the server "
+                        "queue and history do not (they need the device's connection, which the browser holds).")
         if not chromium and not firefox:
             _usage("that directory is not a browser profile with WhatsApp Web storage:\n  %s\n\n"
                    "Expected either an IndexedDB folder (Chrome/Edge/Brave/Opera) or\n"
@@ -1855,7 +1860,9 @@ def cmd_queue(a):
     no presence)."""
     _require_source(a, "queue")
     if getattr(a, "browser_running", False):
-        log.error("--queue signs in as the linked device the open browser is using; close the browser first")
+        log.warning("server queue skipped: the browser is running on this profile. While WhatsApp Web is open it "
+                    "receives everything itself, so the server holds nothing for this device; close the browser "
+                    "and record the queue later (it fills while the browser stays closed).")
         return 2
     if a.profile and _is_chromium(a.profile):
         eng = ["--profile", a.profile]
@@ -1962,7 +1969,9 @@ def cmd_history(a):
     # engine args shared by creds / signal-state / anchors
     _require_source(a, "history")                           # a profile (or --origin) is required; nothing is auto-detected
     if getattr(a, "browser_running", False):
-        log.error("--history signs in as the linked device the open browser is using; close the browser first")
+        log.warning("history skipped: the browser is running on this profile. The phone sends history to the "
+                    "device's open connection -- the browser -- so this tool would not receive it; close the "
+                    "browser to recover history.")
         return 2
     if a.profile and _is_chromium(a.profile):
         eng = ["--profile", a.profile]
@@ -2588,6 +2597,8 @@ def main():
     g.add_argument("--log-file", metavar="FILE", help="mirror all logs (DEBUG) to this file")
 
     a = p.parse_args()
+    if getattr(a, "fetch_media", False):
+        os.environ["WAWF_FETCH_MEDIA"] = "1"            # helpers word their hints for a run that downloads
     a.keys = a.key or []                               # --key may be repeated; code paths below take one
     a.key = a.keys[0] if a.keys else None
     if getattr(a, "offline", False) and getattr(a, "fetch_media", False):
