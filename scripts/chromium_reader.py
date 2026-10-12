@@ -214,6 +214,22 @@ def _harden_ccl():
     L.LogFile._get_batches = _batches
     L.ManifestFile._get_batches = _batches
     L.RawLevelDb.__init__ = _init
+
+    # LevelDB blocks are Snappy-compressed; ccl decodes them in pure Python, which dominates the read of
+    # a large store. cramjam's compiled decoder gives the same bytes; the original is kept as a fallback.
+    try:
+        import cramjam
+        snappy = L.ccl_simplesnappy
+        slow = snappy.decompress
+        def _fast(buff):
+            data = buff.read()
+            try:
+                return bytes(cramjam.snappy.decompress_raw(data))
+            except Exception:
+                return slow(io.BytesIO(data))
+        snappy.decompress = _fast
+    except ImportError:
+        pass
     _HARDENED = True
 
 
@@ -589,6 +605,25 @@ def session_summary(rows):
                          % r["deleted_files_ignored"])
     return lines
 
+class _Heartbeat:
+    """Logs a line every `every` seconds until stopped, so a long read is visibly alive."""
+    def __init__(self, what, t0, every=20):
+        import threading
+        self.what, self.t0, self.every = what, t0, every
+        self._stop = threading.Event()
+        threading.Thread(target=self._run, daemon=True).start()
+    def _run(self):
+        while not self._stop.wait(self.every):
+            log.info("  ... %s: %ds", self.what, time.time() - self.t0)
+    def stop(self):
+        self._stop.set()
+
+def _dir_mb(d):
+    try:
+        return int(sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(d) for f in fs) / 1e6)
+    except OSError:
+        return 0
+
 _CACHE = {}
 
 def load_source(profile: str, partition: str | None = None) -> dict:
@@ -617,14 +652,22 @@ def load_source(profile: str, partition: str | None = None) -> dict:
         lss = read_localstorage_all(profile)
         parts = find_partitions(profile)
         results = []
-        for p in parts:
+        for n, p in enumerate(parts, 1):
+            mb = _dir_mb(p["leveldb"])
+            log.info("reading WhatsApp store %d of %d (%s, %d MB) ...", n, len(parts), p["layout"], mb)
+            t0 = time.time()
             ldb = _copy(p["leveldb"])
             blob = _copy(p["blob"]) if p["blob"] else None
+            beat = _Heartbeat("still reading store %d of %d (%s)" % (n, len(parts), p["layout"]), t0)
             try:
                 dbs, rep = _read_idb_dir(ldb, blob)
             except Exception as e:
                 log.warning("IndexedDB %s could not be read: %s", p["layout"], e)
                 dbs, rep = {}, {"error": str(e)}
+            finally:
+                beat.stop()
+            log.info("  store %d read in %ds: %s records", n, time.time() - t0,
+                     "{:,}".format(sum(len(v) for st in dbs.values() for v in st.values())))
             sk = _norm_key(p["storage_key"]) if p["storage_key"] else None
             if sk is None and p["layout"].startswith("given: "):
                 sk = _given_ls_key(lss, dbs, partition)    # a given store has no storage key: pair by content

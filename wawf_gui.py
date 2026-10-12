@@ -775,9 +775,13 @@ class App(tk.Tk):
         self.bar.pack(fill="x", after=self._bar_after); self.bar.start(12)
 
     def _pump(self, proc):
+        # the run's end is reported from the process itself: helper processes it started can keep the
+        # output pipe open after it has exited
+        def wait():
+            self.q.put(("__exit__", proc.wait()))
+        threading.Thread(target=wait, daemon=True).start()
         for raw in iter(proc.stdout.readline, b""):
             self.q.put(raw.decode("utf-8", "replace"))
-        self.q.put(("__exit__", proc.wait()))
 
     def _drain(self):
         try:
@@ -791,6 +795,9 @@ class App(tk.Tk):
                     if item[1] == self._profile_path() and item[2]:
                         self.profile_help.configure(text=item[2] + "\n" + item[1])
                 elif isinstance(item, tuple):
+                    if item[0] == "__exit__" and getattr(self, "_finished_proc", None) is self.proc:
+                        continue                               # already reported
+                    self._finished_proc = self.proc
                     self._finished(item[1])
                 else:
                     tag = "err" if " ERROR " in item else "warn" if " WARNING " in item else None
@@ -822,7 +829,11 @@ class App(tk.Tk):
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
+            if sys.platform == "win32":                    # the run and every helper it started
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(self.proc.pid)], capture_output=True,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            else:
+                self.proc.terminate()
             self.status.configure(text="Stopping…")
 
     def open_out(self):
