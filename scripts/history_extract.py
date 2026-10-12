@@ -29,7 +29,9 @@ FAIL_LIMIT, COOLDOWN = int(E("FAIL_LIMIT", 10)), int(E("COOLDOWN_SEC", 7200))
 BASE_DELAY, MAX_DELAY = int(E("CHAT_DELAY_MS", 800)) / 1000, int(E("CHAT_DELAY_MAX_MS", 30000)) / 1000
 LATE_WAIT = int(E("LATE_WAIT_MS", 300000)) / 1000
 SETTLE_MAX = int(E("SETTLE_MAX_MS", 300000)) / 1000
-CHUNK_DELETE = E("HIST_CHUNK_DELETE", "1") != "0"
+# Off by default: the history file stays on WhatsApp's server as the phone left it (it expires there).
+# WhatsApp Web deletes each one after reading it; HIST_CHUNK_DELETE=1 does the same.
+CHUNK_DELETE = E("HIST_CHUNK_DELETE", "0") == "1"
 CDN_HEADERS = {"accept": "*/*", "accept-language": "en-US,en;q=0.9", "origin": "https://web.whatsapp.com",
                "referer": "https://web.whatsapp.com/", "sec-fetch-site": "cross-site", "sec-fetch-mode": "cors",
                "sec-fetch-dest": "empty",
@@ -57,12 +59,39 @@ def fetch_blob(n):
     raise err
 
 
+HISTORY_KEY_INFO = b"WhatsApp History Keys"
+
+def history_mac_ok(blob, media_key):
+    """The 10-byte HMAC-SHA256 (mac key = expanded[48:80], over iv + ciphertext) every WhatsApp media file
+    carries -- checked before anything is decrypted."""
+    import hmac as _hmac
+    k = HKDF(algorithm=hashes.SHA256(), length=112, salt=b"\0" * 32, info=HISTORY_KEY_INFO).derive(media_key)
+    return _hmac.compare_digest(_hmac.new(k[48:80], k[:16] + blob[:-10], hashlib.sha256).digest()[:10], blob[-10:])
+
 def decrypt_history(blob, media_key):
-    k = HKDF(algorithm=hashes.SHA256(), length=112, salt=b"\0" * 32, info=b"WhatsApp History Keys").derive(media_key)
+    k = HKDF(algorithm=hashes.SHA256(), length=112, salt=b"\0" * 32, info=HISTORY_KEY_INFO).derive(media_key)
     d = Cipher(algorithms.AES(k[16:48]), modes.CBC(k[:16])).decryptor()
     pt = d.update(blob[:-10]) + d.finalize()
-    return zlib.decompress(pt[:-pt[-1]])
+    pt = pt[:-pt[-1]]
+    return zlib.decompress(pt), pt          # (HistorySync protobuf, the file before inflating = fileSha256)
 
+
+def _undecoded(w):
+    """Why this tool cannot read a history message, or None. Never a guess: a message whose content is a
+    field this tool's schema does not name is reported as such, with its raw fields kept."""
+    msg = w.get("message")
+    if msg is None:
+        return None                                   # a system event (stub), handled as one
+    inner = WP.unwrap(msg)
+    named = [k for k in inner if k not in ("messageContextInfo", "_unknown")]
+    if named:
+        return None
+    unk = inner.get("_unknown") or []
+    if unk:
+        return {"reason": "message field(s) this tool does not decode", "fields": sorted({f for f, _, _ in unk}),
+                "raw": [{"field": f, "b64": base64.b64encode(v if isinstance(v, (bytes, bytearray)) else b"").decode()}
+                        for f, _, v in unk]}
+    return {"reason": "empty message"}
 
 def flatten(hs):
     out = []
@@ -71,10 +100,13 @@ def flatten(hs):
             w = hm.get("message") or {}
             k = w.get("key") or {}
             if not k.get("id"): continue
-            out.append({"chat": conv.get("id") or k.get("remoteJid"), "id": k["id"], "fromMe": bool(k.get("fromMe")),
-                        "participant": k.get("participant") or w.get("participant"), "pushName": w.get("pushName"),
-                        "ts": int(w.get("messageTimestamp") or 0), "text": WP.message_text(w.get("message")),
-                        "type": WP.message_type(w.get("message"))})
+            row = {"chat": conv.get("id") or k.get("remoteJid"), "id": k["id"], "fromMe": bool(k.get("fromMe")),
+                   "participant": k.get("participant") or w.get("participant"), "pushName": w.get("pushName"),
+                   "ts": int(w.get("messageTimestamp") or 0), "text": WP.message_text(w.get("message")),
+                   "type": WP.message_type(w.get("message"))}
+            und = _undecoded(w)
+            if und: row["undecoded"] = und
+            out.append(row)
     return out
 
 
@@ -106,6 +138,14 @@ class Run:
         self.late = self.late_msgs = self.late_ours = 0
         self.kept = self.kept_bytes = self.released = self.release_failed = 0
         self.media_conn = None
+        # what a chunk carries besides messages: chats (names, participants, settings), people who left
+        # or were removed, call logs, status updates, name and number mappings -- accumulated across runs
+        self.meta_path = os.path.join(os.getcwd(), "history_metadata.json")
+        try: self.meta = json.load(open(self.meta_path, encoding="utf-8"))
+        except Exception: self.meta = {}
+        for k in ("conversations", "past_participants", "call_logs", "pushnames", "pn_lid", "status_messages"):
+            self.meta.setdefault(k, {})
+        self.undecoded = 0
 
     # -------------------------------------------------------------- output
     def write_out(self):
@@ -118,19 +158,91 @@ class Run:
                        "start_reached": sorted(self.start_reached), "silent_chats": sorted(self.silent),
                        "answered_chats": sorted(self.answered), "messages": nw}, f, ensure_ascii=False, indent=1)
         os.replace(tmp, self.out)
+        tmp = self.meta_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f: json.dump(self.meta, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, self.meta_path)
         return len(arr), len(nw), len(by)
 
+    def note_metadata(self, hs):
+        m = self.meta
+        for conv in hs.get("conversations") or []:
+            cid = conv.get("id")
+            if not cid: continue
+            rec = {k: conv.get(k) for k in ("name", "displayName", "description", "username", "pnJid", "lidJid",
+                                            "archived", "pinned", "muteEndTime", "ephemeralExpiration")
+                   if conv.get(k) not in (None, "", 0, False)}
+            if conv.get("participant"):
+                rec["participants"] = [{"jid": p.get("userJid"), "rank": {0: "member", 1: "admin", 2: "superadmin"}
+                                        .get(p.get("rank") or 0, p.get("rank"))} for p in conv["participant"]]
+            if rec: m["conversations"].setdefault(cid, {}).update(rec)
+        for pp in hs.get("pastParticipants") or []:
+            g = pp.get("groupJid")
+            for x in pp.get("pastParticipants") or []:
+                m["past_participants"].setdefault(g, {})[x.get("userJid")] = {
+                    "left": {0: "left", 1: "removed"}.get(x.get("leaveReason") or 0), "ts": x.get("leaveTs")}
+        for c in hs.get("callLogRecords") or []:
+            cid = c.get("callId") or "%s-%s" % (c.get("callCreatorJid"), c.get("startTime"))
+            m["call_logs"][cid] = {k: v for k, v in c.items() if k != "_unknown"}
+        for p in hs.get("pushnames") or []:
+            if p.get("id"): m["pushnames"][p["id"]] = p.get("pushname")
+        for x in hs.get("phoneNumberToLidMappings") or []:
+            if x.get("pnJid"): m["pn_lid"][x["pnJid"]] = x.get("lidJid")
+        for w in hs.get("statusV3Messages") or []:
+            k = w.get("key") or {}
+            if k.get("id"):
+                m["status_messages"][k["id"]] = {"from": k.get("participant") or k.get("remoteJid"),
+                                                 "ts": w.get("messageTimestamp"), "type": WP.message_type(w.get("message")),
+                                                 "text": WP.message_text(w.get("message"))}
+
     # -------------------------------------------------------------- chunks
-    def keep_chunk(self, raw):
+    def keep_chunk(self, raw, enc=None):
+        """Keep the decrypted HistorySync protobuf (<sha>.pb.gz) and, when it was downloaded, the encrypted
+        file exactly as the CDN served it (<sha>.enc), which re-verifies against the fileEncSha256 the
+        phone sent in its notification (in received_journal.jsonl)."""
         try:
             os.makedirs(self.chunkdir, exist_ok=True)
-            f = os.path.join(self.chunkdir, hashlib.sha256(raw).hexdigest()[:32] + ".pb.gz")
-            if not os.path.exists(f):
-                data = gzip.compress(raw); open(f, "wb").write(data)
+            base = os.path.join(self.chunkdir, hashlib.sha256(raw).hexdigest()[:32])
+            if not os.path.exists(base + ".pb.gz"):
+                data = gzip.compress(raw); open(base + ".pb.gz", "wb").write(data)
                 self.kept += 1; self.kept_bytes += len(data)
+            if enc is not None and not os.path.exists(base + ".enc"):
+                open(base + ".enc", "wb").write(enc)
             return True
         except OSError as e:
             say("  chunk keep failed (not fatal):", e); return False
+
+    def keep_chunk_record(self, raw, enc, n, origin, mac_ok):
+        """<sha>.json beside the chunk: the key that opens <sha>.enc, how, and what was checked -- so the
+        original, the key and the decrypted result are kept together and anyone can redo the decryption.
+        KEY MATERIAL: it decrypts the chunk."""
+        b64 = lambda v: base64.b64encode(v).decode() if isinstance(v, (bytes, bytearray)) else v
+        try:
+            base = os.path.join(self.chunkdir, hashlib.sha256(raw).hexdigest()[:32])
+            rec = {
+                "original": os.path.basename(base) + ".enc" if enc is not None else None,
+                "inline": enc is None,                     # delivered inside the notification, not downloaded
+                "decrypted": os.path.basename(base) + ".pb.gz",
+                "media_key_b64": b64(n.get("mediaKey")),
+                "key_derivation": "HKDF-SHA256(mediaKey, salt=32 zero bytes, info='WhatsApp History Keys', 112 bytes): "
+                                  "iv=[0:16], aes_key=[16:48], mac_key=[48:80]; AES-256-CBC over enc[:-10], "
+                                  "HMAC-SHA256(mac_key, iv+enc[:-10])[:10] == enc[-10:], PKCS7, then zlib inflate",
+                "declared": {k: b64(n.get(k)) for k in ("fileEncSha256", "fileSha256", "fileLength", "directPath",
+                                                        "syncType", "chunkOrder", "progress", "originalMessageId",
+                                                        "peerDataRequestSessionId", "oldestMsgInChunkTimestampSec")
+                             if n.get(k) is not None},
+                "checked": {"enc_sha256": hashlib.sha256(enc).hexdigest() if enc is not None else None,
+                            "enc_sha256_matches_declared": (hashlib.sha256(enc).digest() == n.get("fileEncSha256"))
+                                                           if enc is not None and n.get("fileEncSha256") else None,
+                            "mac_ok": mac_ok,
+                            "plaintext_sha256_matches_declared": True if enc is not None and n.get("fileSha256") else None,
+                            "decrypted_sha256": hashlib.sha256(raw).hexdigest(),
+                            "decrypted_bytes": len(raw)},
+                "delivered_by": {k: (origin or {}).get(k) for k in ("id", "from", "t", "category")} if origin else None,
+                "received_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+            with open(base + ".json", "w", encoding="utf-8") as f: json.dump(rec, f, indent=1)
+        except OSError as e:
+            say("  chunk record failed (not fatal):", e)
 
     def release_chunk(self, n):
         """Tell the CDN the chunk was consumed, as WhatsApp Web does after reading each one."""
@@ -166,8 +278,10 @@ class Run:
                 self.answered.add(x); self.silent.discard(x)
                 if int(conv.get("endOfHistoryTransferType") or 0) == 1: self.start_reached.add(x)
 
-    def on_notification(self, n):
-        """Download, decrypt, keep, decode, bank, release. -> (session id, messages)"""
+    def on_notification(self, n, origin=None):
+        """Download, verify, decrypt, keep (original + key + decrypted), decode, bank, release.
+        -> (session id, messages)"""
+        blob = None; mac_ok = None
         if n.get("initialHistBootstrapInlinePayload"):
             p = n["initialHistBootstrapInlinePayload"]
             try: raw = zlib.decompress(p)
@@ -176,12 +290,24 @@ class Run:
             blob = fetch_blob(n)
             if n.get("fileEncSha256") and hashlib.sha256(blob).digest() != n["fileEncSha256"]:
                 raise ValueError("history chunk hash mismatch")
-            raw = decrypt_history(blob, n["mediaKey"])
-        kept = self.keep_chunk(raw)
+            mac_ok = history_mac_ok(blob, n["mediaKey"])
+            if not mac_ok:
+                raise ValueError("history chunk MAC mismatch")
+            raw, compressed = decrypt_history(blob, n["mediaKey"])
+            if n.get("fileSha256") and hashlib.sha256(compressed).digest() != n["fileSha256"]:
+                raise ValueError("history chunk plaintext hash mismatch")
+        kept = self.keep_chunk(raw, blob)
+        self.keep_chunk_record(raw, blob, n, origin, mac_ok)
         hs = WP.decode(raw, WP.HISTORY_SYNC)
         self.note_conversations(hs.get("conversations"))
+        self.note_metadata(hs)
         msgs = flatten(hs)
         for m in msgs: self.all[m["id"]] = m
+        und = sum(1 for m in msgs if m.get("undecoded"))
+        if und:
+            self.undecoded += und
+            say("  [!] %d message(s) in this chunk are of a type this tool does not decode: kept raw "
+                "(history_chunks/, and 'undecoded' in history_recovered.json), not interpreted" % und)
         if kept: self.release_chunk(n)
         return n.get("peerDataRequestSessionId"), msgs
 
@@ -197,7 +323,7 @@ class Run:
             if not n or not m["from"].startswith(self.c.me_lid + "@") and not m["from"].startswith(self.c.me_lid + ":"):
                 continue
             try:
-                sid, msgs = self.on_notification(n)
+                sid, msgs = self.on_notification(n, m)
             except Exception as e:
                 say("  history chunk failed:", e); continue
             if sid in self.pending:
@@ -236,7 +362,7 @@ class Run:
         try:
             self.c.connect()
         except ConnectionError as e:
-            say("[x] login rejected:", e); return 2
+            say("[x]", e); return 2
         except Exception as e:
             say("[x] could not connect:", e); return 4
         self.own = self.c.me_lid + "@lid" if self.c.me_lid else self.c.me_pn + "@s.whatsapp.net"
@@ -312,6 +438,15 @@ class Run:
                 self.released, (", %d release(s) failed" % self.release_failed) if self.release_failed else ""))
         tot, nw, chats = self.write_out()
         say("\n[DONE] recovered=%d NEW(not-on-disk)=%d across %d chats -> %s" % (tot, nw, chats, self.out))
+        mm = self.meta
+        say("[i] also kept (history_metadata.json): %d chats' details (%d with participants), %d past participants, "
+            "%d call logs, %d status updates, %d names" % (
+                len(mm["conversations"]), sum(1 for v in mm["conversations"].values() if v.get("participants")),
+                sum(len(v) for v in mm["past_participants"].values()), len(mm["call_logs"]),
+                len(mm["status_messages"]), len(mm["pushnames"])))
+        if self.undecoded:
+            say("[!] %d recovered message(s) are of a type this tool does not decode -- kept raw, marked 'undecoded'"
+                % self.undecoded)
         say("[i] received: " + ", ".join("%s=%d" % kv for kv in sorted(self.c.tally.items())))
         self.c.close()
         return 7 if tripped else 0

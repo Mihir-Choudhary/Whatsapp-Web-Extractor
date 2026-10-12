@@ -153,10 +153,21 @@ WEB_MESSAGE_INFO = {1: ("key", "m", MESSAGE_KEY), 2: ("message", "m", MESSAGE), 
 HISTORY_SYNC_MSG = {1: ("message", "m", WEB_MESSAGE_INFO), 2: ("msgOrderId", "u")}
 CONVERSATION = {1: ("id", "s"), 2: ("messages", "m*", HISTORY_SYNC_MSG), 3: ("newJid", "s"), 4: ("oldJid", "s"),
                 5: ("lastMsgTimestamp", "u"), 8: ("endOfHistoryTransfer", "b"), 11: ("endOfHistoryTransferType", "e"),
-                13: ("name", "s"), 38: ("displayName", "s"), 39: ("pnJid", "s"), 42: ("lidJid", "s")}
+                13: ("name", "s"), 38: ("displayName", "s"), 39: ("pnJid", "s"), 42: ("lidJid", "s"),
+                9: ("ephemeralExpiration", "u"), 16: ("archived", "b"), 24: ("pinned", "u"), 25: ("muteEndTime", "u"),
+                33: ("description", "s"), 43: ("username", "s"),
+                20: ("participant", "m*", {1: ("userJid", "s"), 2: ("rank", "e")})}
+CALL_LOG_RECORD = {1: ("callResult", "e"), 4: ("duration", "i"), 5: ("startTime", "i"), 6: ("isIncoming", "b"),
+                   7: ("isVideo", "b"), 8: ("isCallLink", "b"), 11: ("callId", "s"), 12: ("callCreatorJid", "s"),
+                   13: ("groupJid", "s"), 14: ("participants", "m*", {1: ("userJid", "s"), 2: ("callResult", "e")}),
+                   15: ("callType", "e")}
 HISTORY_SYNC = {1: ("syncType", "e"), 2: ("conversations", "m*", CONVERSATION), 5: ("chunkOrder", "u"),
                 6: ("progress", "u"), 7: ("pushnames", "m*", {1: ("id", "s"), 2: ("pushname", "s")}),
-                15: ("phoneNumberToLidMappings", "m*", {1: ("pnJid", "s"), 2: ("lidJid", "s")})}
+                15: ("phoneNumberToLidMappings", "m*", {1: ("pnJid", "s"), 2: ("lidJid", "s")}),
+                3: ("statusV3Messages", "m*", WEB_MESSAGE_INFO),
+                12: ("pastParticipants", "m*", {1: ("groupJid", "s"), 2: ("pastParticipants", "m*",
+                                                {1: ("userJid", "s"), 2: ("leaveReason", "e"), 3: ("leaveTs", "u")})}),
+                13: ("callLogRecords", "m*", CALL_LOG_RECORD)}
 ADV_SIGNED_DEVICE_IDENTITY = {1: ("details", "y"), 2: ("accountSignatureKey", "y"), 3: ("accountSignature", "y"),
                               4: ("deviceSignature", "y")}
 

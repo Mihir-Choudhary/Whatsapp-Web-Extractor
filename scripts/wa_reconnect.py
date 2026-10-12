@@ -301,6 +301,20 @@ def scan_for_key(node, hits):
 
 
 # ---------------- frame pump + orchestration ----------------
+def login_failure_reason(attrs):
+    """<failure> at login -> what it means for the examination."""
+    code = str((attrs or {}).get("reason") or "")
+    if code == "401":
+        return ("login refused (401): this linked device has been logged out -- removed from the account's "
+                "linked devices, by the phone or by WhatsApp. The server holds nothing for it any more, and "
+                "the browser's own session has ended too. What is on disk is unaffected: decrypt it offline "
+                "with the key saved by an earlier run (--key ... --offline).")
+    if code == "403":
+        return "login refused (403): the account or this device is blocked from connecting"
+    if code == "503":
+        return "login refused (503): WhatsApp's server is unavailable; try again later"
+    return "login refused (%s)" % (code or attrs)
+
 def fetch_version():
     # same source Baileys' fetchLatestBaileysVersion uses; an outdated version -> server <failure 405>
     url = "https://raw.githubusercontent.com/WhiskeySockets/Baileys/master/src/Defaults/baileys-version.json"
@@ -417,8 +431,7 @@ def run(creds, out_path, timeout=30, log=lambda *a: None, print_key=False):
                 if tag == "failure":
                     A.net("in", endpoint=WS_URL, protocol="noise/websocket", kind="stanza <failure>",
                           status="login rejected", detail={"attrs": node.get("attrs")})
-                    print("[!] login rejected (<failure> %s) — creds not accepted" % node.get("attrs"),
-                          file=sys.stderr)
+                    print("[!] " + login_failure_reason(node.get("attrs")), file=sys.stderr)
                     A.end_run(2, status="error", error=RuntimeError("login rejected by server"))
                     return 2
                 if tag in ("stream:error", "xmlstreamend"):

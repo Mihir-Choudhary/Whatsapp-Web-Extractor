@@ -169,7 +169,7 @@ class Client:
             if n["tag"] == "success":
                 self.success = n["attrs"]; break
             if n["tag"] == "failure":
-                raise ConnectionError("login rejected: %s" % n["attrs"])
+                raise ConnectionError(WR.login_failure_reason(n["attrs"]))
             self._handle(n)
         else:
             raise TimeoutError("no <success> after login")

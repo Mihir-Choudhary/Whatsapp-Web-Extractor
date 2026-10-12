@@ -54,7 +54,7 @@ def main():
     try:
         c.connect()
     except ConnectionError as e:
-        say("[x] login rejected:", e); return 2
+        say("[x]", e); return 2
     except Exception as e:
         say("[x] could not connect:", e); return 4
     own = (c.me_lid + "@lid") if c.me_lid else (c.me_pn + "@s.whatsapp.net")

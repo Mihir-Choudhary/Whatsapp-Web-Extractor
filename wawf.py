@@ -1761,7 +1761,8 @@ def cmd_queue(a):
         log.warning("server queue: %s", summ["session_ended_by_server"])
     if rc:
         log.error("queue capture failed (exit %s)%s", rc,
-                  " -- close WhatsApp Web in every browser using this profile, then run again" if rc == 6 else "")
+                  " -- close WhatsApp Web in every browser using this profile, then run again" if rc == 6 else
+                  " -- the server refused this device's login (the reason is printed above)" if rc == 2 else "")
         return rc
     st = summ.get("stats") or {}
     log.info("server queue: %s stanzas recorded, %s acknowledged; %s messages (%s decrypted, %s not); "

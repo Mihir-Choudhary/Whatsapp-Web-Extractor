@@ -582,7 +582,7 @@ Settings (environment variables, all optional):
 | `OFFLINE_BATCH` / `OFFLINE_MAX_BATCHES` | 100 / 2000 | batch size requested, and the cap on requests |
 | `LATE_WAIT_MS` | 300000 | how long to stay connected for late answers |
 | `PROBE_CHATS` | 4 | stop after this many silent chats in a row at the start |
-| `HIST_CHUNK_DELETE` | on | `0` keeps consumed chunks on the CDN instead of releasing them |
+| `HIST_CHUNK_DELETE` | off | `1` deletes each history file from WhatsApp's server after reading it, as WhatsApp Web does (the Node engine deletes by default). Either way the tool keeps the encrypted file as served (`history_chunks/<sha>.enc`, re-verifiable against the `fileEncSha256` in `received_journal.jsonl`) and its decrypted protobuf (`<sha>.pb.gz`) |
 
 **What to expect.** On a healthy device the server acks in ~0.3s and a chunk of up to 50 messages
 arrives ~3s later. A first pass over a few hundred chats takes tens of minutes; draining a long
