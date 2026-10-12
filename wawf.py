@@ -427,6 +427,12 @@ def _run_with_keys(a):
     a.key = None
     return cmd_run(a)
 
+def _report_steps(steps):
+    """Log which steps of a run completed; the exit code is the export's if there was one."""
+    log.info("run summary: " + "; ".join("%s %s" % (k, "done" if not v else "NOT done (exit %s)" % v)
+                                         for k, v in steps.items()))
+    return steps.get("export", next((v for v in steps.values() if v), 0))
+
 def cmd_run_sessions(a):
     """The default action for a profile: every signed-in WhatsApp session in it, each exported into its own
     folder under every --out (most recent login first), unless --partition names one."""
@@ -1808,6 +1814,7 @@ def _history_export(a, targets, history_file=None):
     in. Both write the same paths -- the auto-naming that protects an EARLIER run's export happened
     once, before either call."""
     if not targets: return 0
+    a._exported = True
     qf = getattr(a, "queue_export_file", None)
     if qf and os.path.isfile(qf):                    # this run also recorded the server queue: merge both
         merged = []
@@ -1824,6 +1831,15 @@ def _history_export(a, targets, history_file=None):
                             raw_include_keys=getattr(a, "raw_include_keys", False),
                             history_file=history_file)
     return cmd_run(ns)
+
+def _creds_ok(a, out):
+    """Recover the device credentials into `out`. A copy that cannot yield them is reported (the reason
+    is logged) rather than ending the run: the export of what the copy holds still follows."""
+    try:
+        return not cmd_creds(argparse.Namespace(profile=a.profile, origin=a.origin, out=out, _internal=True))
+    except SystemExit as e:
+        log.error("%s", e)
+        return False
 
 def cmd_queue(a):
     """--queue: record what WhatsApp's server is holding for the examined device, without taking it.
@@ -1859,7 +1875,8 @@ def cmd_queue(a):
     if a.creds:
         import shutil
         shutil.copyfile(a.creds, os.path.join(work, "creds_in.json"))
-    elif cmd_creds(argparse.Namespace(profile=a.profile, origin=a.origin, out=os.path.join(work, "creds_in.json"), _internal=True)):
+    elif not _creds_ok(a, os.path.join(work, "creds_in.json")):
+        log.error("server queue not recorded: no usable device credentials in this copy")
         return 3
     log.info("[2/3] exporting the browser's Signal state (sessions, group sender keys) ...")
     if _sub("export_signal_state.py", eng + ["--out", os.path.join(work, "signal_state.json")]): return 3
@@ -1954,7 +1971,8 @@ def cmd_history(a):
         if not origin: log.error("pass a profile or --origin"); return 2
         eng = ["--origin", origin]
     log.info("[1/4] recovering reconnect creds ...")
-    if cmd_creds(argparse.Namespace(profile=a.profile, origin=a.origin, out=os.path.join(work, "creds_in.json"), _internal=True)):
+    if not _creds_ok(a, os.path.join(work, "creds_in.json")):
+        log.error("history not recovered: no usable device credentials in this copy")
         return 3
     log.info("[2/4] recovering Signal state (identity, prekeys, sessions, sender keys) ...")
     if _sub("export_signal_state.py", eng + ["--out", os.path.join(work, "signal_state.json")]): return 3
@@ -2604,24 +2622,37 @@ def main():
     if getattr(a, "queue", False) and a.history:
         def _queue_then_history(a):
             # the queue first (it is what the server holds now), then history; the export merges both
-            rc = cmd_queue(a)
-            if rc:
-                log.warning("server queue not recorded (exit %s); continuing with history recovery", rc)
-            return cmd_history(a)
+            steps = {"server queue": cmd_queue(a)}
+            if steps["server queue"]:
+                log.warning("server queue not recorded; continuing with history recovery")
+            steps["history"] = cmd_history(a)
+            if a.out and not getattr(a, "_exported", False):
+                log.warning("history not recovered; exporting what the copy holds")
+                steps["export"] = cmd_run_sessions(a)
+            return _report_steps(steps)
         a.cmd, action = "queue+history", _queue_then_history
     elif getattr(a, "queue", False):
         def _decrypt_then_queue(a):
             # The queue first, so the export can fold it in: one timeline per chat, every row saying
             # whether it came from the browser's store or the server queue.
-            rc = cmd_queue(a)
-            if rc or not a.out: return rc            # with no --out: only the queue
+            steps = {"server queue": cmd_queue(a)}
+            if not a.out: return steps["server queue"]          # with no --out: only the queue
+            if steps["server queue"]:
+                log.warning("server queue not recorded; exporting what the copy holds")
             qf = getattr(a, "queue_export_file", None)
             if qf and os.path.isfile(qf) and not getattr(a, "history_file", None):
                 a.history_file = qf
-            return cmd_run_sessions(a)
+            steps["export"] = cmd_run_sessions(a)
+            return _report_steps(steps)
         a.cmd, action = "decrypt+queue", _decrypt_then_queue
     elif a.history:
-        a.cmd, action = "history", cmd_history
+        def _history_then_export(a):
+            steps = {"history": cmd_history(a)}
+            if steps["history"] and a.out and not getattr(a, "_exported", False):
+                log.warning("history not recovered; exporting what the copy holds")
+                steps["export"] = cmd_run_sessions(a)
+            return _report_steps(steps)
+        a.cmd, action = "history", _history_then_export
     else:
         a.cmd, action = "decrypt", cmd_run_sessions
     # Inputs are checked BEFORE a case database is opened. Every command here needs a profile and
