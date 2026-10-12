@@ -587,6 +587,7 @@ def quoted_text(pt, cap=None):
     return texts(pt, cap)[1]
 
 ACK_STATUS = {-1: "error", 0: "pending", 1: "sent", 2: "delivered", 3: "read", 4: "played"}
+GROUP_ACK_STATUS = {2: "delivered to all members", 3: "read by all members", 4: "played by all members"}
 # entries that are not messages anyone sent: no delivery state applies, so none is written
 _SYSTEM_TYPES = {"e2e_notification", "gp2", "notification_template", "notification", "pinned_message",
                  "protocol", "revoked", "ciphertext", "call_log", "message_history_notice"}
@@ -635,6 +636,9 @@ def msg_row(m, when, pt, ids):
     # Delivery state of a message I sent, as WhatsApp Web last recorded it (the ticks).
     if m.get("from_me") and m.get("ack") in ACK_STATUS and (m["ack"] != 0 or m.get("type") not in _SYSTEM_TYPES):
         row["ack"] = m["ack"]; row["status"] = ACK_STATUS[m["ack"]]
+        # in a group or broadcast the stored state covers every recipient: two ticks only once all have it
+        if str(m.get("chat") or "").endswith(("@g.us", "@broadcast")) and m["ack"] in GROUP_ACK_STATUS:
+            row["status"] = GROUP_ACK_STATUS[m["ack"]]
     row.update(det)                     # link / location / poll / event / payment, only when present
     return row
 

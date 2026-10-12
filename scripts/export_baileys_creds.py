@@ -62,7 +62,17 @@ def load_firefox(origin):
 def load_chromium(profile):
     import chromium_reader as cr
     src = cr.load_source(profile); ls = src["localStorage"]; idb = src["idb"]
-    root = idb["wawc_db_enc"]["keys"][0]["key"].key_data
+    keys = (idb.get("wawc_db_enc") or {}).get("keys") or []
+    k0 = keys[0].get("key") if keys and isinstance(keys[0], dict) else None
+    if k0 is None or not getattr(k0, "key_data", None):
+        sel = next((p for p in cr.ACQUISITION.get("partitions", []) if p.get("selected")), {})
+        raise SystemExit(
+            "this session's root key (IndexedDB wawc_db_enc) is not in the copy%s, so its device credentials "
+            "cannot be decrypted and no key can be fetched with them. Messages, chats and contacts can still "
+            "be exported without message text (--offline). For the credentials, copy the profile again with "
+            "the browser closed." % (" -- %d table(s) its database lists as live are empty or missing"
+                                     % sel["incomplete_tables"] if sel.get("incomplete_tables") else ""))
+    root = k0.key_data
     meta = [o for o in idb.get("signal-storage", {}).get("signal-meta-store", []) if isinstance(o, dict)]
     return ls, root, meta
 

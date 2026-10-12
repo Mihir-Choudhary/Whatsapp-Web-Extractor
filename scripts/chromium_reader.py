@@ -40,7 +40,7 @@ Default Chromium profile locations:
   (Windows: %LOCALAPPDATA%\\Google\\Chrome\\User Data\\Default , ...\\Microsoft\\Edge\\User Data\\Default)
 """
 from __future__ import annotations
-import os, glob, io, json, re, shutil, sqlite3, struct, tempfile
+import os, glob, io, json, re, shutil, sqlite3, struct, tempfile, time
 from pathlib import Path
 import logging
 log = logging.getLogger('wawf.chromium')
@@ -82,7 +82,51 @@ def as_bytes(v):
 
 
 # ---------------------------------------------------------------- damaged-LevelDB tolerance
-_DAMAGE = {"tables_skipped": [], "log_records_torn": 0}
+_DAMAGE = {"tables_skipped": [], "log_records_torn": 0, "deleted_files_ignored": [], "tables_missing": []}
+
+
+def manifest_live_tables(ldb_dir):
+    """Table numbers the database's current MANIFEST lists as live, or None if it cannot be read.
+    A table file that is empty or absent but listed here held data the copy does not have; one that is
+    not listed is a deleted file, of no consequence."""
+    try:
+        cur = open(os.path.join(ldb_dir, "CURRENT")).read().strip()
+        data = open(os.path.join(ldb_dir, cur), "rb").read()
+    except OSError:
+        return None
+    recs, i, frag = [], 0, b""
+    while i + 7 <= len(data):
+        left = 32768 - (i % 32768)
+        if left < 7: i += left; continue
+        ln = data[i + 4] | (data[i + 5] << 8); t = data[i + 6]; p = data[i + 7:i + 7 + ln]; i += 7 + ln
+        if t == 1: recs.append(p)
+        elif t == 2: frag = p
+        elif t == 3: frag += p
+        elif t == 4: recs.append(frag + p); frag = b""
+        else: break
+    def vi(b, j):
+        n = s = 0
+        while True:
+            x = b[j]; j += 1; n |= (x & 0x7f) << s; s += 7
+            if not x & 0x80: return n, j
+    def sl(b, j):
+        n, j = vi(b, j); return b[j:j + n], j + n
+    live = set()
+    for r in recs:
+        j = 0
+        try:
+            while j < len(r):
+                tag, j = vi(r, j)
+                if tag == 1: _, j = sl(r, j)
+                elif tag in (2, 3, 4, 9): _, j = vi(r, j)
+                elif tag == 5: _, j = vi(r, j); _, j = sl(r, j)
+                elif tag == 6: _, j = vi(r, j); f, j = vi(r, j); live.discard(f)
+                elif tag == 7:
+                    _, j = vi(r, j); f, j = vi(r, j); _, j = vi(r, j); _, j = sl(r, j); _, j = sl(r, j); live.add(f)
+                else: break
+        except IndexError:
+            continue
+    return live
 _HARDENED = False
 
 def _harden_ccl():
@@ -136,6 +180,8 @@ def _harden_ccl():
         if not self._in_dir.is_dir():
             raise ValueError("in_dir is not a directory")
         self._files, latest = [], (0, None)
+        live = manifest_live_tables(str(self._in_dir))
+        present = set()
         for f in self._in_dir.iterdir():
             if not f.is_file(): continue
             if re.match(L.RawLevelDb.DATA_FILE_PATTERN, f.name):
@@ -143,15 +189,22 @@ def _harden_ccl():
                     if f.suffix.lower() == ".log":
                         self._files.append(L.LogFile(f))
                     elif f.suffix.lower() in (".ldb", ".sst"):
+                        present.add(int(f.stem))
                         if f.stat().st_size == 0: raise ValueError("zero-length table")
                         self._files.append(L.LdbFile(f))
                 except Exception as e:
-                    _DAMAGE["tables_skipped"].append({"file": f.name, "bytes": f.stat().st_size,
-                                                      "reason": str(e).split(" in ")[0][:80]})
+                    num = int(f.stem) if f.stem.isdigit() else None
+                    if live is not None and num is not None and f.suffix.lower() in (".ldb", ".sst") and num not in live:
+                        _DAMAGE["deleted_files_ignored"].append(f.name)
+                    else:
+                        _DAMAGE["tables_skipped"].append({"file": f.name, "bytes": f.stat().st_size,
+                                                          "reason": str(e).split(" in ")[0][:80]})
             m = re.match(L.ManifestFile.MANIFEST_FILENAME_PATTERN, f.name)
             if m and f.is_file():
                 n = int(m.group(1), 16)
                 if latest[0] < n: latest = (n, f)
+        if live is not None:
+            _DAMAGE["tables_missing"].extend("%06d.ldb" % n for n in sorted(live - present))
         try:
             self.manifest = L.ManifestFile(latest[1]) if latest[1] is not None else None
         except Exception as e:
@@ -336,6 +389,7 @@ def _read_idb_dir(ldb_dir: str, blob_dir: str | None) -> tuple:
     from ccl_chromium_reader.serialization_formats import ccl_blink_value_deserializer, ccl_v8_value_deserializer
     from ccl_chromium_reader.storage_formats import ccl_leveldb as L
     _DAMAGE["tables_skipped"], _DAMAGE["log_records_torn"] = [], 0
+    _DAMAGE["deleted_files_ignored"], _DAMAGE["tables_missing"] = [], []
     raw = idb.IndexedDb(ldb_dir, blob_dir)
     names = {d.dbid_no: d.name for d in raw.global_metadata.db_ids}
     T = idb.ObjectStoreMetadataType
@@ -413,6 +467,8 @@ def _read_idb_dir(ldb_dir: str, blob_dir: str | None) -> tuple:
         "inferred_stores": inferred,
         "undeserializable": {f"{names.get(d, d)}/{s}": n for (d, s), n in bad.items()},
         "tables_skipped": list(_DAMAGE["tables_skipped"]),
+        "tables_missing": list(_DAMAGE["tables_missing"]),
+        "deleted_files_ignored": list(_DAMAGE["deleted_files_ignored"]),
         "log_records_torn": _DAMAGE["log_records_torn"],
     }
     try: raw.close()
@@ -446,23 +502,92 @@ def _account(ls: dict):
             return v.split("@")[0].split(":")[0]          # '<number>:<device>@s.whatsapp.net' -> number
     return None
 
+def _wid(ls: dict):
+    """'<number>:<device>' of the session's own linked device, or None."""
+    for k in ("last-wid-md", "last-wid"):
+        v = ls.get(k)
+        if not v: continue
+        try: v = json.loads(v)
+        except Exception: pass
+        if isinstance(v, str) and "@" in v:
+            return v.split("@")[0]
+    return None
+
+def _device(ls: dict):
+    w = _wid(ls) or ""
+    return int(w.split(":")[1]) if ":" in w and w.split(":")[1].isdigit() else None
+
+def _incomplete(rep: dict) -> int:
+    return len(rep.get("tables_skipped") or []) + len(rep.get("tables_missing") or [])
+
+def _msg_range(dbs: dict):
+    ts = []
+    for m in dbs.get("model-storage", {}).get("message", []):
+        try:
+            t = float(m.get("t") or 0)
+            if 1e9 < t < 4e9: ts.append(t)
+        except (TypeError, ValueError):
+            pass
+    return (min(ts), max(ts)) if ts else (None, None)
+
+def session_labels(rows):
+    """{index: label} for partitions: the most recent login (highest linked-device number of an account)
+    and the earlier ones it replaced. Device numbers increase with every new link of an account."""
+    out, by_acct = {}, {}
+    for i, r in enumerate(rows):
+        if r.get("account") and r.get("device") is not None:
+            by_acct.setdefault(r["account"], []).append((r["device"], i))
+    for acct, devs in by_acct.items():
+        top = max(devs)[0]
+        for d, i in devs:
+            out[i] = "most recent login" if d == top else "earlier login (replaced by device %d)" % top
+    for i, r in enumerate(rows):
+        if i not in out:
+            out[i] = "no signed-in account" if not r.get("account") else "signed in (device unknown)"
+    return out
+
 def _score(idb_dbs: dict, ls: dict) -> tuple:
     """How much this partition looks like the signed-in session (higher = more)."""
     keys = bool(idb_dbs.get("wawc_db_enc", {}).get("keys"))
     msgs = len(idb_dbs.get("model-storage", {}).get("message", []))
-    return (1 if keys and "WAWebEncKeySalt" in ls else 0, 1 if "WALid" in ls or "last-wid-md" in ls else 0, msgs)
+    signed = 1 if ("WALid" in ls or "last-wid-md" in ls) and msgs else 0
+    return (1 if keys and "WAWebEncKeySalt" in ls else 0, signed, _device(ls) or -1, msgs)
 
 def choose_partition(results, partition=None):
     """results: [(info, storage_key, idb, localStorage, report)]. An explicit `partition` (storage key,
     layout name or account) must match; otherwise the signed-in session with the most messages."""
     if partition is not None:
+        want = str(partition).lstrip("+")
         hit = [r for r in results if r[1] == _norm_key(partition) or r[0].get("layout") == partition
-               or _account(r[3]) == str(partition).split(":")[0].lstrip("+")]
+               or (_wid(r[3]) or "") == want
+               or (":" not in want and _account(r[3]) == want)]
+        if len(hit) > 1 and ":" not in want:
+            raise SystemExit("account %s has %d sessions in this profile; name one as <account>:<device> "
+                             "(%s) or by its storage key" % (want, len(hit), ", ".join(_wid(r[3]) or "?" for r in hit)))
         if not hit:
             raise SystemExit(f"partition {partition!r} not found; present: "
                              f"{[(r[0].get('layout'), _account(r[3]), r[1]) for r in results]}")
         return hit[0]
     return max(results, key=lambda r: _score(r[2], r[3])) if results else None
+
+
+def session_summary(rows):
+    """The sessions of a profile as text lines for the log and the console."""
+    labels = session_labels(rows)
+    fmt = lambda t: time.strftime("%Y-%m-%d %H:%M", time.localtime(t)) if t else "-"
+    lines = []
+    for i, r in enumerate(rows):
+        state = ("INCOMPLETE COPY: %d table(s) this database lists as live are empty or missing in the copy"
+                 % r["incomplete_tables"]) if r.get("incomplete_tables") else "complete"
+        lines.append("  %d. %-11s device %-4s %-40s %8s messages  %s .. %s  root key: %-3s  %s%s" % (
+            i + 1, r.get("account") or "-", r.get("device") if r.get("device") is not None else "-", labels[i],
+            "{:,}".format(r.get("messages") or 0), fmt(r.get("oldest")), fmt(r.get("newest")),
+            "yes" if r.get("has_root_key") else "no", state,
+            "   <- selected" if r.get("selected") else ""))
+        if r.get("deleted_files_ignored"):
+            lines.append("       (%d empty file(s) the database no longer lists -- deleted files in the copy -- ignored)"
+                         % r["deleted_files_ignored"])
+    return lines
 
 _CACHE = {}
 
@@ -515,30 +640,34 @@ def load_source(profile: str, partition: str | None = None) -> dict:
                             "messages": len(r[2].get("model-storage", {}).get("message", [])),
                             "has_root_key": bool(r[2].get("wawc_db_enc", {}).get("keys")),
                             "signed_in": "WALid" in r[3] or "last-wid-md" in r[3],
-                            "account": _account(r[3]),
+                            "account": _account(r[3]), "device": _device(r[3]), "wid": _wid(r[3]),
+                            "oldest": _msg_range(r[2])[0], "newest": _msg_range(r[2])[1],
+                            "incomplete_tables": _incomplete(r[4]),
+                            "deleted_files_ignored": len(r[4].get("deleted_files_ignored") or []),
+                            "selected": r is chosen,
                             "read": r[4]} for r in results],
             "localStorage_keys_without_idb": sorted(set(lss) - {r[1] for r in results}),
             "selected": chosen[1] if chosen else None,
             "selected_layout": chosen[0]["layout"] if chosen else None,
         })
-        if len(results) > 1:
-            for r in results:
-                log.info("partition %-16s account=%-22s messages=%-8d root_key=%-3s %s%s", r[0]["layout"],
-                         _account(r[3]) or "-", len(r[2].get("model-storage", {}).get("message", [])),
-                         "yes" if r[2].get("wawc_db_enc", {}).get("keys") else "no", r[1],
-                         "   <- selected" if r is chosen else "")
+        rows = ACQUISITION["partitions"]
+        if len(results) > 1 or any(r["incomplete_tables"] for r in rows):
+            log.info("WhatsApp sessions in this profile:")
+            for line in session_summary(rows):
+                log.info(line)
         signed = [r for r in results if _account(r[3]) and r[2].get("model-storage", {}).get("message")]
-        if len(signed) > 1 and partition is None:
-            ACQUISITION["multiple_accounts"] = [_account(r[3]) for r in signed]
-            log.warning("this profile holds %d signed-in WhatsApp sessions (%s). Exporting %s only; run again "
-                        "with --partition <account or storage key> for each of the others.", len(signed),
-                        ", ".join(_account(r[3]) for r in signed), _account(chosen[3]) if chosen else "?")
+        if len(signed) > 1:
+            ACQUISITION["multiple_accounts"] = [_wid(r[3]) or _account(r[3]) for r in signed]
         if chosen:
             rep = chosen[4]
-            if rep.get("tables_skipped") or rep.get("log_records_torn"):
-                log.warning("damaged acquisition: %d table(s) unreadable, %d torn log record(s) — "
-                            "records in them are missing from every output",
-                            len(rep.get("tables_skipped", [])), rep.get("log_records_torn", 0))
+            if _incomplete(rep):
+                log.warning("the selected session's copy is incomplete: %d table(s) its database lists as live "
+                            "are empty or missing -- usually a copy taken while the browser was still writing, or "
+                            "read below the file system before recent writes reached the disk. Records in them are "
+                            "missing from every output; copy the profile again (browser closed) for a complete set.",
+                            _incomplete(rep))
+            if rep.get("log_records_torn"):
+                log.warning("%d log record(s) cut off in the copy were skipped", rep.get("log_records_torn", 0))
             if rep.get("inferred_stores"):
                 log.warning("IndexedDB metadata is missing (copied while the browser was writing?); "
                             "%d store(s) identified by their record fields instead of by name",

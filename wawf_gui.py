@@ -143,19 +143,24 @@ def profile_summary(profile):
     except Exception:
         return ""
 
+ALL_SESSIONS = "All sessions (each in its own folder)"
+
 def session_accounts(profile):
-    """[(account, storage key)] of every signed-in WhatsApp session in a Chromium profile. Reads only
-    localStorage (small), so it is fast enough to run when a profile is picked."""
+    """[(label, '<account>:<device>')] of every signed-in WhatsApp session in a Chromium profile, most
+    recent login first. Reads only localStorage (small), so it is fast enough to run when a profile is picked."""
     try:
         sys.path.insert(0, os.path.join(HERE, "scripts"))
         import chromium_reader as cr
         if not cr.is_chromium_profile(profile): return []
-        out = []
+        rows = []
         for sk, ls in cr.read_localstorage_all(profile).items():
-            acct = cr._account(ls)
-            if acct: out.append((acct, sk))
+            if cr._account(ls):
+                rows.append({"account": cr._account(ls), "device": cr._device(ls), "wid": cr._wid(ls) or cr._account(ls)})
         cr.cleanup()
-        return out
+        rows.sort(key=lambda r: -(r["device"] or 0))
+        labels = cr.session_labels(rows)
+        return [("%s · device %s (%s)" % (r["account"], r["device"] if r["device"] is not None else "?", labels[i]),
+                 r["wid"]) for i, r in enumerate(rows)]
     except Exception:
         return []
 
@@ -379,7 +384,7 @@ class App(tk.Tk):
         ttk.Label(self.acct_row, text="This profile has more than one WhatsApp account. Examine:",
                   style="Card.TLabel").pack(side="left")
         self.account = tk.StringVar()
-        self.acct_box = ttk.Combobox(self.acct_row, textvariable=self.account, state="readonly", width=24, font=FONT)
+        self.acct_box = ttk.Combobox(self.acct_row, textvariable=self.account, state="readonly", width=52, font=FONT)
         self._tip(self.acct_box, "account")
         self.acct_box.pack(side="left", padx=(8, 0))
         self._accounts = []
@@ -670,7 +675,8 @@ class App(tk.Tk):
         if not prof or not os.path.isdir(prof):
             raise ValueError("Choose a browser profile folder that exists.")
         src = [prof]
-        if len(self._accounts) > 1 and self.account.get(): src += ["--partition", self.account.get()]
+        if len(self._accounts) > 1 and self.account.get() not in ("", ALL_SESSIONS):
+            src += ["--partition", dict(self._accounts).get(self.account.get(), self.account.get())]
         return src
 
     def _command(self):
@@ -807,8 +813,8 @@ class App(tk.Tk):
         if profile != self._profile_path(): return          # the user has picked another profile since
         self._accounts = accts
         if len(accts) > 1:
-            self.acct_box["values"] = [a for a, _ in accts]
-            self.account.set(accts[0][0])
+            self.acct_box["values"] = [ALL_SESSIONS] + [a for a, _ in accts]
+            self.account.set(ALL_SESSIONS)
             self.acct_row.grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
         else:
             self.acct_row.grid_remove()

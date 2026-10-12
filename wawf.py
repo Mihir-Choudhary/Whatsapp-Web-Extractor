@@ -292,11 +292,40 @@ def _require_source(a, cmd="<command>"):
             elif len(found) > 1:
                 _usage("that folder holds %d browser profiles with WhatsApp Web storage; pass the one to examine:\n  %s"
                        % (len(found), "\n  ".join(found)))
+        if (chromium or firefox) and _browser_running(prof):
+            a.browser_running = True
+            log.warning("the browser is running on this profile. Its storage changes while it is read, and the "
+                        "newest writes may not be in the copy -- close the browser for a complete, consistent "
+                        "read. Signing in as its linked device (--queue, --history) is refused while it runs.")
         if not chromium and not firefox:
             _usage("that directory is not a browser profile with WhatsApp Web storage:\n  %s\n\n"
                    "Expected either an IndexedDB folder (Chrome/Edge/Brave/Opera) or\n"
                    "storage/default/https+++web.whatsapp.com (Firefox) inside it.\n\n"
                    "Profile locations on this system:\n%s" % (prof, _profile_help()))
+
+def _browser_running(profile):
+    """True if the browser that owns this profile is running (it holds its lock), False if not, None if
+    unknown. Chromium family: <User Data>/lockfile (Windows, held open) or SingletonLock (Linux/macOS,
+    'host-pid' link). Firefox: parent.lock in the profile (Windows) or its 'lock' link."""
+    cands = [os.path.join(os.path.dirname(os.path.abspath(profile)), n) for n in ("lockfile", "SingletonLock")]
+    cands += [os.path.join(profile, n) for n in ("parent.lock", "lock")]
+    for p in cands:
+        if os.path.islink(p):                       # 'host-pid'
+            try:
+                pid = int(os.readlink(p).rsplit("-", 1)[1])
+                os.kill(pid, 0)
+                return True
+            except (ValueError, IndexError, OSError):
+                return False
+        if os.path.isfile(p) and sys.platform == "win32":
+            try:
+                open(p, "rb").close()
+                return False
+            except PermissionError:
+                return True
+            except OSError:
+                return None
+    return None
 
 def _has_whatsapp_storage(d):
     """Cheap test (no store is read): does this profile folder hold WhatsApp Web storage?"""
@@ -402,6 +431,66 @@ def _summary(engine, ls, msgs, meta):
     log.info("  msg types   : %s", top)
     log.info("─────────────────────────────────")
 
+def cmd_run_sessions(a):
+    """The default action for a profile: every signed-in WhatsApp session in it, each exported into its own
+    folder under every --out (most recent login first), unless --partition names one."""
+    if getattr(a, "partition", None) or not (a.profile and _is_chromium(a.profile)):
+        return cmd_run(a)
+    import copy as _copy
+    import chromium_reader as cr
+    cr.load_source(a.profile)
+    rows = [r for r in cr.ACQUISITION.get("partitions", []) if r.get("account") and r.get("messages")]
+    if len(rows) <= 1:
+        return cmd_run(a)
+    rows.sort(key=lambda r: (r.get("device") is None, -(r.get("device") or 0), -(r.get("messages") or 0)))
+    labels = cr.session_labels(rows)
+    selected = cr.ACQUISITION.get("selected")
+    log.info("this profile holds %d WhatsApp sessions; each is exported into its own folder:", len(rows))
+    for line in cr.session_summary(rows):
+        log.info(line)
+    outs = [_parse_out(s) for s in (a.out or [])] or [(None, "wawf_out")]
+    done, rc_all = [], 0
+    for i, r in enumerate(rows):
+        name = "session-%d_%s" % (i + 1, (r.get("wid") or r.get("account") or "unknown").replace(":", "-device"))
+        sub = _copy.copy(a)
+        sub.partition = r["storage_key"]
+        if getattr(a, "history_file", None) and r["storage_key"] != selected:
+            sub.history_file = None                    # the queue / history belongs to the selected session
+        sub.out = [("%s:%s" % (fmt, os.path.join(path, name)) if fmt else os.path.join(path, name))
+                   for fmt, path in outs]
+        if getattr(a, "creds", None):
+            try:
+                cd = json.load(open(a.creds))
+                if "%s:%s" % (cd.get("user"), cd.get("device")) != (r.get("wid") or ""):
+                    sub.creds = None                       # those credentials belong to another device
+            except Exception:
+                sub.creds = None
+        os.environ["WAWF_PARTITION"] = r["storage_key"]
+        log.info("=== session %d of %d: %s, device %s (%s) -> %s", i + 1, len(rows), r.get("account"),
+                 r.get("device"), labels[i], name)
+        rc = cmd_run(sub)
+        if rc == 3 and getattr(a, "key", None):
+            log.warning("the given key does not open this session (each linked device has its own key); "
+                        "%s", "exporting it without message text" if getattr(a, "offline", False)
+                        else "capturing this session's own key")
+            sub.key = None
+            rc = cmd_run(sub)
+        done.append({"session": i + 1, "folder": name, "account": r.get("account"), "device": r.get("device"),
+                     "label": labels[i], "messages": r.get("messages"), "oldest": r.get("oldest"),
+                     "newest": r.get("newest"), "incomplete_tables": r.get("incomplete_tables"),
+                     "storage_key": r.get("storage_key"), "exit": rc})
+        rc_all = rc_all or rc
+    os.environ.pop("WAWF_PARTITION", None)
+    for fmt, path in outs:
+        try:
+            os.makedirs(path, exist_ok=True)
+            with open(os.path.join(path, "sessions.json"), "w", encoding="utf-8") as f:
+                json.dump({"profile": a.profile, "sessions": done}, f, indent=1)
+            AUDIT.artifact(os.path.join(path, "sessions.json"), kind="sessions in the profile and where each was exported")
+        except OSError as e:
+            log.warning("could not write sessions.json in %s: %s", path, e)
+    return rc_all
+
 def cmd_run(a):
     """THE DEFAULT ACTION and the whole point of the tool: recover the device credentials from the profile,
     obtain the at-rest key, and decrypt — in one step. Previously this was three separate sub-commands
@@ -436,9 +525,14 @@ def cmd_run(a):
         if getattr(a, "offline", False):
             creds_path = None                         # credentials only serve the network login
             log.info("      --offline: skipped (they are only needed to sign in)")
-        elif cmd_creds(argparse.Namespace(profile=a.profile, origin=a.origin, out=creds_path, _internal=True)):
-            log.warning("device credentials could not be recovered; continuing without network key capture")
-            creds_path = None
+        else:
+            try:
+                bad = cmd_creds(argparse.Namespace(profile=a.profile, origin=a.origin, out=creds_path, _internal=True))
+            except SystemExit as e:
+                log.warning("%s", e); bad = True
+            if bad:
+                log.warning("device credentials could not be recovered; continuing without network key capture")
+                creds_path = None
 
     key = _find_key(a, workdir, outs)
     # Record provenance HERE, where it is actually known. It used to be inferred further down as
@@ -1743,6 +1837,9 @@ def cmd_queue(a):
     Networked: recorded as activity on the account. Nothing a contact can see is sent (no receipts,
     no presence)."""
     _require_source(a, "queue")
+    if getattr(a, "browser_running", False):
+        log.error("--queue signs in as the linked device the open browser is using; close the browser first")
+        return 2
     if a.profile and _is_chromium(a.profile):
         eng = ["--profile", a.profile]
     else:
@@ -1846,6 +1943,9 @@ def cmd_history(a):
         log.info("history data dir: %s", work)
     # engine args shared by creds / signal-state / anchors
     _require_source(a, "history")                           # a profile (or --origin) is required; nothing is auto-detected
+    if getattr(a, "browser_running", False):
+        log.error("--history signs in as the linked device the open browser is using; close the browser first")
+        return 2
     if a.profile and _is_chromium(a.profile):
         eng = ["--profile", a.profile]
     else:
@@ -2189,13 +2289,15 @@ def cmd_list_partitions(a):
     import chromium_reader as cr
     cr.load_source(a.profile)
     rows = cr.ACQUISITION.get("partitions", [])
-    print(f"{'layout':<20} {'account':<22} {'messages':>9}  root key  storage key")
-    for r in rows:
-        print(f"{r['layout']:<20} {(r.get('account') or '-'):<22} {r['messages']:>9}  "
-              f"{'yes' if r['has_root_key'] else 'no ':<8}  {r['storage_key']}"
-              f"{'   <- default' if r['storage_key'] == cr.ACQUISITION.get('selected') else ''}")
-    print("WAWF_PARTITIONS_JSON " + json.dumps([{k: r.get(k) for k in ("layout", "account", "messages",
-          "has_root_key", "storage_key")} for r in rows]))
+    print("WhatsApp sessions in %s:" % a.profile)
+    for line in cr.session_summary(rows):
+        print(line)
+    print("Select one with --partition <account>:<device> (for example %s) or its storage key:" %
+          next((r.get("wid") for r in rows if r.get("wid")), "919000000000:3"))
+    for i, r in enumerate(rows):
+        print("  %d. %-14s %s" % (i + 1, r.get("wid") or "-", r.get("storage_key")))
+    print("WAWF_PARTITIONS_JSON " + json.dumps([{k: r.get(k) for k in ("layout", "account", "device", "wid", "messages",
+          "has_root_key", "incomplete_tables", "oldest", "newest", "storage_key")} for r in rows]))
     return 0
 
 def cmd_sqlite(a):
@@ -2276,6 +2378,13 @@ def _own_console():
     except Exception:
         return False
 
+def _missing_packages():
+    """Runtime packages that do not import in this interpreter (the standalone build bundles them)."""
+    import importlib.util
+    need = {"cryptography": "cryptography", "cramjam": "cramjam", "websocket": "websocket-client",
+            "ccl_chromium_reader": "ccl_chromium_reader"}
+    return [pkg for mod, pkg in need.items() if importlib.util.find_spec(mod) is None]
+
 def main():
     _win_utf8_console()                                  # render em dashes / arrows / box chars, not mojibake
     # frozen dispatch: `<exe> _runpy <script.py> [args...]` runs a bundled helper in-process
@@ -2305,6 +2414,15 @@ def main():
             print(f"the window is unavailable here ({e}); run `wawf -h` for the command line", file=sys.stderr)
             return 2
         return wawf_gui.main()
+    if not getattr(sys, "frozen", False) and not ({"-h", "--help"} & set(sys.argv[1:])):
+        missing = _missing_packages()
+        if missing:
+            print("This Python (%s) is missing package(s) the tool needs: %s\n"
+                  "Install them once with:\n  \"%s\" -m pip install -r \"%s\"\n"
+                  "(or use the standalone wawf.exe, which includes them)"
+                  % (sys.executable, ", ".join(missing), sys.executable, os.path.join(HERE, "requirements.txt")),
+                  file=sys.stderr)
+            return 2
     p = argparse.ArgumentParser(
         prog="wawf",
         description="WhatsApp Web Forensics (Firefox + Chromium). Point it at a browser profile and it "
@@ -2489,12 +2607,12 @@ def main():
             qf = getattr(a, "queue_export_file", None)
             if qf and os.path.isfile(qf) and not getattr(a, "history_file", None):
                 a.history_file = qf
-            return cmd_run(a)
+            return cmd_run_sessions(a)
         a.cmd, action = "decrypt+queue", _decrypt_then_queue
     elif a.history:
         a.cmd, action = "history", cmd_history
     else:
-        a.cmd, action = "decrypt", cmd_run
+        a.cmd, action = "decrypt", cmd_run_sessions
     # Inputs are checked BEFORE a case database is opened. Every command here needs a profile and
     # valid --out formats, and with the audit on by default a mistyped path was leaving a
     # chain-of-custody file behind for a run that never started -- in the working directory, which

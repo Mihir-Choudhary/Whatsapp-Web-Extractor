@@ -21,8 +21,9 @@ TIPS = {
              "the device keys and which account is signed in.\nCommand line: --local-storage DIR.",
     "st_cache": "Optional: a cache folder (CacheStorage, Cache_Data, Firefox cache2) to search for media "
                 "WhatsApp Web had cached.\nCommand line: --media-cache DIR.",
-    "account": "This profile holds more than one signed-in WhatsApp session; pick the account to examine. "
-               "Run again for each of the others.\nCommand line: --partition ACCOUNT.",
+    "account": "This profile holds more than one WhatsApp session -- for example an earlier login of a linked "
+               "device and the one that replaced it. 'All sessions' exports each into its own folder; or pick one.\n"
+               "Command line: (default: all) or --partition ACCOUNT:DEVICE.",
     # step 2
     "out": "Folder for everything this run writes: export\\ (chats), database\\ (SQLite), raw\\, the log and "
            "the chain-of-custody database. A new folder per case is best.",

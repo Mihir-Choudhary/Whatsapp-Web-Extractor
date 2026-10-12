@@ -104,8 +104,12 @@ try:
           and pair(a, "--media-cache") == cache and prof not in a)
     reset(); app.src_mode.set("stores"); app.st_idb.set(ff); a = args()
     check("a Firefox origin folder becomes --origin, no Local Storage needed", pair(a, "--origin") == ff and "--idb" not in a)
-    reset(); app._accounts = [("919000000001", "k1"), ("919000000002", "k2")]; app.account.set("919000000002"); a = args()
-    check("second account selected with --partition", pair(a, "--partition") == "919000000002")
+    accts = [("919000000001 · device 8 (most recent login)", "919000000001:8"),
+             ("919000000001 · device 7 (earlier login (replaced by device 8))", "919000000001:7")]
+    reset(); app._accounts = accts; app.account.set(accts[1][0]); a = args()
+    check("one session picked: --partition account:device", pair(a, "--partition") == "919000000001:7")
+    reset(); app._accounts = accts; app.account.set(G.ALL_SESSIONS); a = args()
+    check("all sessions: no --partition", "--partition" not in a)
 
     print("refusals")
     reset(); app.profile.set(os.path.join(tmp, "missing"))
