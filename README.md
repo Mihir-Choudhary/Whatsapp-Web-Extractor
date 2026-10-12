@@ -417,6 +417,9 @@ device's queue, so the queue is left exactly where it was: the next client that 
 contact can see is sent either: no delivery or read receipts, no presence. It is still a sign-in, recorded
 as activity on the account.
 
+**Close WhatsApp Web in the browser first.** The server allows one connection per device and the newer
+one replaces the other; if that happens the capture stops, says why, and exits with code 6.
+
 Group messages whose key handover a *previous* client took without keeping are left encrypted (and on
 the server); they are counted as `not decrypted`. View-once content is never in the queue (see the table
 above).
