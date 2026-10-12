@@ -128,7 +128,7 @@ def decode_row(pt: bytes):
     if "_unknown" in row or "currentMsg" not in row and "quotedMsg" not in row:
         return None
     # A field this map does not know may hold text. Rather than drop it, let the caller use its
-    # schema-free reader, which keeps every string. (None in the reference profile's 409,165 bodies.)
+    # schema-free reader, which keeps every string.
     if any(isinstance(row.get(k), dict) and "_unknown" in row[k] for k in ("currentMsg", "quotedMsg")):
         return None
     return row.get("currentMsg") or {}, row.get("quotedMsg")

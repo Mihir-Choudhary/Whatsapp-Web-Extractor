@@ -354,9 +354,8 @@ def _read_idb_dir(ldb_dir: str, blob_dir: str | None) -> tuple:
         if iid == 3 and dbid and sid: blob_index.append(r)
         if dbid == 0 or sid == 0 or iid != 1: continue      # metadata, not object data
         groups.setdefault((dbid, sid), []).append((r, k[plen:]))
-    # Every raw record was held twice from here on (in ccl's list and in `groups`) alongside the values
-    # decoded from them -- 7 GB peak on a 700 MB store. Metadata is already parsed, and only the blob
-    # index is consulted again, so ccl keeps just that.
+    # Metadata is already parsed and only the blob index is consulted again, so ccl keeps just that
+    # (otherwise every raw record is held twice alongside the decoded values).
     raw._fetched_records = blob_index
 
     blink = ccl_blink_value_deserializer.BlinkV8Deserializer()

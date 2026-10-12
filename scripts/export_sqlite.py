@@ -223,8 +223,8 @@ MTYPE = {'chat':0,'image':1,'ptt':2,'audio':2,'video':3,'vcard':4,'location':5,'
          'revoked':15,'notification_template':7,'protocol':7,'ciphertext':0,'status':116,'template':45,
          'rich_response':0,'unknown':0}
 def ack_status(a, from_me=1):
-    """WhatsApp Web `ack` -> Android message.status, measured on a profile + phone pair (29,428 sent
-    messages, 99.8% agreeing): 1 sent (one tick) -> 4, 2 delivered -> 5, 3 read -> 13, 4 played -> 8.
+    """WhatsApp Web `ack` -> Android message.status: 1 sent (one tick) -> 4, 2 delivered -> 5, 3 read -> 13,
+    4 played -> 8.
     An outgoing record with no ack is a system/control entry, which Android stores as 6. Received
     messages carry no status of ours: 0."""
     if not from_me: return 0
@@ -598,13 +598,11 @@ for o in store(REACT_SID):
     rx += 1
 
 # ---- message associations: album items, HD copies, motion photos -> message_association ----
-# The browser's own labels are MEDIA_ALBUM and UNKNOWN. Checked record by record against an Android
-# msgstore.db of the same account: MEDIA_ALBUM is Android's album item (2) in every case; UNKNOWN under a
-# VIDEO parent is the HD copy of that video (7) in every case; UNKNOWN under a PHOTO parent is either the
-# HD copy of the photo (12) or a motion photo (11), and nothing the browser stores tells the two apart
-# (same row type, same body). So those -- and anything else -- go only to wawf_message_association, with
-# the browser's label, instead of a guessed Android type. The HD/motion child itself is a stub in the
-# browser: WhatsApp Web keeps no media key for it.
+# The browser labels associations MEDIA_ALBUM or UNKNOWN. MEDIA_ALBUM is Android's album item (2); UNKNOWN
+# under a video parent is the video's HD copy (7); UNKNOWN under a photo parent is the photo's HD copy (12)
+# or a motion photo (11), which the browser's records do not distinguish, so those -- and anything else --
+# go only to wawf_message_association with the browser's label. WhatsApp Web keeps no media key for an HD
+# or motion-photo child.
 db.execute("""CREATE TABLE wawf_message_association(child_message_row_id INTEGER, parent_message_row_id INTEGER,
               child_key TEXT, parent_key TEXT, browser_association_type TEXT, meaning TEXT)""")
 na = nwa = 0

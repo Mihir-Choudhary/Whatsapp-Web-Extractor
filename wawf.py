@@ -282,10 +282,46 @@ def _require_source(a, cmd="<command>"):
         chromium = _is_chromium(prof)
         firefox = os.path.isdir(os.path.join(prof, "storage", "default", "https+++web.whatsapp.com"))
         if not chromium and not firefox:
+            # the profile may be nested inside the given folder: use it if there is exactly one
+            found = _nested_profiles(prof)
+            if len(found) == 1:
+                log.info("using the profile inside the given folder: %s", found[0])
+                a.profile = prof = found[0]
+                chromium = _is_chromium(prof)
+                firefox = not chromium
+            elif len(found) > 1:
+                _usage("that folder holds %d browser profiles with WhatsApp Web storage; pass the one to examine:\n  %s"
+                       % (len(found), "\n  ".join(found)))
+        if not chromium and not firefox:
             _usage("that directory is not a browser profile with WhatsApp Web storage:\n  %s\n\n"
                    "Expected either an IndexedDB folder (Chrome/Edge/Brave/Opera) or\n"
                    "storage/default/https+++web.whatsapp.com (Firefox) inside it.\n\n"
                    "Profile locations on this system:\n%s" % (prof, _profile_help()))
+
+def _has_whatsapp_storage(d):
+    """Cheap test (no store is read): does this profile folder hold WhatsApp Web storage?"""
+    if os.path.isdir(os.path.join(d, "storage", "default", "https+++web.whatsapp.com")):
+        return True
+    idb = os.path.join(d, "IndexedDB")
+    if os.path.isdir(idb) and any(n.startswith("https_web.whatsapp.com") for n in os.listdir(idb)):
+        return True
+    if os.path.isdir(os.path.join(d, "WebStorage")):
+        import chromium_reader as _cr
+        return bool(_cr._quota_buckets(d))       # the bucket index names each bucket's site
+    return False
+
+def _nested_profiles(root, depth=4):
+    """Profile folders with WhatsApp Web storage under `root`, at most `depth` levels down."""
+    out = []
+    for cur, dirs, _ in os.walk(root):
+        rel = os.path.relpath(cur, root)
+        level = 0 if rel == "." else rel.count(os.sep) + 1
+        if level > depth:
+            dirs[:] = []; continue
+        if level and (_is_chromium(cur) or os.path.isdir(os.path.join(cur, "storage", "default"))) \
+                and _has_whatsapp_storage(cur):
+            out.append(os.path.normpath(cur)); dirs[:] = []          # do not descend into a profile
+    return sorted(out)
 
 def _require_session(ls, what="that profile"):
     """A browser can hold WhatsApp Web storage without being a logged-in session (site merely visited, or

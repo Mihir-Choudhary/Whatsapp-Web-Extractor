@@ -814,8 +814,8 @@ def merge_history(chats, recovered, ids, ts):
 def _disambiguate(who):
     """{sender key: legend row} -> {sender key: label as printed in this chat}.
 
-    Different people can share a display name -- one group here has five members called the same
-    thing -- and a transcript line naming only that name cannot be attributed. Within a chat, each
+    Different people can share a display name, and a transcript line naming only that name cannot be
+    attributed. Within a chat, each
     such label gets the last digits of that person's own number (or lid) appended, as many as it
     takes to tell them apart. Labels that are already unique are printed unchanged."""
     base = {k: _oneline(r["label"], _LABEL_MAX) for k, r in who.items() if r is not None}
