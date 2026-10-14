@@ -160,12 +160,35 @@ def _firefox_cache2(data: bytes):
 SOURCES = [
     ("chromium CacheStorage", "Service Worker/CacheStorage/**/*_0", (_chromium_simple,)),
     ("chromium CacheStorage", "Service Worker/CacheStorage/**/*_1", (_chromium_simple, _raw)),
+    # newer Chromium/Edge keep a partitioned origin's CacheStorage inside its storage bucket
+    ("chromium CacheStorage", "WebStorage/*/CacheStorage/**/*_0",   (_chromium_simple,)),
+    ("chromium CacheStorage", "WebStorage/*/CacheStorage/**/*_1",   (_chromium_simple, _raw)),
     ("chromium http cache",   "Cache/Cache_Data/**/*_0",            (_chromium_simple,)),
     ("chromium http cache",   "Cache/Cache_Data/f_*",               (_raw,)),
     ("chromium http cache",   "Cache/f_*",                          (_raw,)),
     ("firefox CacheStorage",  "**/cache/morgue/**/*.final",         (_firefox_morgue, _raw)),
     ("firefox http cache",    "cache2/entries/*",                   (_firefox_cache2, _raw)),
 ]
+
+# A cache folder given on its own (wawf --media-cache) is not at a known place inside a profile, so
+# every cache-entry shape is looked for anywhere beneath it.
+GIVEN = [
+    ("given cache", "**/*_0",          (_chromium_simple,)),
+    ("given cache", "**/*_1",          (_chromium_simple, _raw)),
+    ("given cache", "**/f_*",          (_raw,)),
+    ("given cache", "**/*.final",      (_firefox_morgue, _raw)),
+    ("given cache", "**/entries/*",    (_firefox_cache2, _raw)),
+]
+
+def _given_caches(path):
+    """Cache folders named in a given-stores description (see chromium_reader.PARTS_FILE)."""
+    out = [p for p in (os.environ.get("WAWF_MEDIA_CACHE") or "").split(os.pathsep) if p and os.path.isdir(p)]
+    f = os.path.join(path or "", "wawf_parts.json")
+    if os.path.isfile(f):
+        import json
+        with open(f, encoding="utf-8") as fh:
+            out += [p for p in (json.load(fh).get("media_cache") or []) if os.path.isdir(p)]
+    return out
 
 MIN_BLOB = 64                  # nothing smaller can be an encrypted media object
 MAX_BLOB = 256 * 1024 * 1024   # don't read a pathological file into memory
@@ -205,9 +228,15 @@ def recover(wanted, *paths, verbose=False, log=print):
     found, stats = {}, {"roots": 0, "files": 0, "bodies": 0, "by_source": {}}
     if not want:
         return found, stats
-    for root in cache_roots(*paths):
+    jobs = [(r, SOURCES) for r in cache_roots(*paths)]
+    seen_given = set()
+    for p in list(paths) + [None]:
+        for c in _given_caches(p):
+            if os.path.normcase(c) not in seen_given:
+                seen_given.add(os.path.normcase(c)); jobs.append((c, GIVEN))
+    for root, sources in jobs:
         stats["roots"] += 1
-        for label, pattern, extractors in SOURCES:
+        for label, pattern, extractors in sources:
             for path in glob.iglob(os.path.join(root, pattern), recursive=True):
                 if not os.path.isfile(path):
                     continue

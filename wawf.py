@@ -43,20 +43,38 @@ def _evidence_paths(src):
     the evidence. For Chromium that's the web.whatsapp.com IndexedDB (+ its external blob dir) and the
     localStorage LevelDB; a Firefox --origin dir already IS the store."""
     out = []
-    idb = os.path.join(src, "IndexedDB")
-    if os.path.isdir(idb):                                   # a Chromium profile dir
-        for suf in ("_0.indexeddb.leveldb", "_0.indexeddb.blob"):
-            p = os.path.join(idb, "https_web.whatsapp.com" + suf)
-            if os.path.exists(p): out.append(p)
-        lsd = os.path.join(src, "Local Storage", "leveldb")
-        if os.path.isdir(lsd): out.append(lsd)
+    if _is_chromium(src):
+        sys.path.insert(0, os.path.join(HERE, "scripts"))
+        import chromium_reader as cr
+        for p in cr.find_partitions(src):                    # legacy layout AND WebStorage/<bucket> partitions
+            out.append(p["leveldb"])
+            if p["blob"]: out.append(p["blob"])
+        for extra in (os.path.join("Local Storage", "leveldb"), os.path.join("WebStorage", "QuotaManager")):
+            if os.path.exists(os.path.join(src, extra)): out.append(os.path.join(src, extra))
     return out or [src]
+
+def _is_chromium(path):
+    """A Chromium source: a profile (either IndexedDB layout) or stores given on their own -- one
+    definition, chromium_reader's, so the CLI and every reader agree."""
+    sys.path.insert(0, os.path.join(HERE, "scripts"))
+    import chromium_reader as cr
+    return cr.is_chromium_profile(path)
 
 def _audit_evidence(src):
     """Record the evidence source: the profile/origin it came from, plus each WhatsApp store inside it with
     file count and total bytes."""
     if not src: return
     AUDIT.event("evidence source", category="acquire", detail={"profile_or_origin": src})
+    # Where the profile came from, read from its own files -- the folder may have been copied anywhere
+    # and renamed. Best effort: an unidentifiable profile is still examined.
+    try:
+        sys.path.insert(0, os.path.join(HERE, "scripts"))
+        import profile_identity as _pi
+        info = _pi.identify(src)
+        log.info("profile: %s", _pi.summary(info))
+        AUDIT.event("profile identity", category="acquire", detail=info)
+    except Exception as e:
+        log.debug("profile identity not determined: %s", e)
     for p in _evidence_paths(src):
         AUDIT.dir_read(p, purpose="WhatsApp Web store (evidence)")
 
@@ -243,6 +261,8 @@ def _usage(msg):
     log.error("%s", msg)
     raise SystemExit(2)
 
+_WARNED = {}
+
 def _require_source(a, cmd="<command>"):
     """Every data command needs an explicit profile (or Firefox --origin). Nothing is guessed: which
     profile gets examined is always the user's choice. Fail with the paths to look in, not a bare usage line."""
@@ -261,13 +281,40 @@ def _require_source(a, cmd="<command>"):
             _usage("no such %s directory:\n  %s\n\nProfile locations on this system:\n%s"
                    % (what, path, _profile_help()))
     if prof and not orig:
-        chromium = os.path.isdir(os.path.join(prof, "IndexedDB"))
+        chromium = _is_chromium(prof)
         firefox = os.path.isdir(os.path.join(prof, "storage", "default", "https+++web.whatsapp.com"))
+        if not chromium and not firefox:
+            # the profile may be nested inside the given folder: use it if there is exactly one
+            found = _nested_profiles(prof)
+            if len(found) == 1:
+                log.info("using the profile inside the given folder: %s", found[0])
+                a.profile = prof = found[0]
+                chromium = _is_chromium(prof)
+                firefox = not chromium
+            elif len(found) > 1:
+                _usage("that folder holds %d browser profiles with WhatsApp Web storage; pass the one to examine:\n  %s"
+                       % (len(found), "\n  ".join(found)))
+        if (chromium or firefox) and not getattr(a, "_running_checked", False):
+            a._running_checked = True
+            a.browser_running = bool(_browser_running(prof))
+        if (chromium or firefox) and a.browser_running and not _WARNED.get("running"):
+            _WARNED["running"] = True
+            log.warning("the browser is running on this profile: what it writes during the read may be missing "
+                        "-- close it for a complete read. The export and the key work while it runs; the server "
+                        "queue and history do not (they need the device's connection, which the browser holds).")
         if not chromium and not firefox:
             _usage("that directory is not a browser profile with WhatsApp Web storage:\n  %s\n\n"
                    "Expected either an IndexedDB folder (Chrome/Edge/Brave/Opera) or\n"
                    "storage/default/https+++web.whatsapp.com (Firefox) inside it.\n\n"
                    "Profile locations on this system:\n%s" % (prof, _profile_help()))
+
+def _browser_running(profile):
+    import profile_identity as _pi
+    return _pi.browser_running(profile)
+
+def _nested_profiles(root, depth=4):
+    import profile_identity as _pi
+    return _pi.nested_profiles(root, depth)
 
 def _require_session(ls, what="that profile"):
     """A browser can hold WhatsApp Web storage without being a logged-in session (site merely visited, or
@@ -288,6 +335,7 @@ def _load_wa(a):
     AUDIT.event("reading browser storage (IndexedDB + localStorage) — can take a minute on a large profile",
                 category="stage", detail={"source": src})
     engine, ls, root, msgs, meta, ids = WD.load(getattr(a, "profile", None), getattr(a, "origin", None))
+    _audit_acquisition(engine)
     log.info("engine=%s  messages=%d  root_key=%s  ls_keys=%d", engine, len(msgs), "yes" if root else "NO", len(ls))
     # what came OUT of the evidence source, and the on-disk root key that everything derives from
     AUDIT.event("loaded WhatsApp Web store", category="acquire",
@@ -297,8 +345,23 @@ def _load_wa(a):
         AUDIT.crypto("recover", key=root, key_source="IndexedDB wawc_db_enc/keys (root key, non-extractable "
                      "CryptoKey serialized to disk)", input_desc=src,
                      detail={"engine": engine, "root_len": len(root)})
-    if not root: raise SystemExit("root key not found in wawc_db_enc/keys (is this a WhatsApp Web profile?)")
+    if not root:
+        if getattr(a, "enc_static", None) or not msgs:
+            raise SystemExit("root key not found in wawc_db_enc/keys (is this a WhatsApp Web profile?)")
+        # A damaged copy can keep the messages and lose the key store. Everything but text still exports.
+        log.warning("root key not found in wawc_db_enc/keys: message text cannot be decrypted from this "
+                    "copy; exporting everything else")
     return WD, engine, ls, root, msgs, meta, ids
+
+def _audit_acquisition(engine):
+    """Record which storage partition was examined, every other one found, and what was unreadable."""
+    if engine != "chromium": return
+    try:
+        import chromium_reader as cr
+    except ImportError:
+        return
+    if cr.ACQUISITION:
+        AUDIT.event("storage partitions", category="acquire", detail=cr.ACQUISITION)
 
 def _msg_date(v):
     try:
@@ -332,6 +395,89 @@ def _summary(engine, ls, msgs, meta):
     log.info("  msg types   : %s", top)
     log.info("─────────────────────────────────")
 
+def _run_with_keys(a):
+    """cmd_run with each --key in turn until one opens the session; with none that does, the session's own
+    key is captured (or, offline, it is exported without message text)."""
+    keys = list(getattr(a, "keys", None) or ([a.key] if getattr(a, "key", None) else []))
+    for i, k in enumerate(keys):
+        a.key = k
+        if i < len(keys) - 1:
+            os.environ["WAWF_KEY_TRIAL"] = "1"         # another key follows: a mismatch is expected
+        try:
+            rc = cmd_run(a)
+        finally:
+            os.environ.pop("WAWF_KEY_TRIAL", None)
+        if rc != 3:
+            return rc
+        log.info("the key in %s does not open this session; trying the next", k)
+    if keys:
+        log.warning("none of the given keys opens this session (each linked device has its own key); %s",
+                    "exporting it without message text" if getattr(a, "offline", False) else "capturing its own key")
+    a.key = None
+    return cmd_run(a)
+
+def _report_steps(steps):
+    """Log which steps of a run completed; the exit code is the export's if there was one."""
+    log.info("run summary: " + "; ".join("%s %s" % (k, "done" if not v else "NOT done (exit %s)" % v)
+                                         for k, v in steps.items()))
+    return steps.get("export", next((v for v in steps.values() if v), 0))
+
+def cmd_run_sessions(a):
+    """The default action for a profile: every signed-in WhatsApp session in it, each exported into its own
+    folder under every --out (most recent login first), unless --partition names one."""
+    if getattr(a, "partition", None) or not (a.profile and _is_chromium(a.profile)):
+        return _run_with_keys(a)
+    import copy as _copy
+    import chromium_reader as cr
+    cr.load_source(a.profile)
+    rows = [r for r in cr.ACQUISITION.get("partitions", []) if r.get("account") and r.get("messages")]
+    if len(rows) <= 1:
+        return _run_with_keys(a)
+    rows.sort(key=lambda r: (r.get("device") is None, -(r.get("device") or 0), -(r.get("messages") or 0)))
+    labels = cr.session_labels(rows)
+    selected = cr.ACQUISITION.get("selected")
+    log.info("this profile holds %d WhatsApp sessions; each is exported into its own folder:", len(rows))
+    for line in cr.session_summary(rows):
+        log.info(line)
+    outs = [_parse_out(s) for s in (a.out or [])] or [(None, "wawf_out")]
+    done, rc_all = [], 0
+    for i, r in enumerate(rows):
+        name = "session-%d_%s" % (i + 1, (r.get("wid") or r.get("account") or "unknown").replace(":", "-device"))
+        sub = _copy.copy(a)
+        sub.partition = r["storage_key"]
+        if getattr(a, "history_file", None) and r["storage_key"] != selected:
+            sub.history_file = None                    # the queue / history belongs to the selected session
+        sub.out = [("%s:%s" % (fmt, os.path.join(path, name)) if fmt else os.path.join(path, name))
+                   for fmt, path in outs]
+        if getattr(a, "creds", None):
+            try:
+                cd = json.load(open(a.creds))
+                if "%s:%s" % (cd.get("user"), cd.get("device")) != (r.get("wid") or ""):
+                    sub.creds = None                       # those credentials belong to another device
+            except Exception:
+                sub.creds = None
+        os.environ["WAWF_PARTITION"] = r["storage_key"]
+        log.info("=== session %d of %d: %s, device %s (%s) -> %s", i + 1, len(rows), r.get("account"),
+                 r.get("device"), labels[i], name)
+        rc = _run_with_keys(sub)
+        utc = lambda t: dt.datetime.fromtimestamp(t, dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if t else None
+        done.append({"session": i + 1, "folder": name, "account": r.get("account"), "device": r.get("device"),
+                     "label": labels[i], "messages": r.get("messages"), "oldest": r.get("oldest"),
+                     "newest": r.get("newest"), "oldest_utc": utc(r.get("oldest")), "newest_utc": utc(r.get("newest")),
+                     "incomplete_tables": r.get("incomplete_tables"),
+                     "storage_key": r.get("storage_key"), "exit": rc})
+        rc_all = rc_all or rc
+    os.environ.pop("WAWF_PARTITION", None)
+    for fmt, path in outs:
+        try:
+            os.makedirs(path, exist_ok=True)
+            with open(os.path.join(path, "sessions.json"), "w", encoding="utf-8") as f:
+                json.dump({"profile": a.profile, "sessions": done}, f, indent=1)
+            AUDIT.artifact(os.path.join(path, "sessions.json"), kind="sessions in the profile and where each was exported")
+        except OSError as e:
+            log.warning("could not write sessions.json in %s: %s", path, e)
+    return rc_all
+
 def cmd_run(a):
     """THE DEFAULT ACTION and the whole point of the tool: recover the device credentials from the profile,
     obtain the at-rest key, and decrypt — in one step. Previously this was three separate sub-commands
@@ -363,8 +509,17 @@ def cmd_run(a):
     else:
         log.info("[1/3] recovering device credentials from the profile ...")
         creds_path = os.path.join(workdir, "creds_in.json")
-        if cmd_creds(argparse.Namespace(profile=a.profile, origin=a.origin, out=creds_path, _internal=True)):
-            return 3
+        if getattr(a, "offline", False):
+            creds_path = None                         # credentials only serve the network login
+            log.info("      --offline: skipped (they are only needed to sign in)")
+        else:
+            try:
+                bad = cmd_creds(argparse.Namespace(profile=a.profile, origin=a.origin, out=creds_path, _internal=True))
+            except SystemExit as e:
+                log.warning("%s", e); bad = True
+            if bad:
+                log.warning("device credentials could not be recovered; continuing without network key capture")
+                creds_path = None
 
     key = _find_key(a, workdir, outs)
     # Record provenance HERE, where it is actually known. It used to be inferred further down as
@@ -380,19 +535,20 @@ def cmd_run(a):
         log.error("--key was given but could not be used, so stopping rather than reaching for the "
                   "network. Fix the file, or omit --key to capture a fresh one deliberately.")
         return 3
-    if not key:
+    if not key and getattr(a, "offline", False):
+        log.info("[2/3] --offline: no key on hand and the network is not used -- exporting everything "
+                 "except message text")
+        key_was_guessed = False
+    elif not key:
         log.info("[2/3] reconnecting as the linked device to capture the at-rest key (NETWORKED) ...")
         keyfile = os.path.join(workdir, KEY_FILENAME)
         rc = cmd_reconnect(argparse.Namespace(profile=a.profile, origin=a.origin, creds=creds_path,
-                                              out=keyfile, verbose=a.verbose))
-        if rc:
-            log.error("could not capture the at-rest key, so there is nothing to decrypt with. "
-                      "Point --key at a companion_enc_static.txt captured earlier, or recover the key from "
-                      "memory with --memory.")
-            return rc
-        key = _read_key_file(keyfile)
+                                              out=keyfile, verbose=a.verbose)) if creds_path else 3
+        key = _read_key_file(keyfile) if not rc else None
         if not key:
-            return 3
+            log.warning("could not capture the at-rest key, so message TEXT cannot be decrypted. Exporting "
+                        "everything else. To decrypt later, point --key at a companion_enc_static.txt "
+                        "captured earlier.")
         key_was_guessed = False          # just captured from the server; not a guess
 
     # An auto-detected key can be STALE, and silently trusting it is the exact mistake that cost this
@@ -424,7 +580,7 @@ def cmd_run(a):
                 return rc
         return 0
 
-    if guessed:
+    if guessed and key:
         log.info("[3/3] decrypting to %d output(s) ...", len(outs))
         rc = _decrypt_all(key)
         if rc != 3:
@@ -456,7 +612,25 @@ def cmd_run(a):
             rc = cmd_decrypt(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=key,
                                                 out=path, only=fmt, history_file=hf))
         if rc: return rc
+    # A --history run fetches media itself once the recovered messages are merged; a plain run does it here.
+    if getattr(a, "fetch_media", False) and not hf:
+        _fetch_media(a, [path for fmt, path in outs if fmt == "sqlite"])
     return 0
+
+def _fetch_media(a, sqlite_dirs):
+    """Download, decrypt and verify media the browser never cached, from WhatsApp's CDN (networked).
+    Each message carries its own mediaKey; a url whose signature has expired is skipped unasked."""
+    if not sqlite_dirs:
+        log.warning("--fetch-media needs an --out sqlite:PATH export to work from; nothing fetched")
+        return
+    for path in sqlite_dirs:
+        db = os.path.join(path, "msgstore.db")
+        if not os.path.isfile(db):
+            log.warning("--fetch-media: no msgstore.db in %s", path); continue
+        log.info("--fetch-media: downloading media the browser never cached from WhatsApp's CDN "
+                 "(NETWORKED; newest first; expired links are skipped)")
+        _sub("mediafetch.py", ["--db", db, "--cdn"] + (["--profile", a.profile] if a.profile else []) +
+             (["--origin", a.origin] if a.origin else []))
 
 KEY_FILENAME = "companion_enc_static.txt"
 
@@ -658,7 +832,7 @@ def cmd_raw(a):
     the store plus a decryption, and never a substitute for it. One JSONL file per object store.
     """
     _require_source(a, "raw")
-    if a.profile and os.path.isdir(os.path.join(a.profile, "IndexedDB")):
+    if a.profile and _is_chromium(a.profile):
         sys.path.insert(0, os.path.join(HERE, "scripts"))
         import chromium_reader as cr
         # ONE call: load_source has no cache -- it re-reads localStorage and the whole IndexedDB and
@@ -725,7 +899,7 @@ def cmd_raw(a):
             if decrypt(_op)[0] is not None:
                 _good += 1
         if _refs and _good < len(_refs) * 0.5:
-            log.error("the at-rest key is INVALID for this profile/device (%d/%d reference bodies "
+            (log.info if os.environ.get("WAWF_KEY_TRIAL") else log.error)("the at-rest key is INVALID for this profile/device (%d/%d reference bodies "
                       "validate). Refusing to write a raw dump with nothing decrypted in it.",
                       _good, len(_refs))
             return 3
@@ -819,36 +993,39 @@ def cmd_decrypt(a):
     WD, engine, ls, root, msgs, meta, ids = _load_wa(a)
     _require_session(ls, getattr(a, "profile", None) or getattr(a, "origin", None))
     _summary(engine, ls, msgs, meta)
-    salt_ws = base64.b64decode(json.loads(ls["WAWebEncKeySalt"]))
     sch = collections.Counter(m["scheme"] for m in msgs if m["data"])
     log.info("message schemes: %s", dict(sch))
+    key = None
     if not a.enc_static:
-        log.info("no at-rest key available: offline inventory only. Message TEXT needs companion_enc_static "
-                 "(memory or reconnect). Media keys/metadata are already on disk.")
-        return 0
-    enc_static = base64.b64decode(a.enc_static)
-    key = HKDF(algorithm=hashes.SHA256(), length=16, salt=enc_static, info=salt_ws).derive(root)
-    # exactly what derived the message key, so an examiner can reproduce it: root (on disk) + server-only
-    # companion_enc_static as HKDF salt + WAWebEncKeySalt as info -> AES-CBC-128
-    AUDIT.crypto("derive", algorithm="AES-CBC-128", kdf="HKDF-SHA256 len=16", scheme="1 (final)",
-                 key=key, key_source="HKDF(root, salt=companion_enc_static, info=WAWebEncKeySalt)",
-                 salt=enc_static, salt_source="companion_enc_static (server-issued, never written to disk by the browser)",
-                 info="WAWebEncKeySalt (localStorage)", input_desc="msgRowOpaqueData._data (scheme 1)",
-                 detail={"root_fp": audit.fp(root), "root_len": len(root), "salt_len": len(enc_static)})
-    def strict(b): return bool(b) and len(b) % 16 == 0 and 1 <= b[-1] <= 16 and b[-b[-1]:] == bytes([b[-1]])*b[-1]
-    refs = [m for m in msgs if m["data"] and m["scheme"] == 1][:40]; good = 0   # scheme-1 only
-    for m in refs:
-        try:
-            if strict(Cipher(algorithms.AES(key), modes.CBC(m["iv"])).decryptor().update(m["data"])): good += 1
-        except Exception as e: log.debug("ref decrypt error: %s", e)
-    if refs and good < len(refs) * 0.5:
-        log.error("companion_enc_static INVALID for this profile/device (%d/%d refs validate). Not writing garbage.", good, len(refs))
-        AUDIT.crypto("verify", algorithm="AES-CBC-128", key=key, validated="FAILED",
+        log.warning("no message key: exporting everything except message text (bodies stay encrypted, "
+                    "marked body_status=encrypted)")
+        AUDIT.event("metadata-only export: message bodies left encrypted", category="crypto")
+    else:
+        enc_static = base64.b64decode(a.enc_static)
+        salt_ws = base64.b64decode(json.loads(ls["WAWebEncKeySalt"]))
+        key = HKDF(algorithm=hashes.SHA256(), length=16, salt=enc_static, info=salt_ws).derive(root)
+        # exactly what derived the message key, so an examiner can reproduce it: root (on disk) + server-only
+        # companion_enc_static as HKDF salt + WAWebEncKeySalt as info -> AES-CBC-128
+        AUDIT.crypto("derive", algorithm="AES-CBC-128", kdf="HKDF-SHA256 len=16", scheme="1 (final)",
+                     key=key, key_source="HKDF(root, salt=companion_enc_static, info=WAWebEncKeySalt)",
+                     salt=enc_static, salt_source="companion_enc_static (server-issued, never written to disk by the browser)",
+                     info="WAWebEncKeySalt (localStorage)", input_desc="msgRowOpaqueData._data (scheme 1)",
+                     detail={"root_fp": audit.fp(root), "root_len": len(root), "salt_len": len(enc_static)})
+        def strict(b): return bool(b) and len(b) % 16 == 0 and 1 <= b[-1] <= 16 and b[-b[-1]:] == bytes([b[-1]])*b[-1]
+        refs = [m for m in msgs if m["data"] and m["scheme"] == 1][:40]; good = 0   # scheme-1 only
+        for m in refs:
+            try:
+                if strict(Cipher(algorithms.AES(key), modes.CBC(m["iv"])).decryptor().update(m["data"])): good += 1
+            except Exception as e: log.debug("ref decrypt error: %s", e)
+        if refs and good < len(refs) * 0.5:
+            (log.info if os.environ.get("WAWF_KEY_TRIAL") else log.error)(
+                "companion_enc_static INVALID for this profile/device (%d/%d refs validate). Not writing garbage.", good, len(refs))
+            AUDIT.crypto("verify", algorithm="AES-CBC-128", key=key, validated="FAILED",
+                         input_desc="strict PKCS7 on reference ciphertexts", records_in=len(refs), records_ok=good)
+            return 3
+        log.info("companion_enc_static VALIDATED (%d/%d reference messages)", good, len(refs))
+        AUDIT.crypto("verify", algorithm="AES-CBC-128", key=key, validated="OK",
                      input_desc="strict PKCS7 on reference ciphertexts", records_in=len(refs), records_ok=good)
-        return 3
-    log.info("companion_enc_static VALIDATED (%d/%d reference messages)", good, len(refs))
-    AUDIT.crypto("verify", algorithm="AES-CBC-128", key=key, validated="OK",
-                 input_desc="strict PKCS7 on reference ciphertexts", records_in=len(refs), records_ok=good)
     os.makedirs(a.out, exist_ok=True)
     def ts(v):
         try:
@@ -862,6 +1039,8 @@ def cmd_decrypt(a):
         # message, measured). It is now a row with no text and a body_status saying why.
         if not m["data"]:
             nobody += 1; chats[m["chat"]].append(WD.bodyless_row(m, ts(m["t"]), ids, "none")); continue
+        if key is None:
+            chats[m["chat"]].append(WD.bodyless_row(m, ts(m["t"]), ids, "encrypted")); continue
         if m["scheme"] != 1:                     # never decrypt another scheme's body into garbage
             other += 1; chats[m["chat"]].append(WD.bodyless_row(m, ts(m["t"]), ids, "other-scheme")); continue
         # CBC consumes whole blocks: update() on a ciphertext that is not a multiple of 16 returns the
@@ -888,9 +1067,12 @@ def cmd_decrypt(a):
         try:
             rec = (json.load(open(hf, encoding="utf-8")) or {}).get("messages") or []
             hist_added, hist_skipped, touched = WD.merge_history(chats, rec, ids, ts)
-            log.info("history: +%s message(s) recovered from the phone across %d chat(s); "
+            _n = collections.Counter(r.get("source") or "phone" for r in rec)
+            _from = " and ".join("%s (%s offered)" % ({"phone": "the phone", "server-queue": "the server queue"}
+                                                      .get(k, k), f"{v:,}") for k, v in _n.items()) or "the phone"
+            log.info("merged: +%s message(s) from %s across %d chat(s); "
                      "%s already present in the browser's own store",
-                     f"{hist_added:,}", len(touched), f"{hist_skipped:,}")
+                     f"{hist_added:,}", _from, len(touched), f"{hist_skipped:,}")
         except Exception as e:
             log.error("could not merge recovered history from %s: %s", hf, e)
             return 1
@@ -913,8 +1095,12 @@ def cmd_decrypt(a):
                   indent=1, default=str)
         AUDIT.artifact(f"{a.out}/identities.json", kind="identity correlation (jid/lid/phone/name)",
                        records=len(tbl["identities"]))
+        nc = WD.write_contacts_csv(f"{a.out}/contacts.csv", ids)
+        AUDIT.artifact(f"{a.out}/contacts.csv", kind="contacts (contact store, one row per record)", records=nc)
+        log.info("contacts: %s record(s) -> %s/contacts.csv", f"{nc:,}", a.out)
     if only == "json":
-        log.info("decrypted %d bodies (%d failed) -> %s/ (chats.json + identities.json)", ok, fail, a.out)
+        log.info("%s -> %s/ (chats.json + identities.json)",
+                 "metadata only (no text)" if key is None else "decrypted %d bodies (%d failed)" % (ok, fail), a.out)
         AUDIT.artifact(f"{a.out}/chats.json", kind="decrypted chats (JSON)", records=sum(len(v) for v in chats.values()))
         # the same receipt the other formats leave: this branch returned before writing one, so a
         # json-only export was the one kind a later --history run could not describe
@@ -927,12 +1113,16 @@ def cmd_decrypt(a):
     # name what was actually written: with --out txt:PATH the JSON side is skipped, and a log line
     # that lists files that are not there is a log line that gets believed
     wrote = "transcripts.txt" if only == "txt" else "chats.json + identities.json + transcripts.txt"
-    log.info("decrypted %d bodies (%d failed) -> %s/ (%s)", ok, fail, a.out, wrote)
+    if key is None:
+        log.info("metadata only: %d messages written without text -> %s/ (%s)",
+                 sum(len(v) for v in chats.values()), a.out, wrote)
+    else:
+        log.info("decrypted %d bodies (%d failed) -> %s/ (%s)", ok, fail, a.out, wrote)
     if nobody or other or fail:
         log.info("also written without text, not dropped: %d message(s) with no stored body, %d with a "
                  "body of another scheme, %d that failed to decrypt (see body_status)", nobody, other, fail)
     # outcome of the bulk decrypt + hashes of what was produced (so the exports are tamper-evident)
-    AUDIT.crypto("decrypt", algorithm="AES-CBC-128", scheme="1 (final)", key=key,
+    if key is not None: AUDIT.crypto("decrypt", algorithm="AES-CBC-128", scheme="1 (final)", key=key,
                  input_desc="all scheme-1 msgRowOpaqueData bodies", records_in=ok + fail,
                  records_ok=ok, records_failed=fail, detail={"chats": len(chats)})
     # only record artifacts that were actually produced: with --out txt:PATH there is no chats.json,
@@ -955,7 +1145,7 @@ def _wa_user_prefs(profile, origin):
     old behaviour", so a profile shape we have not seen degrades instead of failing.
     """
     try:
-        if profile and os.path.isdir(os.path.join(profile, "IndexedDB")):
+        if profile and _is_chromium(profile):
             sys.path.insert(0, os.path.join(HERE, "scripts"))
             import chromium_reader as _cr
             recs = _cr.load_source(profile)["idb"].get("model-storage", {}).get("user-prefs", [])
@@ -1066,7 +1256,7 @@ def cmd_creds(a):
     _, BC = _imp()
     _require_source(a, "creds")                             # a profile (or --origin) is required; nothing is auto-detected
     if a.origin: ls, root, meta = BC.load_firefox(a.origin)
-    elif a.profile and os.path.isdir(os.path.join(a.profile, "IndexedDB")): ls, root, meta = BC.load_chromium(a.profile)
+    elif a.profile and _is_chromium(a.profile): ls, root, meta = BC.load_chromium(a.profile)
     elif a.profile: ls, root, meta = BC.load_firefox(os.path.join(a.profile, "storage/default/https+++web.whatsapp.com"))
     else: log.error("pass a profile or --origin"); return 2
     _require_session(ls, a.profile or a.origin)          # storage present but not logged in -> clear error
@@ -1183,7 +1373,7 @@ def cmd_memory(a):
     # Web profile; pass --origin or --profile", which reads like the path was wrong when the real
     # answer is that this mode does not cover that engine. Said here, before spawning anything.
     if getattr(a, "profile", None) and not getattr(a, "origin", None) \
-            and os.path.isdir(os.path.join(a.profile, "IndexedDB")):
+            and _is_chromium(a.profile):
         log.error("the memory scan validates candidate keys against a FIREFOX WhatsApp Web store, "
                   "and that is a Chromium profile. Either point --origin at a Firefox "
                   "storage/default/https+++web.whatsapp.com folder, or just run `wawf <PROFILE>`, "
@@ -1616,6 +1806,17 @@ def _history_export(a, targets, history_file=None):
     in. Both write the same paths -- the auto-naming that protects an EARLIER run's export happened
     once, before either call."""
     if not targets: return 0
+    a._exported = True
+    qf = getattr(a, "queue_export_file", None)
+    if qf and os.path.isfile(qf):                    # this run also recorded the server queue: merge both
+        merged = []
+        for f in (history_file, qf):
+            if f and os.path.isfile(f):
+                try: merged += (json.load(open(f, encoding="utf-8")) or {}).get("messages") or []
+                except Exception as e: log.warning("could not read %s: %s", f, e)
+        history_file = os.path.join(os.path.dirname(qf), "history_and_queue_for_export.json")
+        with open(history_file, "w", encoding="utf-8") as fh:
+            json.dump({"messages": merged}, fh, ensure_ascii=False)
     ns = argparse.Namespace(profile=a.profile, origin=a.origin, out=["%s:%s" % (f, p) if f else p
                                                                      for f, p in targets],
                             key=getattr(a, "key", None), verbose=getattr(a, "verbose", False),
@@ -1623,44 +1824,151 @@ def _history_export(a, targets, history_file=None):
                             history_file=history_file)
     return cmd_run(ns)
 
-def cmd_history(a):
-    """On-demand history sync: pull messages OLDER than the browser cache from WhatsApp's servers, per
-    chat, going back toward each chat's start — ITERATIVELY: each pass re-anchors on the oldest message
-    recovered so far and pulls deeper, accumulating (deduped) until it converges. Recovers creds + Signal
-    state + anchors (pure Python) then runs the Node/Baileys extractor. The Signal/E2E stack isn't ported
-    to Python, so this needs Node + `npm install` in tools/reconnect: the .exe will use that folder if it
-    sits next to the executable (e.g. the repo's dist/), but it is not bundled inside the .exe itself."""
-    rec = _find_reconnect_dir()
-    if not rec:
-        log.error("history needs the Node client (tools/reconnect/history_extract.js), which is not bundled "
-                  "in the .exe. Run wawf from the repo, or keep the .exe inside the repo (its dist/ folder is "
-                  "fine) so tools/reconnect sits alongside it.")
+def _creds_ok(a, out):
+    """Recover the device credentials into `out`. A copy that cannot yield them is reported (the reason
+    is logged) rather than ending the run: the export of what the copy holds still follows."""
+    try:
+        return not cmd_creds(argparse.Namespace(profile=a.profile, origin=a.origin, out=out, _internal=True))
+    except SystemExit as e:
+        log.error("%s", e)
+        return False
+
+def cmd_queue(a):
+    """--queue: record what WhatsApp's server is holding for the examined device, without taking it.
+
+    While the browser session is closed, the server queues for that device everything the account
+    receives (messages, group key handovers, receipts, call offers, notifications). This exports the
+    device's credentials and the browser's OWN Signal state (identity, sessions, group sender keys)
+    into a new folder, signs in as the device and journals every stanza the server delivers --
+    exactly as received, and each payload decrypted -- acknowledging nothing, so the server keeps
+    the queue for the browser. Each run starts from the browser's state again, in a folder of its own.
+
+    Networked: recorded as activity on the account. Nothing a contact can see is sent (no receipts,
+    no presence)."""
+    _require_source(a, "queue")
+    if getattr(a, "browser_running", False):
+        log.warning("server queue skipped: the browser is running on this profile. While WhatsApp Web is open it "
+                    "receives everything itself, so the server holds nothing for this device; close the browser "
+                    "and record the queue later (it fills while the browser stays closed).")
         return 2
-    # --install-node, not --yes: see the note in _ensure_node
-    node = _ensure_node(getattr(a, "yes", False), getattr(a, "install_node", False))
-    if not node: return 2
-    node_dir = os.path.dirname(node)                     # make node/npm resolvable for this run's subprocesses
-    if node_dir and node_dir not in os.environ.get("PATH", "").split(os.pathsep):
-        os.environ["PATH"] = node_dir + os.pathsep + os.environ.get("PATH", "")
-    if not _ensure_baileys(rec, node, getattr(a, "yes", False)): return 2   # find Baileys, or offer npm install
-    # Where OUTPUTS (creds/state/anchors/recovered history) go. For a standalone .exe the Node client (rec)
-    # lives inside the temp extraction dir, which is wiped on exit — so write outputs to a persistent folder
-    # next to the executable instead, and keep the resume ledger there across runs.
-    if getattr(sys, "frozen", False) and os.path.abspath(rec) == os.path.abspath(os.path.join(HERE, "tools", "reconnect")):
-        work = _pick_work_dir()                          # exact match on the bundled client, not a prefix test
-        log.info("history data dir: %s", work)
+    if a.profile and _is_chromium(a.profile):
+        eng = ["--profile", a.profile]
     else:
-        work = rec                                       # from-source / repo-adjacent: outputs live in tools/reconnect
+        origin = a.origin or (os.path.join(a.profile, "storage/default/https+++web.whatsapp.com") if a.profile else None)
+        if not origin: log.error("pass a profile or --origin"); return 2
+        eng = ["--origin", origin]
+    base = None
+    for spec in (a.out or []):
+        _, path = _parse_out(spec)
+        base = path; break
+    base = base or _pick_work_dir()
+    work = os.path.join(base, "server-queue", time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
+    os.makedirs(work, exist_ok=True)
+    log.info("server queue capture -> %s", work)
+    log.info("[1/3] recovering the device credentials ...")
+    if a.creds:
+        import shutil
+        shutil.copyfile(a.creds, os.path.join(work, "creds_in.json"))
+    elif not _creds_ok(a, os.path.join(work, "creds_in.json")):
+        log.error("server queue not recorded: no usable device credentials in this copy")
+        return 3
+    log.info("[2/3] exporting the browser's Signal state (sessions, group sender keys) ...")
+    if _sub("export_signal_state.py", eng + ["--out", os.path.join(work, "signal_state.json")]): return 3
+    log.info("[3/3] signing in as the device and recording the queue (nothing is acknowledged) ...")
+    if getattr(sys, "frozen", False):
+        qcmd = [sys.executable, "_runpy", "queue_capture.py"]
+    else:
+        qcmd = [sys.executable, os.path.join(HERE, "scripts", "queue_capture.py")]
+    env = dict(AUDIT.child_env() or os.environ)
+    env.update(PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYINSTALLER_RESET_ENVIRONMENT="1")
+    # The state this tool's own history runs left for this device (if any): after talking to the phone,
+    # its sessions with the phone are newer than the browser's, and the phone encrypts to them.
+    extra = [p for p in (os.path.join(d, "signal_runtime.py.json") for d in
+                         (os.path.join(HERE, "tools", "reconnect"), _pick_work_dir())) if os.path.isfile(p)]
+    if extra and not env.get("WAWF_QUEUE_EXTRA_STATE"):
+        env["WAWF_QUEUE_EXTRA_STATE"] = os.pathsep.join(extra)
+        log.info("also trying the Signal state this tool's history runs left: %s", ", ".join(extra))
+    AUDIT.event("server queue capture start", category="network",
+                detail={"argv": qcmd, "cwd": work, "ack_policy": env.get("WAWF_QUEUE_ACK", "none")})
+    rc = subprocess.run(qcmd, cwd=work, env=env).returncode
+    summ = {}
+    try: summ = json.load(open(os.path.join(work, "queue_summary.json"), encoding="utf-8"))
+    except Exception: pass
+    for name, kind in (("queue_journal.jsonl", "server queue journal (stanzas as received + decrypted payloads)"),
+                       ("queue_messages.json", "server queue, readable (one row per message)"),
+                       ("queue_summary.json", "server queue capture summary"),
+                       ("queue_for_export.json", "server queue messages as merged into the export")):
+        p = os.path.join(work, name)
+        if os.path.isfile(p): AUDIT.artifact(p, kind=kind)
+    AUDIT.event("server queue capture exit rc=%s" % rc, level="INFO" if rc == 0 else "ERROR", category="network",
+                detail={k: summ.get(k) for k in ("stats", "end_of_queue_marker", "messages", "decrypted", "not_decrypted")})
+    if summ.get("session_ended_by_server"):
+        log.warning("server queue: %s", summ["session_ended_by_server"])
+    if rc:
+        log.error("queue capture failed (exit %s)%s", rc,
+                  " -- close WhatsApp Web in every browser using this profile, then run again" if rc == 6 else
+                  " -- the server refused this device's login (the reason is printed above)" if rc == 2 else "")
+        return rc
+    st = summ.get("stats") or {}
+    log.info("server queue: %s stanzas recorded, %s acknowledged; %s messages (%s decrypted, %s not); "
+             "end-of-queue marker %s", st.get("journalled"), st.get("acked"), summ.get("messages"),
+             summ.get("decrypted"), summ.get("not_decrypted"),
+             "received" if summ.get("end_of_queue_marker") is not None else "NOT received (queue may be partial)")
+    log.info("readable: %s", os.path.join(work, "queue_messages.json"))
+    a.queue_export_file = os.path.join(work, "queue_for_export.json")
+    log.warning("%s holds the device's credentials and Signal state: key material -- keep it with the case, "
+                "never share it.", work)
+    return 0
+
+def cmd_history(a):
+    """On-demand history sync: pull messages OLDER than the browser cache from the account's phone, per
+    chat, going back toward each chat's start -- ITERATIVELY: each pass re-anchors on the oldest message
+    recovered so far and pulls deeper, accumulating (deduped) until it converges. Recovers creds, Signal
+    state and anchors from the profile, then runs the history client: scripts/history_extract.py (pure
+    Python, its own Signal implementation, no Node; works from the .exe), or the Baileys client in
+    tools/reconnect when WAWF_HISTORY_ENGINE=node."""
+    # The history client is pure Python by default (scripts/history_extract.py): no Node.js, and it runs
+    # from the standalone .exe. WAWF_HISTORY_ENGINE=node keeps the Baileys client (tools/reconnect).
+    engine = os.environ.get("WAWF_HISTORY_ENGINE", "python").strip().lower()
+    rec = _find_reconnect_dir()
+    node = None
+    if engine == "node":
+        if not rec:
+            log.error("WAWF_HISTORY_ENGINE=node needs the Node client (tools/reconnect/history_extract.js), "
+                      "which is not bundled in the .exe. Run wawf from the repo, or leave the engine at its "
+                      "default (python).")
+            return 2
+        # --install-node, not --yes: see the note in _ensure_node
+        node = _ensure_node(getattr(a, "yes", False), getattr(a, "install_node", False))
+        if not node: return 2
+        node_dir = os.path.dirname(node)                 # make node/npm resolvable for this run's subprocesses
+        if node_dir and node_dir not in os.environ.get("PATH", "").split(os.pathsep):
+            os.environ["PATH"] = node_dir + os.pathsep + os.environ.get("PATH", "")
+        if not _ensure_baileys(rec, node, getattr(a, "yes", False)): return 2
+    # Where OUTPUTS (creds/state/anchors/recovered history) go: beside a repo checkout's tools/reconnect,
+    # so earlier runs' ledgers keep resuming; for the .exe, a persistent folder next to the executable.
+    if rec and not (getattr(sys, "frozen", False) and
+                    os.path.abspath(rec) == os.path.abspath(os.path.join(HERE, "tools", "reconnect"))):
+        work = rec
+    else:
+        work = _pick_work_dir()
+        log.info("history data dir: %s", work)
     # engine args shared by creds / signal-state / anchors
     _require_source(a, "history")                           # a profile (or --origin) is required; nothing is auto-detected
-    if a.profile and os.path.isdir(os.path.join(a.profile, "IndexedDB")):
+    if getattr(a, "browser_running", False):
+        log.warning("history skipped: the browser is running on this profile. The phone sends history to the "
+                    "device's open connection -- the browser -- so this tool would not receive it; close the "
+                    "browser to recover history.")
+        return 2
+    if a.profile and _is_chromium(a.profile):
         eng = ["--profile", a.profile]
     else:
         origin = a.origin or (os.path.join(a.profile, "storage/default/https+++web.whatsapp.com") if a.profile else None)
         if not origin: log.error("pass a profile or --origin"); return 2
         eng = ["--origin", origin]
     log.info("[1/4] recovering reconnect creds ...")
-    if cmd_creds(argparse.Namespace(profile=a.profile, origin=a.origin, out=os.path.join(work, "creds_in.json"), _internal=True)):
+    if not _creds_ok(a, os.path.join(work, "creds_in.json")):
+        log.error("history not recovered: no usable device credentials in this copy")
         return 3
     log.info("[2/4] recovering Signal state (identity, prekeys, sessions, sender keys) ...")
     if _sub("export_signal_state.py", eng + ["--out", os.path.join(work, "signal_state.json")]): return 3
@@ -1733,16 +2041,18 @@ def cmd_history(a):
                 "is distinguishable from a refusal.")
     log.warning("SIDE EFFECT ON THE DEVICE: your phone's replies are end-to-end encrypted to a Signal "
                 "session, and the copy in the browser profile is a snapshot of a ratchet that keeps moving, "
-                "so this renegotiates that session and then keeps its own copy (signal_runtime.json, next "
-                "to the output — treat it as key material). The browser's stored session for this linked "
+                "so this renegotiates that session and then keeps its own copy (signal_runtime.py.json, or "
+                "signal_runtime.json for the Node client, next to the output — treat it as key material). The browser's stored session for this linked "
                 "device therefore goes stale; WhatsApp Web re-establishes it by itself the next time you "
                 "open it. Nothing on the phone or in the profile is modified.")
-    log.warning("KEEP signal_runtime.json (and its .bak) WITH THE CASE — it is NOT a cache. It holds the "
+    log.warning("KEEP signal_runtime.py.json / signal_runtime.json WITH THE CASE — it is NOT a cache. It holds the "
                 "only copy of the prekeys this tool published to WhatsApp's servers, which peers then "
                 "encrypt to, and of ratchet state the phone has already moved past. Delete it and "
                 "anything encrypted to those keys is permanently unreadable, even from the same profile. "
                 "Every run also advances that shared state, so run deliberately, not repeatedly.")
-    env = dict(os.environ, TOP="100000", COUNT="50", MAXPAGES="100000")   # every chat, page until exhausted
+    # every chat, page until exhausted -- unless TOP / MAXPAGES / COUNT are set to bound the sweep
+    env = dict(os.environ, TOP=os.environ.get("TOP", "100000"), COUNT=os.environ.get("COUNT", "50"),
+               MAXPAGES=os.environ.get("MAXPAGES", "100000"))
     anchors_path = os.path.join(work, "anchors.json")
     pass_out = os.path.join(work, "history_recovered.json")   # human-facing final output (full accumulated set)
     accum = os.path.join(work, "history_all.json")            # resume ledger, accumulated across ALL runs
@@ -1822,8 +2132,14 @@ def cmd_history(a):
         for p in range(1, MAX_PASSES + 1):
             log.info("──── history pass %d ────", p)
             if os.path.exists(pass_out): os.remove(pass_out)   # else a node failure re-reads a stale pass as "new"
-            ncmd = [node, os.path.join(rec, "history_extract.js")]
-            AUDIT.event("history pass %d: launching Node extractor" % p, category="stage",
+            if engine == "node":
+                ncmd = [node, os.path.join(rec, "history_extract.js")]
+            elif getattr(sys, "frozen", False):
+                ncmd = [sys.executable, "_runpy", "history_extract.py"]
+            else:
+                ncmd = [sys.executable, os.path.join(HERE, "scripts", "history_extract.py")]
+            env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+            AUDIT.event("history pass %d: launching the %s history client" % (p, engine), category="stage",
                         detail={"argv": ncmd, "cwd": work})
             rc = (_run_node_audited(ncmd, work, env, p) if AUDIT.enabled
                   else subprocess.run(ncmd, cwd=work, env=env).returncode)
@@ -1978,10 +2294,31 @@ def cmd_history(a):
                 "attempts at different times are normal and often succeed where one did not.")
     return 1
 
+def cmd_list_partitions(a):
+    """Print every WhatsApp Web session in a Chromium profile: one line each, plus a JSON form for tools."""
+    _require_source(a, "--list-partitions")
+    if not _is_chromium(a.profile):
+        log.error("--list-partitions applies to Chromium profiles (a Firefox profile has one session)")
+        return 2
+    sys.path.insert(0, os.path.join(HERE, "scripts"))
+    import chromium_reader as cr
+    cr.load_source(a.profile)
+    rows = cr.ACQUISITION.get("partitions", [])
+    if len(rows) == 1 and not rows[0].get("incomplete_tables"):     # the reader logs the summary for 2+
+        for line in cr.session_summary(rows):
+            print(line)
+    print("Select one with --partition <account>:<device> (for example %s) or its storage key:" %
+          next((r.get("wid") for r in rows if r.get("wid")), "919000000000:3"))
+    for i, r in enumerate(rows):
+        print("  %d. %-14s %s" % (i + 1, r.get("wid") or "-", r.get("storage_key")))
+    print("WAWF_PARTITIONS_JSON " + json.dumps([{k: r.get(k) for k in ("layout", "account", "device", "wid", "messages",
+          "has_root_key", "incomplete_tables", "oldest", "newest", "storage_key")} for r in rows]))
+    return 0
+
 def cmd_sqlite(a):
     _require_source(a, "sqlite")                            # a profile (or --origin) is required; nothing is auto-detected
     extra = ["--out", a.out]
-    if a.profile and os.path.isdir(os.path.join(a.profile, "IndexedDB")):
+    if a.profile and _is_chromium(a.profile):
         extra += ["--profile", a.profile]          # Chromium (Chrome/Edge/Brave/Opera)
     else:
         origin = a.origin
@@ -1991,6 +2328,10 @@ def cmd_sqlite(a):
         if origin: extra += ["--origin", origin]
     hf = getattr(a, "history_file", None)
     if hf and os.path.isfile(hf): extra += ["--history", hf]
+    if not a.enc_static: extra += ["--metadata-only"]
+    if a.profile and _is_chromium(a.profile):
+        import chromium_reader as _cr
+        _cr.release()          # the helper reads the parsed store from the run cache; don't hold two copies
     rc = _sub("export_sqlite.py", extra, secret_env={"WAWF_ENC_STATIC": a.enc_static})
     if rc == 0:
         # Same receipt as the text/JSON side, so a later --history run can name what it found here
@@ -2029,6 +2370,36 @@ def _win_utf8_console():
             except Exception: pass
     except Exception: pass
 
+def _given_stores_profile(idb, local_storage, media_cache):
+    """A run-scoped folder holding only chromium_reader.PARTS_FILE, naming the given stores. Every reader
+    resolves it to the real locations; nothing is copied, and the folder is removed when the run ends."""
+    import tempfile, shutil, atexit
+    d = tempfile.mkdtemp(prefix="wawf_given_")
+    atexit.register(shutil.rmtree, d, True)
+    with open(os.path.join(d, "wawf_parts.json"), "w", encoding="utf-8") as f:
+        json.dump({"idb": [os.path.abspath(x) for x in idb], "local_storage": os.path.abspath(local_storage),
+                   "media_cache": [os.path.abspath(x) for x in media_cache]}, f, indent=1)
+    return d
+
+def _own_console():
+    """True when nothing but this program is attached to its console (it was double-clicked). A
+    one-file build runs as two processes -- the bootloader and this one -- so for it two is alone; a
+    shell it was started from would be a third."""
+    if sys.platform != "win32": return False
+    try:
+        import ctypes
+        buf = (ctypes.c_uint * 8)()
+        return ctypes.windll.kernel32.GetConsoleProcessList(buf, 8) <= (2 if getattr(sys, "frozen", False) else 1)
+    except Exception:
+        return False
+
+def _missing_packages():
+    """Runtime packages that do not import in this interpreter (the standalone build bundles them)."""
+    import importlib.util
+    need = {"cryptography": "cryptography", "cramjam": "cramjam", "websocket": "websocket-client",
+            "ccl_chromium_reader": "ccl_chromium_reader"}
+    return [pkg for mod, pkg in need.items() if importlib.util.find_spec(mod) is None]
+
 def main():
     _win_utf8_console()                                  # render em dashes / arrows / box chars, not mojibake
     # frozen dispatch: `<exe> _runpy <script.py> [args...]` runs a bundled helper in-process
@@ -2039,6 +2410,34 @@ def main():
         sys.argv = [path] + sys.argv[3:]
         runpy.run_path(path, run_name="__main__")
         return 0
+    # No arguments at all (a double-clicked .exe, or `wawf` typed alone): open the window instead.
+    # Any argument keeps the command line exactly as it was. `--gui` asks for the window explicitly.
+    if len(sys.argv) == 1 or sys.argv[1:] == ["--gui"]:
+        # Double-clicked: Windows gave this process a console of its own, which would sit empty behind
+        # the window (Windows Terminal ignores requests to hide it). Start the window detached, with no
+        # console, and exit so this one closes. Run from a shell, the console is shared and stays.
+        if len(sys.argv) == 1 and getattr(sys, "frozen", False) and _own_console():
+            # PYINSTALLER_RESET_ENVIRONMENT: the new process must unpack its own copy rather than reuse
+            # this one's, which is deleted the moment this process exits.
+            subprocess.Popen([sys.executable, "--gui"], close_fds=True,
+                             env=dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1"),
+                             creationflags=0x00000008 | 0x00000200)   # DETACHED_PROCESS | NEW_PROCESS_GROUP
+            return 0
+        try:
+            import wawf_gui
+        except ImportError as e:                       # e.g. a Python without tkinter
+            print(f"the window is unavailable here ({e}); run `wawf -h` for the command line", file=sys.stderr)
+            return 2
+        return wawf_gui.main()
+    if not getattr(sys, "frozen", False) and not ({"-h", "--help"} & set(sys.argv[1:])):
+        missing = _missing_packages()
+        if missing:
+            print("This Python (%s) is missing package(s) the tool needs: %s\n"
+                  "Install them once with:\n  \"%s\" -m pip install -r \"%s\"\n"
+                  "(or use the standalone wawf.exe, which includes them)"
+                  % (sys.executable, ", ".join(missing), sys.executable, os.path.join(HERE, "requirements.txt")),
+                  file=sys.stderr)
+            return 2
     p = argparse.ArgumentParser(
         prog="wawf",
         description="WhatsApp Web Forensics (Firefox + Chromium). Point it at a browser profile and it "
@@ -2092,11 +2491,29 @@ def main():
                    help="with --out raw: also dump signal-storage and wawc_db_enc. They hold the "
                         "account's Signal sessions, prekeys and the at-rest root key, so a dump that "
                         "includes them is key material and must not travel with a case.")
-    p.add_argument("--key", metavar="FILE",
+    p.add_argument("--key", metavar="FILE", action="append",
                    help="a companion_enc_static.txt captured earlier, to decrypt without touching the "
+                        "network; repeat it for a profile holding several sessions (each linked device has "
+                        "its own key, and every session is decrypted with the one that opens it). "
                         "network. Normally unnecessary: a copy left beside the output is picked up "
                         "automatically. A FILE rather than the key itself, so no secret reaches your "
                         "shell history, process list or command auditing.")
+    p.add_argument("--offline", action="store_true",
+                   help="never contact WhatsApp: decrypt with a key file if one is given or found, otherwise "
+                        "export everything except message text")
+    p.add_argument("--partition", metavar="WHICH",
+                   help="when a profile holds more than one WhatsApp session, which one to examine: the "
+                        "account number, the storage key, or the layout name shown by --list-partitions")
+    g2 = p.add_argument_group("without a profile folder: point at the stores themselves")
+    g2.add_argument("--idb", metavar="DIR", action="append",
+                    help="a WhatsApp Web IndexedDB folder (https_web.whatsapp.com_0.indexeddb.leveldb, or "
+                         "WebStorage/<n>/IndexedDB/indexeddb.leveldb), wherever it is; repeatable")
+    g2.add_argument("--local-storage", metavar="DIR",
+                    help="the profile's 'Local Storage/leveldb' folder (key salt, device keys, signed-in account)")
+    g2.add_argument("--media-cache", metavar="DIR", action="append",
+                    help="a cache folder to search for media (CacheStorage, Cache_Data, ...); repeatable")
+    p.add_argument("--list-partitions", action="store_true",
+                   help="list every WhatsApp Web session (storage partition) in the profile, then stop")
     p.add_argument("--creds", metavar="FILE",
                    help="an existing creds_in.json to reuse instead of recovering credentials again "
                         "(skips the minutes-long read of the browser storage). It must describe the "
@@ -2107,7 +2524,8 @@ def main():
     g = p.add_argument_group("optional actions (instead of the default decrypt job)")
     g.add_argument("--history", action="store_true",
                    help="pull chat history older than the browser cache from your phone. NETWORKED and "
-                        "phone-dependent; needs Node (offers to install it). Results are saved and resume. "
+                        "phone-dependent; pure Python (WAWF_HISTORY_ENGINE=node runs the Node client). "
+                        "Results are saved and resume. "
                         "With --out, the local store is decrypted first and the recovered messages are "
                         "appended to it, so the export is one timeline per chat with every row saying "
                         "whether it came from the cache or the phone; it is written beside any export "
@@ -2118,6 +2536,13 @@ def main():
     # FIREFOX store and there is no scenario yet where it beats the two routes that always work: a
     # normal run captures the key over the network, and `--key` decrypts offline with a key captured
     # earlier. Restoring it is these four add_argument lines plus the dispatch branch, both marked.
+    g.add_argument("--queue", action="store_true",
+                   help="record what WhatsApp's server is holding for this device (messages, group and "
+                        "status updates, receipts, call offers received while the browser was closed), "
+                        "decrypted with the browser's own keys. NETWORKED; nothing is acknowledged, so the "
+                        "server keeps the queue for the browser, and nothing a contact can see is sent. "
+                        "Written to <first --out>/server-queue/<time>/, and its messages are merged "
+                        "into the export, each row marked source=server-queue.")
     g.add_argument("--install-node", action="store_true",
                    help="allow --history to INSTALL Node.js via winget if none is found. Not covered "
                         "by --yes, because it modifies this machine and asks for elevation; a "
@@ -2127,10 +2552,10 @@ def main():
                         "deeper, to fill in fields an earlier run did not capture (the group sender). "
                         "Finds nothing new by design and spends the same rate-limit budget.")
     g.add_argument("--fetch-media", action="store_true",
-                   help="with --history --out sqlite:PATH: after the pull, ask the CDN for media the "
-                        "browser never cached. NETWORKED and slow, and a url whose signature has "
-                        "expired returns 403, so this is opt-in; without it the mediaKeys are still "
-                        "exported and scripts/mediafetch.py --cdn can fetch later.")
+                   help="with --out sqlite:PATH: download, decrypt and verify the media the browser never "
+                        "cached from WhatsApp's CDN, newest first. NETWORKED and can be large; a url whose "
+                        "signature has expired is skipped. Without it the mediaKeys are still exported "
+                        "and scripts/mediafetch.py --cdn can fetch later.")
     g.add_argument("--yes", action="store_true",
                    help="auto-confirm prompts that only affect this tool's own folder (such as "
                         "`npm install` in tools/reconnect). It does NOT authorise installing Node.js "
@@ -2146,6 +2571,10 @@ def main():
                         "touched, key derivation, network request, artifact with its SHA-256, and "
                         "error, crash-safe, as wawf_audit.db beside the output)")
     g.add_argument("--audit-db", metavar="DB", help="path for the audit database (default: beside the output)")
+    g.add_argument("--case-id", metavar="ID", help="case / exhibit number recorded in the audit database "
+                                                    "(default: generated from the date)")
+    g.add_argument("--examiner", metavar="NAME", help="who ran this, recorded with the case and with each run")
+    g.add_argument("--case-notes", metavar="TEXT", help="free-text note recorded with the case")
     g.add_argument("--audit-secrets", action="store_true",
                    help="also store raw key material in the audit database (default: only SHA-256 "
                         "fingerprints plus derivation parameters, so the log is not a secret store)")
@@ -2155,6 +2584,26 @@ def main():
     g.add_argument("--log-file", metavar="FILE", help="mirror all logs (DEBUG) to this file")
 
     a = p.parse_args()
+    if getattr(a, "fetch_media", False):
+        os.environ["WAWF_FETCH_MEDIA"] = "1"            # helpers word their hints for a run that downloads
+    a.keys = a.key or []                               # --key may be repeated; code paths below take one
+    a.key = a.keys[0] if a.keys else None
+    if getattr(a, "offline", False) and getattr(a, "fetch_media", False):
+        _usage("--offline and --fetch-media contradict each other: downloading media contacts WhatsApp's servers")
+    if getattr(a, "media_cache", None):
+        for d in a.media_cache:
+            if not os.path.isdir(d): _usage("no such directory:\n  %s" % d)
+        # read by mediacache in this process and in the helper subprocesses, for every engine
+        os.environ["WAWF_MEDIA_CACHE"] = os.pathsep.join(os.path.abspath(d) for d in a.media_cache)
+    if getattr(a, "idb", None) or getattr(a, "local_storage", None):
+        if a.profile or a.origin:
+            _usage("give either a profile folder (or Firefox --origin) or --idb/--local-storage, not both")
+        if not (a.idb and a.local_storage):
+            _usage("--idb and --local-storage are both needed: the messages are in the IndexedDB, and the "
+                   "key salt and the signed-in account are in localStorage")
+        for d in (a.idb or []) + [a.local_storage] + (a.media_cache or []):
+            if not os.path.isdir(d): _usage("no such directory:\n  %s" % d)
+        a.profile = _given_stores_profile(a.idb, a.local_storage, a.media_cache or [])
     # One version string for this run, inherited by the audit database (audit._tool_version reads
     # WAWF_VERSION) and by every helper process, so they cannot record different values.
     os.environ["WAWF_VERSION"] = _wawf_version()
@@ -2162,10 +2611,48 @@ def main():
     # Pick the action. The default IS the job: credentials -> key -> decrypt. --history and --memory are
     # the two alternative actions; everything else is an option on the default job.
     # (the memory-scan branch belonged here; see the note where its arguments were withdrawn)
-    if a.history:
-        a.cmd, action = "history", cmd_history
+    if getattr(a, "partition", None):
+        os.environ["WAWF_PARTITION"] = a.partition       # helper subprocesses read the same session
+    if getattr(a, "list_partitions", False):
+        return cmd_list_partitions(a)
+    if getattr(a, "queue", False) and getattr(a, "offline", False):
+        _usage("--queue signs in to WhatsApp's server, and --offline forbids going online")
+    if getattr(a, "queue", False) and a.history:
+        def _queue_then_history(a):
+            # the queue first (it is what the server holds now), then history; the export merges both
+            steps = {"server queue": cmd_queue(a)}
+            if steps["server queue"]:
+                log.warning("server queue not recorded; continuing with history recovery")
+            steps["history"] = cmd_history(a)
+            if a.out and not getattr(a, "_exported", False):
+                log.warning("history not recovered; exporting what the copy holds")
+                steps["export"] = cmd_run_sessions(a)
+            return _report_steps(steps)
+        a.cmd, action = "queue+history", _queue_then_history
+    elif getattr(a, "queue", False):
+        def _decrypt_then_queue(a):
+            # The queue first, so the export can fold it in: one timeline per chat, every row saying
+            # whether it came from the browser's store or the server queue.
+            steps = {"server queue": cmd_queue(a)}
+            if not a.out: return steps["server queue"]          # with no --out: only the queue
+            if steps["server queue"]:
+                log.warning("server queue not recorded; exporting what the copy holds")
+            qf = getattr(a, "queue_export_file", None)
+            if qf and os.path.isfile(qf) and not getattr(a, "history_file", None):
+                a.history_file = qf
+            steps["export"] = cmd_run_sessions(a)
+            return _report_steps(steps)
+        a.cmd, action = "decrypt+queue", _decrypt_then_queue
+    elif a.history:
+        def _history_then_export(a):
+            steps = {"history": cmd_history(a)}
+            if steps["history"] and a.out and not getattr(a, "_exported", False):
+                log.warning("history not recovered; exporting what the copy holds")
+                steps["export"] = cmd_run_sessions(a)
+            return _report_steps(steps)
+        a.cmd, action = "history", _history_then_export
     else:
-        a.cmd, action = "decrypt", cmd_run
+        a.cmd, action = "decrypt", cmd_run_sessions
     # Inputs are checked BEFORE a case database is opened. Every command here needs a profile and
     # valid --out formats, and with the audit on by default a mistyped path was leaving a
     # chain-of-custody file behind for a run that never started -- in the working directory, which
@@ -2174,17 +2661,30 @@ def main():
     for _spec in (a.out or []): _parse_out(_spec)
     global AUDIT
     if not getattr(a, "no_audit", False):            # the trail is written unless asked not to
-        AUDIT = audit.open_db(_audit_db_path(a), record_secrets=getattr(a, "audit_secrets", False))
+        AUDIT = audit.open_db(_audit_db_path(a), case_id=getattr(a, "case_id", None),
+                              record_secrets=getattr(a, "audit_secrets", False),
+                              examiner=getattr(a, "examiner", None), notes=getattr(a, "case_notes", None))
         if AUDIT.enabled:
             AUDIT.start_run(a.cmd, sys.argv)
             # mirror EVERY log record (and any exc_info traceback) into the DB, so the trail is complete
             logging.getLogger().addHandler(AUDIT.logging_handler())
             log.info("audit: case %s  run %s  -> %s", AUDIT.case_id, AUDIT.run_id, AUDIT.path)
+            if getattr(AUDIT, "case_id_conflict", None):
+                log.warning("this audit database already belongs to case %s; --case-id %s was not applied "
+                            "(one database is one case -- use another --audit-db for another case)",
+                            AUDIT.case_id, AUDIT.case_id_conflict)
+            if getattr(a, "examiner", None) or getattr(a, "case_notes", None):
+                AUDIT.event("case details", category="case",
+                            detail={"examiner": getattr(a, "examiner", None), "notes": getattr(a, "case_notes", None)})
             if AUDIT.record_secrets:
                 log.warning("--audit-secrets: raw key material WILL be stored in %s — protect it accordingly.",
                             AUDIT.path)
     t0 = time.time()
     rc, status, err, tb = 0, "ok", None, None
+    # Parsed-profile cache shared with helper subprocesses for this run only (see chromium_reader).
+    import tempfile, shutil
+    _cache_dir = tempfile.mkdtemp(prefix="wawf_src_")
+    os.environ["WAWF_SOURCE_CACHE"] = _cache_dir
     try:
         rc = action(a)
         status = "ok" if not rc else "error"
@@ -2201,6 +2701,8 @@ def main():
         log.exception("traceback") if a.verbose else log.error("(re-run with -v for the full traceback)")
         import traceback as _tb; rc, status, err, tb = 1, "error", e, _tb.format_exc()
     finally:
+        shutil.rmtree(_cache_dir, ignore_errors=True)
+        os.environ.pop("WAWF_SOURCE_CACHE", None)
         log.debug("elapsed %.1fs", time.time() - t0)
         # record the outcome even on failure: a 'running' status left behind means the process was killed
         AUDIT.end_run(rc or 0, status=status, error=err, tb=tb)

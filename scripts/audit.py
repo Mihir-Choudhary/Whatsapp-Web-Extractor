@@ -105,7 +105,7 @@ class NoAudit:
 class Audit:
     enabled = True
 
-    def __init__(self, path, case_id=None, record_secrets=False, parent_run_id=None):
+    def __init__(self, path, case_id=None, record_secrets=False, parent_run_id=None, examiner=None, notes=None):
         self.path = os.path.abspath(path)
         self.record_secrets = bool(record_secrets)
         self._t0 = time.time()
@@ -116,13 +116,22 @@ class Audit:
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA busy_timeout=15000")
         self.db.executescript(_DDL)
+        # columns added after the first schema: an older case database gains them in place
+        for table, col in (("case_info", "examiner"), ("case_info", "notes"), ("run", "examiner")):
+            try: self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+            except sqlite3.OperationalError: pass                  # already there
+        self.examiner = examiner
         row = self.db.execute("SELECT case_id FROM case_info LIMIT 1").fetchone()
         if row:
             self.case_id = row[0]
+            # one database is one case: a different id asked for later is reported, never rewritten
+            self.case_id_conflict = case_id if case_id and case_id != row[0] else None
         else:
+            self.case_id_conflict = None
             self.case_id = case_id or ("case-" + _utc().replace(":", "").replace("-", "")[:15])
-            self.db.execute("INSERT INTO case_info(case_id,created_utc,tool,tool_version,schema_version)"
-                            " VALUES(?,?,?,?,?)", (self.case_id, _utc(), "wawf", _tool_version(), SCHEMA_VERSION))
+            self.db.execute("INSERT INTO case_info(case_id,created_utc,tool,tool_version,schema_version,examiner,notes)"
+                            " VALUES(?,?,?,?,?,?,?)", (self.case_id, _utc(), "wawf", _tool_version(),
+                                                       SCHEMA_VERSION, examiner, notes))
         self.run_id = None
         self.parent_run_id = parent_run_id
         self._ended = False
@@ -148,6 +157,8 @@ class Audit:
              1 if getattr(sys, "frozen", False) else 0, sys.executable, sys.version.split()[0],
              platform.platform(), platform.node(), _user(), os.getcwd(), os.getpid(), self.parent_run_id))
         self.run_id = cur.lastrowid
+        if self.examiner:
+            self.db.execute("UPDATE run SET examiner=? WHERE run_id=?", (self.examiner, self.run_id))
         return self.run_id
 
     def end_run(self, exit_code=0, status=None, error=None, tb=None):
@@ -311,11 +322,12 @@ def _tool_version():
     return os.environ.get("WAWF_VERSION") or "1.0"
 
 
-def open_db(path, case_id=None, record_secrets=False, parent_run_id=None):
+def open_db(path, case_id=None, record_secrets=False, parent_run_id=None, examiner=None, notes=None):
     """Open/create a case audit DB. Returns NoAudit() if it cannot be opened — auditing must never be the
     reason a forensic run fails."""
     try:
-        return Audit(path, case_id=case_id, record_secrets=record_secrets, parent_run_id=parent_run_id)
+        return Audit(path, case_id=case_id, record_secrets=record_secrets, parent_run_id=parent_run_id,
+                     examiner=examiner, notes=notes)
     except Exception as e:
         sys.stderr.write("[audit] disabled (could not open %s: %s)\n" % (path, e))
         return NoAudit()

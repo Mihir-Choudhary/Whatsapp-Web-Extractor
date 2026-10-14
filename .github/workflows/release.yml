@@ -44,6 +44,11 @@ jobs:
           python scripts/selftest_history.py
           python scripts/selftest_anchors.py
           python scripts/selftest_mediacache.py
+          python scripts/selftest_chromium.py
+          python scripts/selftest_gui.py
+          python scripts/selftest_binary.py
+          python scripts/selftest_signal.py
+          python scripts/selftest_capture.py
       - name: Build
         run: pyinstaller wawf.spec --noconfirm
       - name: Rename artifact

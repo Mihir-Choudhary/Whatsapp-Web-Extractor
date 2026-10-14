@@ -75,8 +75,9 @@ def _read_varint(buf, i):
         shift += 7
 
 
-def build_client_payload(user, device, version, country="US"):
-    """The Baileys generateLoginNode ClientPayload for a passive companion login."""
+def build_client_payload(user, device, version, country="US", passive=False):
+    """The companion login ClientPayload (Baileys generateLoginNode). passive=True logs in without
+    taking the device's active role."""
     app_ver  = _fld_var(1, version[0]) + _fld_var(2, version[1]) + _fld_var(3, version[2])
     user_agent = (
         _fld_var(1, 14) +                       # platform = WEB
@@ -93,7 +94,7 @@ def build_client_payload(user, device, version, country="US"):
     web_info = _fld_var(4, 0)                    # webSubPlatform = WEB_BROWSER
     return (
         _fld_var(1, int(user)) +                 # username (phone)
-        _fld_var(3, 0) +                         # passive = false
+        _fld_var(3, 1 if passive else 0) +       # passive
         _fld_len(5, user_agent) +                # userAgent
         _fld_len(6, web_info) +                  # webInfo
         _fld_var(12, 1) +                        # connectType = WIFI_UNKNOWN
@@ -301,6 +302,20 @@ def scan_for_key(node, hits):
 
 
 # ---------------- frame pump + orchestration ----------------
+def login_failure_reason(attrs):
+    """<failure> at login -> what it means for the examination."""
+    code = str((attrs or {}).get("reason") or "")
+    if code == "401":
+        return ("login refused (401): this linked device has been logged out -- removed from the account's "
+                "linked devices, by the phone or by WhatsApp. The server holds nothing for it any more, and "
+                "the browser's own session has ended too. What is on disk is unaffected: decrypt it offline "
+                "with the key saved by an earlier run (--key ... --offline).")
+    if code == "403":
+        return "login refused (403): the account or this device is blocked from connecting"
+    if code == "503":
+        return "login refused (503): WhatsApp's server is unavailable; try again later"
+    return "login refused (%s)" % (code or attrs)
+
 def fetch_version():
     # same source Baileys' fetchLatestBaileysVersion uses; an outdated version -> server <failure 405>
     url = "https://raw.githubusercontent.com/WhiskeySockets/Baileys/master/src/Defaults/baileys-version.json"
@@ -317,7 +332,7 @@ def fetch_version():
 import audit                                    # appends to the case DB from --audit (no-op otherwise)
 A = audit.NoAudit()                             # replaced in main()
 
-def run(creds, out_path, timeout=30, log=lambda *a: None, print_key=False):
+def run(creds, out_path, timeout=30, log=lambda *a: None, print_key=False, passive=False):
     import websocket   # websocket-client; imported here so import errors are actionable
     noise_priv = base64.b64decode(creds["noise_priv"])
     noise_pub  = base64.b64decode(creds["noise_pub"])
@@ -378,7 +393,7 @@ def run(creds, out_path, timeout=30, log=lambda *a: None, print_key=False):
         # 3. process handshake -> encrypted static key
         key_enc = noise.process_handshake(sh_eph, sh_static, sh_payload, noise_priv, noise_pub, eph_priv)
         # 4. ClientFinish{static, payload=login ClientPayload}
-        payload_enc = noise.encrypt(build_client_payload(user, device, version))
+        payload_enc = noise.encrypt(build_client_payload(user, device, version, passive=passive))
         send_frame(_fld_len(4, _fld_len(1, key_enc) + _fld_len(2, payload_enc)))
         noise.finish()
         log("handshake complete; awaiting <success>")
@@ -387,7 +402,7 @@ def run(creds, out_path, timeout=30, log=lambda *a: None, print_key=False):
                  validated="handshake completed", input_desc="WhatsApp Noise login",
                  detail={"wa_version": ".".join(map(str, version)), "device": device})
         A.net("out", endpoint=WS_URL, protocol="noise/websocket", kind="login ClientFinish",
-              detail={"passive": False})
+              detail={"passive": passive})
         # 5. read stanzas, scan for companion_enc_static
         captured = None
         deadline = time.time() + timeout
@@ -417,8 +432,7 @@ def run(creds, out_path, timeout=30, log=lambda *a: None, print_key=False):
                 if tag == "failure":
                     A.net("in", endpoint=WS_URL, protocol="noise/websocket", kind="stanza <failure>",
                           status="login rejected", detail={"attrs": node.get("attrs")})
-                    print("[!] login rejected (<failure> %s) — creds not accepted" % node.get("attrs"),
-                          file=sys.stderr)
+                    print("[!] " + login_failure_reason(node.get("attrs")), file=sys.stderr)
                     A.end_run(2, status="error", error=RuntimeError("login rejected by server"))
                     return 2
                 if tag in ("stream:error", "xmlstreamend"):
@@ -468,7 +482,14 @@ def main():
         print("[!] the 'websocket-client' package is required (pip install websocket-client)", file=sys.stderr)
         A.end_run(6, status="error", error=RuntimeError("websocket-client not installed")); return 6
     try:
-        rc = run(creds, a.out, a.timeout, log, print_key=a.print_key)
+        # passive first (it does not take the device's active role); the active login only if the
+        # server sent no key to the passive one
+        rc = run(creds, a.out, a.timeout, log, print_key=a.print_key, passive=True)
+        if rc == 5:
+            print("[i] no key on a passive login; signing in once more, actively", file=sys.stderr)
+            rc = run(creds, a.out, a.timeout, log, print_key=a.print_key, passive=False)
+        elif rc == 0:
+            print("[i] key received on a passive login", file=sys.stderr)
     except Exception as e:
         import traceback as _tb
         A.end_run(1, status="error", error=e, tb=_tb.format_exc()); raise

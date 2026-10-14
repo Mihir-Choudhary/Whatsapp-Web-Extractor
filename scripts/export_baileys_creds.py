@@ -62,9 +62,23 @@ def load_firefox(origin):
 def load_chromium(profile):
     import chromium_reader as cr
     src = cr.load_source(profile); ls = src["localStorage"]; idb = src["idb"]
-    root = idb["wawc_db_enc"]["keys"][0]["key"].key_data
+    keys = (idb.get("wawc_db_enc") or {}).get("keys") or []
+    k0 = keys[0].get("key") if keys and isinstance(keys[0], dict) else None
+    if k0 is None or not getattr(k0, "key_data", None):
+        sel = next((p for p in cr.ACQUISITION.get("partitions", []) if p.get("selected")), {})
+        raise SystemExit(
+            "this session's root key (IndexedDB wawc_db_enc) is not in the copy%s, so its device credentials "
+            "cannot be decrypted and no key can be fetched with them. Messages, chats and contacts can still "
+            "be exported without message text (--offline). For the credentials, copy the profile again with "
+            "the browser closed." % (" -- %d table(s) its database lists as live are empty or missing"
+                                     % sel["incomplete_tables"] if sel.get("incomplete_tables") else ""))
+    root = k0.key_data
     meta = [o for o in idb.get("signal-storage", {}).get("signal-meta-store", []) if isinstance(o, dict)]
     return ls, root, meta
+
+def _is_chromium(path):
+    import chromium_reader as cr
+    return cr.is_chromium_profile(path)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -72,7 +86,7 @@ def main():
     ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools/reconnect/creds_in.json"))
     a = ap.parse_args()
     if a.origin: engine, (ls, root, meta) = "firefox", load_firefox(a.origin)
-    elif a.profile and os.path.isdir(os.path.join(a.profile, "IndexedDB")): engine, (ls, root, meta) = "chromium", load_chromium(a.profile)
+    elif a.profile and _is_chromium(a.profile): engine, (ls, root, meta) = "chromium", load_chromium(a.profile)
     elif a.profile: engine, (ls, root, meta) = "firefox", load_firefox(os.path.join(a.profile, "storage/default/https+++web.whatsapp.com"))
     else: raise SystemExit("pass --profile or --origin")
     print(f"[*] engine={engine}")

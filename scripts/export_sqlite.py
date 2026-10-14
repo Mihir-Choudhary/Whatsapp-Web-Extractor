@@ -28,7 +28,7 @@ from idbutil import store_id
 # ONE text builder for every export, so a message cannot read differently in two exports of the same
 # evidence. (It used to be copied here, and when the filter was found to be dropping 767 messages the
 # fix had to be made twice -- that is the failure mode this import exists to prevent.)
-from wa_decrypt import texts as _message_texts
+from wa_decrypt import texts as _message_texts, body_details as _body_details
 from wa_decrypt import hist_type as _hist_type, stanza_of as _stanza_of, canon_jid as _canon_jid
 import sclone
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -45,6 +45,7 @@ def _find_origin():
     return None
 
 _ap = argparse.ArgumentParser()
+_ap.add_argument('--metadata-only', action='store_true', help='no key: write everything except message text')
 _ap.add_argument('--enc-static', help='companion_enc_static (base64). Prefer the WAWF_ENC_STATIC\n                     environment variable: a key on the command line is readable from the\n                     process list, which is the whole reason wawf passes it by environment.')
 _ap.add_argument('--origin', default=None, help='Firefox web.whatsapp.com storage dir (auto-detected if omitted)')
 _ap.add_argument('--profile', default=None, help='Chromium profile dir (Chrome/Edge/Brave .../Default)')
@@ -58,13 +59,18 @@ HISTORY_FILE = _args.history
 # stored. argv still works for standalone use.
 if not _args.enc_static:
     _args.enc_static = os.environ.get('WAWF_ENC_STATIC') or None
-if not _args.enc_static:
-    raise SystemExit('ERROR: no companion_enc_static. Pass --enc-static <b64> or set WAWF_ENC_STATIC.')
+# Metadata only: no key, so no message text -- but every other field (chats, senders, timestamps,
+# types, media keys, reactions, polls, calls, contacts, groups) is written. Asked for explicitly.
+METADATA_ONLY = bool(_args.metadata_only or os.environ.get('WAWF_METADATA_ONLY'))
+if not _args.enc_static and not METADATA_ONLY:
+    raise SystemExit('ERROR: no companion_enc_static. Pass --enc-static <b64> or set WAWF_ENC_STATIC '
+                     '(or --metadata-only to export everything except message text).')
+if METADATA_ONLY: _args.enc_static = None
 import audit                                   # appends to the SAME case DB as the parent (WAWF_AUDIT_DB)
 A = audit.from_env("sqlite")
 A.event("export_sqlite start", category="stage",
         detail={"profile": _args.profile, "origin": _args.origin, "out": _args.out})
-SALT = base64.b64decode(_args.enc_static)
+SALT = base64.b64decode(_args.enc_static) if _args.enc_static else None
 OUT  = _args.out
 # NOTE: output dirs are created only AFTER key validation passes (below), so a rejected
 # run leaves nothing behind.
@@ -97,7 +103,8 @@ def as_text(x):
 # ---- engine-aware loader: expose L(key), ROOT (raw root key) and store(name) for BOTH Firefox
 #      (IndexedDB as SQLite + Snappy + Mozilla structured-clone) and Chromium (LevelDB + V8 via ccl).
 #      Everything below this block is engine-agnostic (operates on the decoded WA object dicts).
-_is_chromium = bool(_args.profile and os.path.isdir(os.path.join(_args.profile, 'IndexedDB')))
+import chromium_reader as _crd
+_is_chromium = bool(_args.profile and _crd.is_chromium_profile(_args.profile))
 if _is_chromium:
     import chromium_reader as _cr
     _src = _cr.load_source(_args.profile)
@@ -106,7 +113,8 @@ if _is_chromium:
     _keys = _src['idb'].get('wawc_db_enc', {}).get('keys', [])   # CCL exposes the CryptoKey's raw bytes directly
     ROOT = _keys[0]['key'].key_data if (_keys and isinstance(_keys[0], dict)
                                         and hasattr(_keys[0].get('key'), 'key_data')) else None
-    if not ROOT: print('ERROR: root key not recoverable from wawc_db_enc/keys (Chromium profile)'); sys.exit(2)
+    if not ROOT and not METADATA_ONLY:
+        print('ERROR: root key not recoverable from wawc_db_enc/keys (Chromium profile)'); sys.exit(2)
     if 'message' not in _MODEL: print("ERROR: 'message' store not found in Chromium model-storage"); sys.exit(2)
     def _clean(v):                     # CCL marks JS `undefined` with an _Undefined sentinel -> make it None
         if type(v).__name__ == '_Undefined': return None
@@ -148,13 +156,19 @@ else:
             except Exception: continue
 
 _salt = L('WAWebEncKeySalt')
-if _salt is None: print('ERROR: WAWebEncKeySalt not in localStorage — not a WhatsApp Web profile?'); sys.exit(2)
-INFO = base64.b64decode(json.loads(_salt))
-MSGKEY = HKDF(algorithm=hashes.SHA256(), length=16, salt=SALT, info=INFO).derive(ROOT)
+if _salt is None and not METADATA_ONLY:
+    print('ERROR: WAWebEncKeySalt not in localStorage — not a WhatsApp Web profile?'); sys.exit(2)
 A.dir_read(_args.profile or O, purpose="WhatsApp Web browser storage (evidence source)")
-A.crypto("recover", key=ROOT, key_source="IndexedDB wawc_db_enc/keys (root key)",
+if METADATA_ONLY:
+    MSGKEY = None
+    print("[i] metadata only: message text is not decrypted (no key was used).")
+    A.event("metadata-only export: message bodies left encrypted", category="crypto")
+else:
+  INFO = base64.b64decode(json.loads(_salt))
+  MSGKEY = HKDF(algorithm=hashes.SHA256(), length=16, salt=SALT, info=INFO).derive(ROOT)
+  A.crypto("recover", key=ROOT, key_source="IndexedDB wawc_db_enc/keys (root key)",
          input_desc=(_args.profile or O), detail={"engine": "chromium" if _is_chromium else "firefox"})
-A.crypto("derive", algorithm="AES-CBC-128", kdf="HKDF-SHA256 len=16", scheme="1 (final)", key=MSGKEY,
+  A.crypto("derive", algorithm="AES-CBC-128", kdf="HKDF-SHA256 len=16", scheme="1 (final)", key=MSGKEY,
          key_source="HKDF(root, salt=companion_enc_static, info=WAWebEncKeySalt)",
          salt=SALT, salt_source="companion_enc_static (--enc-static)", info="WAWebEncKeySalt (localStorage)",
          input_desc="msgRowOpaqueData._data (scheme 1)")
@@ -163,15 +177,16 @@ def pk7(b):
     if not b or len(b) % 16: return b
     p = b[-1]; return b[:-p] if 1 <= p <= 16 and b[-p:] == bytes([p])*p else b
 def decrypt_body(op):
-    """-> (own text, quoted text). Both may be None."""
-    if not isinstance(op, dict) or op.get('_scheme') != 1: return (None, None)   # MSGKEY is the scheme-1 key (scheme-0 -> garbage)
+    """-> (own text, quoted text, structured parts). Texts may be None; parts is a dict (see wa_opaque)."""
+    if MSGKEY is None: return (None, None, {})
+    if not isinstance(op, dict) or op.get('_scheme') != 1: return (None, None, {})   # MSGKEY is the scheme-1 key (scheme-0 -> garbage)
     iv = as_bytes(op.get('iv')); data = as_bytes(op.get('_data'))
-    if not iv or not data: return (None, None)
-    if len(data) % 16: return (None, None)    # misaligned: CBC would decrypt part and drop the tail
+    if not iv or not data: return (None, None, {})
+    if len(data) % 16: return (None, None, {})    # misaligned: CBC would decrypt part and drop the tail
     try: pt = pk7(Cipher(algorithms.AES(MSGKEY), modes.CBC(iv)).decryptor().update(data))
-    except Exception: return (None, None)
+    except Exception: return (None, None, {})
     own, quoted = _message_texts(pt)            # one parse, both strings; never truncated
-    return (own or None, quoted or None)
+    return (own or None, quoted or None, _body_details(pt))
 
 def ser(x):
     if isinstance(x, dict): return as_text(x.get('_serialized')) or (f"{as_text(x.get('user'))}@{as_text(x.get('server'))}" if x.get('user') else None)
@@ -207,7 +222,14 @@ MTYPE = {'chat':0,'image':1,'ptt':2,'audio':2,'video':3,'vcard':4,'location':5,'
          # 126 deletions in the reference store read as 126 blank text messages.
          'revoked':15,'notification_template':7,'protocol':7,'ciphertext':0,'status':116,'template':45,
          'rich_response':0,'unknown':0}
-def ack_status(a): return {0:0,1:4,2:5,3:13,4:13}.get(a, 0)
+def ack_status(a, from_me=1):
+    """WhatsApp Web `ack` -> Android message.status: 1 sent (one tick) -> 4, 2 delivered -> 5, 3 read -> 13,
+    4 played -> 8.
+    An outgoing record with no ack is a system/control entry, which Android stores as 6. Received
+    messages carry no status of ours: 0."""
+    if not from_me: return 0
+    a = a if isinstance(a, int) else None
+    return {1: 4, 2: 5, 3: 13, 4: 8}.get(a, 6)
 
 # store() is defined per-engine in the loader above; reference model-storage object stores by NAME.
 # Optional stores (reactions/message-info/poll-votes/pinned-messages) just yield nothing if absent.
@@ -219,7 +241,7 @@ REACT_SID, MSGINFO_SID, POLLV_SID, PIN_SID = 'reactions', 'message-info', 'poll-
 # "succeed" — refuse that. Right key => ~100% valid padding; wrong key => ~0.4%.
 def _strict_pk7(b): return bool(b) and len(b) % 16 == 0 and 1 <= b[-1] <= 16 and b[-b[-1]:] == bytes([b[-1]])*b[-1]
 _refs, _good = [], 0
-for _o in store(MSG_SID):
+for _o in (store(MSG_SID) if MSGKEY else ()):
     if not isinstance(_o, dict): continue
     _op = _o.get('msgRowOpaqueData')
     if isinstance(_op, dict) and _op.get('_scheme') == 1:
@@ -235,12 +257,13 @@ if _refs and _good < len(_refs) * 0.5:
     A.crypto("verify", algorithm="AES-CBC-128", key=MSGKEY, validated="FAILED",
              input_desc="strict PKCS7 on reference bodies", records_in=len(_refs), records_ok=_good)
     A.end_run(3, status="error", error=RuntimeError("companion_enc_static INVALID (%d/%d)" % (_good, len(_refs))))
-    print(f"ERROR: companion_enc_static is INVALID for this profile/device — only {_good}/{len(_refs)} "
+    print(f"{'[i]' if os.environ.get('WAWF_KEY_TRIAL') else 'ERROR:'} companion_enc_static is INVALID for this profile/device — only {_good}/{len(_refs)} "
           f"reference message bodies validate. Refusing to write a garbage msgstore. (Wrong key, empty key, "
           f"or wrong browser's salt.)"); sys.exit(3)
-A.crypto("verify", algorithm="AES-CBC-128", key=MSGKEY, validated="OK",
-         input_desc="strict PKCS7 on reference bodies", records_in=len(_refs), records_ok=_good)
-print(f"[+] companion_enc_static VALIDATED ({_good}/{len(_refs)} reference bodies).")
+if MSGKEY:
+    A.crypto("verify", algorithm="AES-CBC-128", key=MSGKEY, validated="OK",
+             input_desc="strict PKCS7 on reference bodies", records_in=len(_refs), records_ok=_good)
+    print(f"[+] companion_enc_static VALIDATED ({_good}/{len(_refs)} reference bodies).")
 os.makedirs(OUT, exist_ok=True); os.makedirs(f'{OUT}/Media/WhatsApp Web', exist_ok=True)
 
 contacts = [o for o in store(CONTACT_SID) if isinstance(o, dict)]
@@ -276,7 +299,11 @@ for o in store(MSG_SID):
     # Every message that carries a body is decrypted, whatever its type -- the JSON export already
     # does this. The old allow-list silently dropped the text of types it did not name: a
     # template_button_reply ("Yes, I am interested") was in chats.json and empty in msgstore.db.
-    body, quoted_body = decrypt_body(o.get('msgRowOpaqueData'))
+    body, quoted_body, det = decrypt_body(o.get('msgRowOpaqueData'))
+    # WhatsApp Web stores a document's FILENAME in the caption field when it has no caption; the
+    # filename is exported as media_name, and a caption equal to it is not something anyone wrote.
+    if typ == 'document' and body and body.strip() == (as_text(o.get('filename')) or '').strip():
+        body = None
     md = None
     if o.get('mediaKey') or o.get('directPath'):
         md = {'media_key': base64.b64decode(o['mediaKey']) if o.get('mediaKey') else None,
@@ -292,11 +319,14 @@ for o in store(MSG_SID):
         'webid': idv, 'chat_jid': chat_jid, 'from_me': from_me, 'key_id': key_id,
         # received: sender = author/partner (groups+broadcast use author; 1:1 partner also fine)
         'sender_jid': None if (from_me or (not is_group and not is_bcast)) else sender,   # null sender for own + 1:1 received
-        'timestamp': int(t)*1000 if t else 0, 'message_type': MTYPE.get(typ, 0), 'text_data': body,
-        'status': ack_status(o.get('ack')), 'starred': 1 if o.get('star') or o.get('isStarred') else 0,
+        # view-once: Android's own types (42 photo, 43 video), so Android tools show it as view-once
+        'timestamp': int(t)*1000 if t else 0,
+        'message_type': ({'image': 42, 'video': 43}.get(typ, MTYPE.get(typ, 0)) if o.get('isViewOnce') else MTYPE.get(typ, 0)),
+        'text_data': body,
+        'status': ack_status(o.get('ack'), from_me), 'starred': 1 if o.get('star') or o.get('isStarred') else 0,
         'media': md, 'thumb': base64.b64decode(th) if isinstance(th, str) and th else None,
         'mentioned': ment, 'quoted_id': as_text(o.get('quotedStanzaID')), 'quoted_type': as_text(o.get('quotedType')),
-        'quoted_text': quoted_body, 'source': 'cache',
+        'quoted_text': quoted_body, 'source': 'cache', 'details': det,
     }
     # This store yields superseded record versions as well as live ones, so the same message can
     # arrive twice; 25 ids do here. Those copies are NOT byte-identical records -- they differ in
@@ -372,13 +402,17 @@ if HIST:
             'timestamp': int(r.get('ts') or 0) * 1000, 'message_type': MTYPE.get(typ, 0),
             'text_data': (r.get('text') or None) if (r.get('text') or '').strip() else None,   # as sent
             'status': 0, 'starred': 0, 'media': None, 'thumb': None, 'mentioned': [],
-            'quoted_id': None, 'quoted_type': None, 'quoted_text': None, 'source': 'phone',
+            'quoted_id': None, 'quoted_type': None, 'quoted_text': None, 'source': r.get('source') or 'phone',
         })
         have.add(sid); appended += 1
         jid_id(cj); chat_rowid(cj)
         if sender: jid_id(norm_jid(sender))
     messages.sort(key=lambda m: (m['chat_jid'], m['timestamp']))
-    print(f"[+] history: appended {appended} message(s) recovered from the phone "
+    _src = {}
+    for r in HIST: _src[r.get('source') or 'phone'] = _src.get(r.get('source') or 'phone', 0) + 1
+    _from = ' and '.join('%s (%d offered)' % ({'phone': 'the phone', 'server-queue': 'the server queue'}.get(k, k), v)
+                         for k, v in _src.items()) or 'the phone'
+    print(f"[+] merged: appended {appended} message(s) from {_from} "
           f"({len(HIST) - appended} already in the store)")
 
 for c in contacts:
@@ -405,7 +439,11 @@ CREATE TABLE message_quoted(message_row_id INTEGER, key_id TEXT, text_data TEXT,
 CREATE TABLE message_mentions(_id INTEGER PRIMARY KEY, message_row_id INTEGER, jid_row_id INTEGER);
 CREATE TABLE message_add_on(_id INTEGER PRIMARY KEY, parent_message_row_id INTEGER, sender_jid_row_id INTEGER, from_me INTEGER, timestamp INTEGER, message_add_on_type INTEGER);
 CREATE TABLE message_add_on_reaction(message_add_on_row_id INTEGER, reaction TEXT);
-CREATE TABLE message_poll(message_row_id INTEGER, selectable_options_count INTEGER);
+CREATE TABLE message_poll(message_row_id INTEGER, selectable_options_count INTEGER, poll_type INTEGER, end_time INTEGER, hide_participant_names INTEGER, allow_add_option INTEGER, correct_option_id INTEGER);
+CREATE TABLE message_poll_option(_id INTEGER PRIMARY KEY, message_row_id INTEGER, option_name TEXT, option_hash TEXT, vote_total INTEGER);
+CREATE TABLE message_text(message_row_id INTEGER, description TEXT, page_title TEXT, url TEXT);
+CREATE TABLE message_location(message_row_id INTEGER, chat_row_id INTEGER, latitude REAL, longitude REAL, place_name TEXT, place_address TEXT, url TEXT, live_location_share_duration INTEGER);
+CREATE TABLE message_event(message_row_id INTEGER, is_canceled INTEGER, name TEXT, description TEXT, location_latitude REAL, location_longitude REAL, location_name TEXT, location_address TEXT, join_link TEXT, start_time INTEGER, chat_row_id INTEGER, end_time INTEGER);
 CREATE TABLE message_add_on_poll_vote(message_add_on_row_id INTEGER, sender_timestamp INTEGER);
 CREATE TABLE receipt_user(message_row_id INTEGER, receipt_user_jid_row_id INTEGER, receipt_timestamp INTEGER, read_timestamp INTEGER, played_timestamp INTEGER);
 CREATE TABLE message_link(_id INTEGER PRIMARY KEY, message_row_id INTEGER, link_index INTEGER);
@@ -413,13 +451,20 @@ CREATE TABLE message_add_on_pin_in_chat(message_add_on_row_id INTEGER, sender_ti
 CREATE TABLE call_log(_id INTEGER PRIMARY KEY, jid_row_id INTEGER, from_me INTEGER, timestamp INTEGER, video_call INTEGER, duration INTEGER, call_result INTEGER, bytes_transferred INTEGER, call_id TEXT, is_joinable_group_call INTEGER DEFAULT 0, group_jid_row_id INTEGER DEFAULT 0, call_type INTEGER DEFAULT 0, call_creator_device_jid_row_id INTEGER DEFAULT 0);
 """)
 _TYPE = {'s.whatsapp.net':0,'lid':18,'g.us':1,'newsletter':21,'bot':26,'broadcast':0}
-for raw, rid in _jid_id.items():
-    user = raw.split('@')[0]; srv = server_of(raw); dev = 0
-    if ':' in user:
-        u, dd = user.split(':', 1); user = u; dev = int(dd) if dd.isdigit() else 0
-    ty = _TYPE.get(srv, 0)
-    if dev > 0: ty = 17 if srv == 's.whatsapp.net' else (19 if srv == 'lid' else ty)
-    db.execute("INSERT INTO jid(_id,user,server,agent,device,type,raw_string) VALUES(?,?,?,?,?,?,?)", (rid, user, srv, 0, dev, ty, raw))
+_jid_written = set()
+def _flush_jids():
+    """Write every jid handed a row id that has no `jid` row yet. Called again before the commit, so a
+    reference created by a later section can never point at a row that does not exist."""
+    for raw, rid in list(_jid_id.items()):
+        if rid in _jid_written: continue
+        user = raw.split('@')[0]; srv = server_of(raw); dev = 0
+        if ':' in user:
+            u, dd = user.split(':', 1); user = u; dev = int(dd) if dd.isdigit() else 0
+        ty = _TYPE.get(srv, 0)
+        if dev > 0: ty = 17 if srv == 's.whatsapp.net' else (19 if srv == 'lid' else ty)
+        db.execute("INSERT INTO jid(_id,user,server,agent,device,type,raw_string) VALUES(?,?,?,?,?,?,?)", (rid, user, srv, 0, dev, ty, raw))
+        _jid_written.add(rid)
+_flush_jids()
 for c in contacts:
     lid = c.get('id'); phone = c.get('phoneNumber')
     if lid and phone and str(lid).endswith('@lid'):
@@ -473,6 +518,74 @@ for m in messages:
     if m['text_data']:
         for li, _u in enumerate(re.findall(r'https?://\S+', m['text_data'])):
             db.execute("INSERT INTO message_link(message_row_id,link_index) VALUES(?,?)", (mid, li))
+    det = m.get('details') or {}
+    if det.get('link'):
+        lk = det['link']
+        db.execute("INSERT INTO message_text(message_row_id,description,page_title,url) VALUES(?,?,?,?)",
+                   (mid, lk.get('description'), lk.get('title'), lk.get('url') or lk.get('client_url')))
+    if det.get('location'):
+        lc = det['location']
+        db.execute("INSERT INTO message_location(message_row_id,chat_row_id,latitude,longitude,place_name,live_location_share_duration) VALUES(?,?,?,?,?,?)",
+                   (mid, chat_rowid(m['chat_jid']), lc.get('lat'), lc.get('lng'), lc.get('name'), 1 if lc.get('live') else None))
+    if det.get('event'):
+        ev = det['event']; el = ev.get('location') or {}
+        db.execute("INSERT INTO message_event(message_row_id,is_canceled,name,description,location_latitude,location_longitude,location_name,location_address,join_link,start_time,chat_row_id,end_time) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (mid, 1 if ev.get('canceled') else 0, ev.get('name'), ev.get('description'), el.get('degreesLatitude'),
+                    el.get('degreesLongitude'), el.get('name'), el.get('address'), ev.get('join_link'),
+                    (ev.get('start') or 0) * 1000 or None, chat_rowid(m['chat_jid']), (ev.get('end') or 0) * 1000 or None))
+
+# ---- groups: current members (rank 0 member / 1 admin / 2 super-admin), past members, settings ----
+# The `participant` store holds one record per group: member jids, admins, super-admins, and past
+# members with when and how they left ("Left" or "Removed"). Android keeps the same facts in
+# group_participant_user / group_past_participant_user; settings Android keeps across several wa.db
+# tables are written to one wawf_group_settings table instead (named so it is not mistaken for one).
+db.execute("CREATE TABLE group_participant_user(_id INTEGER PRIMARY KEY, group_jid_row_id INTEGER, user_jid_row_id INTEGER, rank INTEGER, pending INTEGER DEFAULT 0, add_timestamp INTEGER)")
+db.execute("CREATE TABLE group_past_participant_user(_id INTEGER PRIMARY KEY, group_jid_row_id INTEGER, user_jid_row_id INTEGER, is_leave INTEGER, timestamp INTEGER)")
+db.execute("""CREATE TABLE wawf_group_settings(group_jid_row_id INTEGER PRIMARY KEY, subject TEXT, subject_time INTEGER,
+              owner_jid_row_id INTEGER, creation INTEGER, description TEXT, description_owner_jid_row_id INTEGER,
+              description_time INTEGER, announce INTEGER, restrict INTEGER, member_add_mode TEXT,
+              membership_approval_mode INTEGER, ephemeral_duration INTEGER, size INTEGER,
+              parent_group_jid_row_id INTEGER, is_parent_group INTEGER, incomplete_participant_info INTEGER,
+              suspended INTEGER, terminated INTEGER)""")
+gpu = gpp = gs = 0
+for o in store('participant'):
+    if not isinstance(o, dict) or not o.get('groupId'): continue
+    grow = jid_id(ser(o['groupId']))
+    if not grow: continue
+    rank = {}
+    for j in o.get('participants') or []: rank[ser(j)] = 0
+    for j in o.get('admins') or []: rank[ser(j)] = 1
+    for j in o.get('superAdmins') or []: rank[ser(j)] = 2
+    for j, r in rank.items():
+        u = jid_id(j)
+        if not u: continue
+        gpu += 1
+        db.execute("INSERT INTO group_participant_user(_id,group_jid_row_id,user_jid_row_id,rank) VALUES(?,?,?,?)", (gpu, grow, u, r))
+    for x in o.get('pastParticipants') or []:
+        if not isinstance(x, dict): continue
+        u = jid_id(ser(x.get('jid')))
+        if not u: continue
+        gpp += 1
+        ts_ = x.get('leaveTs')
+        db.execute("INSERT INTO group_past_participant_user(_id,group_jid_row_id,user_jid_row_id,is_leave,timestamp) VALUES(?,?,?,?,?)",
+                   (gpp, grow, u, 1 if str(x.get('leaveReason')) == 'Left' else 0, int(float(ts_) * 1000) if ts_ else None))
+for gid, g in groups.items():
+    grow = jid_id(ser(gid))
+    if not grow: continue
+    def _b(v): return None if v is None else (1 if v else 0)
+    def _ms(v):
+        try: return int(float(v) * 1000) if v else None
+        except (TypeError, ValueError): return None
+    desc = g.get('desc')
+    gs += 1
+    db.execute("INSERT OR REPLACE INTO wawf_group_settings VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+               (grow, as_text(g.get('subject')), _ms(g.get('subjectTime')), jid_id(ser(g.get('owner'))) or None,
+                _ms(g.get('creation')), as_text(desc) if isinstance(desc, str) else None,
+                jid_id(ser(g.get('descOwner'))) or None, _ms(g.get('descTime')), _b(g.get('announce')),
+                _b(g.get('restrict')), as_text(g.get('memberAddMode')) if g.get('memberAddMode') is not None else None,
+                _b(g.get('membershipApprovalMode')), g.get('ephemeralDuration'), g.get('size'),
+                jid_id(ser(g.get('parentGroup'))) or None, _b(g.get('isParentGroup')),
+                _b(g.get('hasIncompleteParticipantInformation')), _b(g.get('suspended')), _b(g.get('terminated'))))
 
 # ---- reactions -> message_add_on (type 56) + message_add_on_reaction ----
 addon_id = 0; rx = 0
@@ -487,6 +600,36 @@ for o in store(REACT_SID):
     db.execute("INSERT INTO message_add_on_reaction(message_add_on_row_id,reaction) VALUES(?,?)", (addon_id, as_text(o.get('reactionText'))))
     rx += 1
 
+# ---- message associations: album items, HD copies, motion photos -> message_association ----
+# The browser labels associations MEDIA_ALBUM or UNKNOWN. MEDIA_ALBUM is Android's album item (2); UNKNOWN
+# under a video parent is the video's HD copy (7); UNKNOWN under a photo parent is the photo's HD copy (12)
+# or a motion photo (11), which the browser's records do not distinguish, so those -- and anything else --
+# go only to wawf_message_association with the browser's label. WhatsApp Web keeps no media key for an HD
+# or motion-photo child.
+db.execute("""CREATE TABLE wawf_message_association(child_message_row_id INTEGER, parent_message_row_id INTEGER,
+              child_key TEXT, parent_key TEXT, browser_association_type TEXT, meaning TEXT)""")
+na = nwa = 0
+for o in store('message-association'):
+    if not isinstance(o, dict): continue
+    ck, pk, bt = as_text(o.get('msgKey')), as_text(o.get('parentMsgKey')), as_text(o.get('associationType'))
+    cid, pid = WEBID2ID.get(ck), WEBID2ID.get(pk)
+    ptype = db.execute("SELECT message_type FROM message WHERE _id=?", (pid,)).fetchone() if pid else None
+    ptype = ptype[0] if ptype else None
+    if bt == 'MEDIA_ALBUM':
+        atype, meaning = 2, 'album item'
+    elif bt == 'UNKNOWN' and ptype in (3, 43):
+        atype, meaning = 7, 'HD copy of a video (the browser keeps no media key for it)'
+    elif bt == 'UNKNOWN' and ptype in (1, 42):
+        atype, meaning = None, 'HD copy or motion photo of a photo (the browser does not record which; no media key kept)'
+    else:
+        atype, meaning = None, 'association %s' % bt
+    db.execute("INSERT INTO wawf_message_association VALUES(?,?,?,?,?,?)", (cid, pid, ck, pk, bt, meaning))
+    nwa += 1
+    if atype and cid and pid:
+        db.execute("INSERT INTO message_association(child_message_row_id,parent_message_row_id,association_type) VALUES(?,?,?)",
+                   (cid, pid, atype))
+        na += 1
+
 # ---- receipts -> receipt_user (outgoing per-recipient) ----
 rc = 0
 for o in store(MSGINFO_SID):
@@ -500,10 +643,20 @@ for o in store(MSGINFO_SID):
     rc += 1
 
 # ---- polls -> message_poll + votes (message_add_on type 2, poll_vote) ----
-pl = 0
+pl = 0; popt = 0
 for m in messages:
-    if m['message_type'] == 66:
-        db.execute("INSERT INTO message_poll(message_row_id,selectable_options_count) VALUES(?,?)", (WEBID2ID[m['webid']], 1)); pl += 1
+    pdet = (m.get('details') or {}).get('poll')
+    if m['message_type'] == 66 or pdet:
+        pdet = pdet or {}
+        rid = WEBID2ID[m['webid']]
+        db.execute("INSERT INTO message_poll(message_row_id,selectable_options_count,poll_type,end_time) VALUES(?,?,?,?)",
+                   (rid, pdet.get('selectable'), 1 if pdet.get('type') == 'QUIZ' else 0 if pdet else None,
+                    pdet.get('end_time'))); pl += 1
+        votes = {v.get('option'): v.get('count') for v in pdet.get('votes') or []}
+        for name in pdet.get('options') or []:
+            popt += 1
+            db.execute("INSERT INTO message_poll_option(_id,message_row_id,option_name,vote_total) VALUES(?,?,?,?)",
+                       (popt, rid, name, votes.get(name)))
 pv = 0
 for o in store(POLLV_SID):
     if not isinstance(o, dict): continue
@@ -539,6 +692,7 @@ for o in store(PIN_SID):
     db.execute("INSERT INTO message_add_on_pin_in_chat(message_add_on_row_id,sender_timestamp,expiry_duration_in_secs,pin_in_chat_state) VALUES(?,?,?,1)",
                (addon_id, int(o.get('senderTimestampMs') or 0), o.get('pinExpiryDuration'))); pn += 1
 
+_flush_jids()
 db.commit(); db.close()
 
 # ============ wa.db ============
@@ -575,19 +729,26 @@ import mediacache
 # ciphertext -- so index a LIST per hash. Keying one message per hash silently dropped the
 # file_path of every other message that shared it.
 byench = {}
+byplain = {}       # WhatsApp Web also caches media it has already DECRYPTED; those match the plain hash
 for m in messages:
     if m['media'] and m['media'].get('enc_file_hash'):
         byench.setdefault(m['media']['enc_file_hash'], []).append(m)
-decrypted = blobs = 0
-cached, _cst = mediacache.recover(byench, _args.profile, O if not _is_chromium else None)
+    if m['media'] and m['media'].get('file_hash'):
+        byplain.setdefault(m['media']['file_hash'], []).append(m)
+decrypted = blobs = plain_hits = 0
+cached, _cst = mediacache.recover(set(byench) | set(byplain), _args.profile, O if not _is_chromium else None)
 db = sqlite3.connect(mp)
 for h, body in cached.items():
     wrote_any = False
-    for m in byench.get(h, []):
+    for m in byench.get(h, []) + byplain.get(h, []):
         md = m['media']
-        # the media TYPE (image/video/audio/document/sticker) picks the HKDF info string; fall back
-        # to the mime when the record has no type word
-        pt = mediacache.decrypt_media(body, md['media_key'], md.get('type') or md.get('mime_type'))
+        if h == md.get('file_hash'):
+            pt = body                     # cached already decrypted; recover() matched its SHA-256 exactly
+            plain_hits += 1
+        else:
+            # the media TYPE (image/video/audio/document/sticker) picks the HKDF info string; fall back
+            # to the mime when the record has no type word
+            pt = mediacache.decrypt_media(body, md['media_key'], md.get('type') or md.get('mime_type'))
         if pt is None: continue
         if base64.b64encode(hashlib.sha256(pt).digest()).decode() != md['file_hash']: continue  # verified
         rid = WEBID2ID[m['webid']]; ext = mediacache.ext_for(md['mime_type'])
@@ -599,17 +760,23 @@ for h, body in cached.items():
     blobs += 1 if wrote_any else 0
 db.commit(); db.close()
 if byench and not decrypted:
-    print(f"  [i] media: {len(byench)} media message(s) have keys but none of their encrypted blobs are "
+    print(f"  [i] media: {len(byench)} media message(s) have keys but none of their blobs are "
           f"in this browser's cache — run scripts/mediafetch.py --cdn to download them")
+elif decrypted:
+    print(f"  [+] media: {decrypted} file(s) recovered from the browser's cache "
+          f"({plain_hits} cached already decrypted, {decrypted - plain_hits} decrypted with their media key)")
 print(f"WROTE SQLite DB: {mp} + {wp}  (+ {OUT}/Media)")
+print(f"  groups={gs} group_members={gpu} past_members={gpp}")
 print(f"  jids={len(_jid_id)} chats={len(_chat_id)} messages={mid} mentions={ment_id} reactions={rx} receipts={rc} polls={pl}/votes={pv} media_decrypted_to_disk={decrypted}")
-A.crypto("decrypt", algorithm="AES-CBC-128", scheme="1 (final)", key=MSGKEY,
-         input_desc="all scheme-1 message bodies", records_in=mid, records_ok=mid)
+if MSGKEY:
+    A.crypto("decrypt", algorithm="AES-CBC-128", scheme="1 (final)", key=MSGKEY,
+             input_desc="all scheme-1 message bodies", records_in=mid, records_ok=mid)
 A.artifact(mp, kind="Android msgstore.db (decrypted messages)", records=mid)
 A.artifact(wp, kind="Android wa.db (contacts)", records=len(contacts))
 A.event("export_sqlite complete", category="stage",
         detail={"jids": len(_jid_id), "chats": len(_chat_id), "messages": mid, "mentions": ment_id,
-                "reactions": rx, "receipts": rc, "polls": pl, "votes": pv, "media_written": decrypted})
+                "reactions": rx, "receipts": rc, "polls": pl, "votes": pv, "media_written": decrypted,
+                "associations": na, "associations_browser": nwa})
 A.end_run(0, status="ok")
 # ---- human-readable summary ----
 import datetime as _dt
@@ -617,17 +784,22 @@ _secs=[m['timestamp']/1000 for m in messages if m.get('timestamp') and 1e9 < m['
 def _d(t): return _dt.datetime.fromtimestamp(t, _dt.timezone.utc).strftime('%Y-%m-%d')
 _cset=set(m['chat_jid'] for m in messages if m.get('chat_jid'))
 _grp=sum(1 for c in _cset if c.endswith('@g.us')); _sent=sum(1 for m in messages if m.get('from_me'))
-_media=sum(1 for m in messages if m.get('media'))
+_media=sum(1 for m in messages if m.get('media') and m.get('message_type') != 0)
+_previews=sum(1 for m in messages if m.get('media') and m.get('message_type') == 0)   # link-preview images
 print('──────────── summary ────────────')
 print(f'  messages    : {len(messages):,} total   ({_sent:,} sent / {len(messages)-_sent:,} received)')
 print(f'  date range  : {(_d(min(_secs)) if _secs else "?")}  →  {(_d(max(_secs)) if _secs else "?")}')
 print(f'  chats       : {len(_cset)}   ({len(_cset)-_grp} direct, {_grp} groups)')
 print(f'  contacts    : {len(contacts):,}   ·   groups: {len(groups):,}   ·   chats(saved): {len(chats):,}')
-print(f'  media msgs  : {_media:,}   ·   reactions: {rx:,}   ·   calls: {len(call_objs):,}')
+print(f'  media msgs  : {_media:,}' + (f' (+{_previews:,} link-preview images)' if _previews else '')
+      + f'   ·   reactions: {rx:,}   ·   calls: {len(call_objs):,}')
+print(f'  associations: {na:,} albums / HD video copies linked   ·   {nwa:,} as the browser recorded them (wawf_message_association)')
 print('─────────────────────────────────')
 print(f"  media       : {decrypted:,} file(s) from {blobs:,} cached blob(s)"
       + (f"; {len(byench):,} distinct media object(s) have keys" if byench else ""))
-if byench and decrypted < len(byench):
+if byench and decrypted < len(byench) and os.environ.get("WAWF_FETCH_MEDIA") == "1":
+    print("  [i] the rest were never cached by the browser; they are downloaded from WhatsApp's servers next")
+elif byench and decrypted < len(byench):
     print("  [i] the rest were never cached by the browser (or the cache has since been evicted). Their "
           "mediaKeys ARE in message_media — fetch them with:")
     print(f"      python3 scripts/mediafetch.py --db {mp} --profile <profile> --cdn")

@@ -21,11 +21,14 @@ hiddenimports += collect_submodules("cryptography")
 # stdlib submodule in that position (wa_reconnect.py, mediafetch.py, fetch_history_blobs.py);
 # urllib.error rides along with it and is named explicitly so it cannot be dropped either.
 hiddenimports += ["urllib.request", "urllib.error"]
+# The Python history client (history_extract.py, wa_client.py) runs from data the same way.
+hiddenimports += ["urllib.request", "urllib.error", "urllib.parse", "queue", "secrets", "gzip", "collections"]
 
 # Bundle every helper script as data so runpy + the runtime sys.path insert resolve them
 # (chromium_reader, wa_decrypt, export_baileys_creds, wa_forensic, export_sqlite,
 #  wa_reconnect + _wa_tokens, snappy_pure*, sclone, ...). They live under _MEIPASS/scripts at runtime.
 datas += [(f, "scripts") for f in glob.glob("scripts/*.py")]
+datas += [("assets/wawf.png", "assets")]          # window icon for the GUI
 
 a = Analysis(
     ["wawf.py"],
@@ -35,7 +38,7 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
-    excludes=["tkinter", "PySide6", "PyQt5", "matplotlib", "numpy.testing"],
+    excludes=["PySide6", "PyQt5", "matplotlib", "numpy.testing"],
     noarchive=False,
 )
 pyz = PYZ(a.pure)
@@ -43,5 +46,5 @@ exe = EXE(
     pyz, a.scripts, a.binaries, a.datas, [],
     name="wawf",
     debug=False, bootloader_ignore_signals=False, strip=False, upx=False,
-    runtime_tmpdir=None, console=True, disable_windowed_traceback=False,
+    runtime_tmpdir=None, console=True, icon="assets/wawf.ico", disable_windowed_traceback=False,
 )
