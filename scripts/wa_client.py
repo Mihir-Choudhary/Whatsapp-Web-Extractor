@@ -112,10 +112,13 @@ class SignalState(SC.MemoryStore):
 
 
 class Client:
-    def __init__(self, creds: dict, signal: SignalState, log=print, journal=None, ack="none"):
+    def __init__(self, creds: dict, signal: SignalState, log=print, journal=None, ack="none", peer_receipts=True):
         if ack not in ("none", "saved"): raise ValueError("ack must be 'none' or 'saved'")
         self.creds, self.signal, self.log = creds, signal, log
         self.ack_policy = ack
+        # a peer message (from another device of the account) is answered with a peer_msg receipt, as
+        # Baileys and WhatsApp Web do; a capture that must leave no trace turns this off
+        self.peer_receipts = peer_receipts
         self._journal = open(journal, "a", encoding="utf-8") if journal else None
         self._last_frame = b""
         self.stream_error = None                # why the server ended the session, if it did
@@ -339,7 +342,7 @@ class Client:
                 if used: parts[-1]["state"] = used
                 self.messages.put({"from": sender, "chat": chat, "id": a.get("id"), "category": a.get("category"),
                                    "t": a.get("t"), "message": msg})
-                if a.get("category") == "peer":
+                if a.get("category") == "peer" and self.peer_receipts:
                     self.send(N("receipt", {"id": a.get("id"), "to": a.get("from"), "type": "peer_msg"}))
             except Exception as e:
                 ok = False
@@ -376,7 +379,7 @@ class Client:
     def sender_kind(self, jid):
         """own-phone / own-other-device / contact / group-member: who a message came from, for the tally."""
         user = (jid or "").split("@")[0]; u, _, dev = user.partition(":")
-        if u in (self.me_lid, self.me_pn):
+        if u and u in (self.me_lid, self.me_pn):
             return "own-phone" if not dev or dev == "0" else "own-device-%s" % dev
         return "contact"
 

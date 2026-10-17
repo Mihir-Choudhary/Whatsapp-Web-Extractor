@@ -5,7 +5,7 @@ the GUI and the CLI cannot drift apart: every run is an ordinary CLI run, with t
 Standard library only (tkinter).
 """
 from __future__ import annotations
-import os, sys, glob, queue, subprocess, threading, datetime as dt
+import os, sys, glob, queue, shutil, subprocess, tempfile, threading, datetime as dt
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -810,12 +810,18 @@ class App(tk.Tk):
         if self.proc and self.proc.poll() is None:
             messagebox.showinfo("WhatsApp Web Extractor", "A run is already in progress."); return
         self._clear(); self._append("$ " + _cmdline(cmd) + "\n\n")
+        # The run and every helper it starts keep their temporary files (parsed copies of the store, which
+        # hold key material) in a folder of their own, removed when the run ends: Stop ends the run
+        # forcibly, so it never gets to clean up after itself.
+        self._run_tmp = tempfile.mkdtemp(prefix="wawf_run_")
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", WAWF_FROM_GUI="1",
-                   PYINSTALLER_RESET_ENVIRONMENT="1")      # the run unpacks its own copy of the exe
+                   PYINSTALLER_RESET_ENVIRONMENT="1",      # the run unpacks its own copy of the exe
+                   TMP=self._run_tmp, TEMP=self._run_tmp, TMPDIR=self._run_tmp)
         try:
             self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                          env=env, cwd=cwd or None, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except OSError as e:
+            self._remove_run_tmp()
             messagebox.showerror("WhatsApp Web Extractor", f"Could not start: {e}"); return
         threading.Thread(target=self._pump, args=(self.proc,), daemon=True).start()
         self.run_btn.configure(state="disabled"); self.stop_btn.configure(state="normal")
@@ -855,7 +861,12 @@ class App(tk.Tk):
             pass
         self.after(100, self._drain)
 
+    def _remove_run_tmp(self):
+        d, self._run_tmp = getattr(self, "_run_tmp", None), None
+        if d: shutil.rmtree(d, ignore_errors=True)
+
     def _finished(self, rc):
+        self._remove_run_tmp()
         self.bar.stop(); self.bar.pack_forget()
         self.run_btn.configure(state="normal"); self.stop_btn.configure(state="disabled")
         if rc == 0:
@@ -895,7 +906,10 @@ class App(tk.Tk):
         if self.proc and self.proc.poll() is None:
             if not messagebox.askyesno("WhatsApp Web Extractor", "A run is in progress. Stop it and close?"):
                 return
-            self.proc.terminate()
+            self.stop()
+            try: self.proc.wait(timeout=10)
+            except Exception: pass
+            self._remove_run_tmp()
         self.destroy()
 
     def _clear(self):

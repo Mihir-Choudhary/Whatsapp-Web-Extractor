@@ -42,12 +42,15 @@ def msg_bytes(fields):
     return WP.encode(fields, WP.MESSAGE)
 
 tmp = tempfile.mkdtemp(prefix="wawf_cap_")
-def client(ack, name=None):
+CLIENTS = []                                      # their journals are closed before tmp is removed (Windows)
+def client(ack, name=None, peer_receipts=None):
     me, me_bundle = party(1001)
     c = WC.Client({"user": "15550000000", "lid": "99990000000@lid"}, me, log=lambda m: None,
-                  journal=os.path.join(tmp, "j_%s.jsonl" % (name or ack)), ack=ack)
+                  journal=os.path.join(tmp, "j_%s.jsonl" % (name or ack)), ack=ack,
+                  peer_receipts=ack != "none" if peer_receipts is None else peer_receipts)
     c.sent = []
     c.send = lambda node: c.sent.append(node)
+    CLIENTS.append(c)
     return c, me, me_bundle
 
 def feed(c, node):
@@ -114,6 +117,21 @@ m = pc.encrypt(WC._pad(WP.encode({"deviceSentMessage": {"destinationJid": "15551
                                                         "message": WP.decode(react, WP.MESSAGE)}}, WP.MESSAGE)))
 feed(c, {"tag": "message", "attrs": {"id": "S2", "from": "15550000000@s.whatsapp.net", "recipient": "15551112222@s.whatsapp.net",
                                       "t": "1760000021", "type": "reaction"}, "content": [enc_node(m["type"], m["body"])]})
+# a peer message from the phone (category="peer": an app-state key share, a history notification)
+peer = pc.encrypt(WC._pad(WP.encode({"conversation": "peer"}, WP.MESSAGE)))
+peer_node = {"tag": "message", "attrs": {"id": "P1", "from": "15550000000@s.whatsapp.net", "category": "peer",
+                                         "t": "1760000022", "type": "text"}, "content": [enc_node(peer["type"], peer["body"])]}
+feed(c, peer_node)
+check("a peer message from the phone is not receipted when nothing is acknowledged",
+      not [n for n in c.sent if n["tag"] == "receipt"])
+c2, _, me_bundle2 = client("none", "peer", peer_receipts=True)     # the history client: answers as WhatsApp Web does
+phone2, _ = party(4005)
+S.SessionBuilder(phone2, "x").init_outgoing(me_bundle2)
+phone2.sessions["15550000000.0"] = phone2.sessions.pop("x")
+peer = S.SessionCipher(phone2, "15550000000.0").encrypt(WC._pad(WP.encode({"conversation": "peer"}, WP.MESSAGE)))
+feed(c2, dict(peer_node, content=[enc_node(peer["type"], peer["body"])]))
+check("with peer receipts on, the phone's peer message gets its peer_msg receipt",
+      [n["attrs"].get("type") for n in c2.sent if n["tag"] == "receipt"] == ["peer_msg"])
 # an encrypted edit (secretEncryptedMessage) of a message whose secret is in the same capture
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
@@ -230,6 +248,7 @@ else:
         acks = {n["attrs"]["id"] for n in c.sent if n["tag"] == "ack"}
         check("both group stanzas acknowledged (fully decrypted, ack=saved)", {"G1", "G2"} <= acks)
 
+for c in CLIENTS: c._journal.close()
 shutil.rmtree(tmp, ignore_errors=True)
 print()
 if FAIL:

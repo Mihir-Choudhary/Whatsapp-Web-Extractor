@@ -409,11 +409,22 @@ def _run_with_keys(a):
             os.environ.pop("WAWF_KEY_TRIAL", None)
         if rc != 3:
             return rc
-        log.info("the key in %s does not open this session; trying the next", k)
-    if keys:
-        log.warning("none of the given keys opens this session (each linked device has its own key); %s",
-                    "exporting it without message text" if getattr(a, "offline", False) else "capturing its own key")
+        if i < len(keys) - 1:
+            log.info("the key in %s does not open this session; trying the next", k)
+    if not keys:
+        return cmd_run(a)
+    # A named key that does not fit is reported, never papered over with a network login: --key is how
+    # a session is decrypted WITHOUT touching the account (see cmd_run). Offline, everything but the
+    # message text can still be exported, which never needs the network either.
+    if not getattr(a, "offline", False):
+        log.error("none of the given keys opens this session (each linked device has its own key), so "
+                  "stopping rather than reaching for the network. Give this session's own key, add --offline "
+                  "to export it without message text, or omit --key to capture its key deliberately.")
+        return 3
+    log.warning("none of the given keys opens this session (each linked device has its own key); "
+                "exporting it without message text")
     a.key = None
+    a._no_key = True                   # and no key found lying beside the output is tried either
     return cmd_run(a)
 
 def _report_steps(steps):
@@ -521,7 +532,7 @@ def cmd_run(a):
                 log.warning("device credentials could not be recovered; continuing without network key capture")
                 creds_path = None
 
-    key = _find_key(a, workdir, outs)
+    key = None if getattr(a, "_no_key", False) else _find_key(a, workdir, outs)
     # Record provenance HERE, where it is actually known. It used to be inferred further down as
     # `not a.key`, which is also true of a key the reconnect had just captured -- so a single decrypt
     # failure made the tool discard a seconds-old key, announce it was "left over from before the
@@ -585,6 +596,14 @@ def cmd_run(a):
         rc = _decrypt_all(key)
         if rc != 3:
             return rc
+        if getattr(a, "offline", False):
+            # --offline promises no contact with WhatsApp, so the fresh key is not fetched: everything
+            # but the message text is exported instead
+            log.warning("the key found beside the output does not match this profile (it is almost certainly "
+                        "left over from before the browser last re-paired); --offline: exporting everything "
+                        "except message text")
+            key, guessed = None, False
+    if guessed and key:
         log.warning("that key does not match this profile -- it is almost certainly left over from "
                     "before the browser last re-paired. Discarding it and capturing a fresh one.")
         keyfile = os.path.join(workdir, KEY_FILENAME)
@@ -2495,7 +2514,7 @@ def main():
                    help="a companion_enc_static.txt captured earlier, to decrypt without touching the "
                         "network; repeat it for a profile holding several sessions (each linked device has "
                         "its own key, and every session is decrypted with the one that opens it). "
-                        "network. Normally unnecessary: a copy left beside the output is picked up "
+                        "Normally unnecessary: a copy left beside the output is picked up "
                         "automatically. A FILE rather than the key itself, so no secret reaches your "
                         "shell history, process list or command auditing.")
     p.add_argument("--offline", action="store_true",

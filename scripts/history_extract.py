@@ -320,7 +320,9 @@ class Run:
                 continue
             pm = WP.unwrap(m["message"]).get("protocolMessage") or {}
             n = pm.get("historySyncNotification")
-            if not n or not m["from"].startswith(self.c.me_lid + "@") and not m["from"].startswith(self.c.me_lid + ":"):
+            # only the account's own devices send history; the phone may address us by its LID or by
+            # its phone number, and creds without a LID have only the number to go by
+            if not n or self.c.sender_kind(m["from"]) == "contact":
                 continue
             try:
                 sid, msgs = self.on_notification(n, m)

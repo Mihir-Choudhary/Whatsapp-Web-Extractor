@@ -306,7 +306,9 @@ def main():
     say("[i] Signal state from %s: %d sessions, %d group sender keys" % (state_file, len(state.get("sessions") or {}),
                                                                          len(state.get("senderKeys") or {})))
     jpath = os.path.abspath("queue_journal.jsonl")
-    c = WC.Client(creds, signal, log=lambda m: say("  " + m), journal=jpath, ack=ACK)
+    # with nothing acknowledged, nothing is receipted either: a peer_msg receipt would tell the phone
+    # its message to this device was delivered
+    c = WC.Client(creds, signal, log=lambda m: say("  " + m), journal=jpath, ack=ACK, peer_receipts=ACK != "none")
     # further states to try (WAWF_QUEUE_EXTRA_STATE, os.pathsep-separated): each is COPIED here first,
     # so the original is never advanced by this run
     for i, src in enumerate(p for p in os.environ.get("WAWF_QUEUE_EXTRA_STATE", "").split(os.pathsep) if p):

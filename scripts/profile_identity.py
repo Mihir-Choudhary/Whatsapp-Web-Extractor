@@ -240,11 +240,24 @@ def browser_running(profile):
     for p in cands:
         if os.path.islink(p):                       # 'host-pid'
             try:
-                pid = int(os.readlink(p).rsplit("-", 1)[1])
+                host, pid = os.readlink(p).rsplit("-", 1); pid = int(pid)
+            except (ValueError, OSError):
+                return None
+            # The pid only means something on the machine that wrote the lock: a profile copied from
+            # another machine names a process of THAT machine. And on Windows os.kill(pid, 0) is not a
+            # probe -- it terminates whatever process has that number.
+            import socket
+            if sys.platform == "win32" or host != socket.gethostname():
+                return None
+            try:
                 os.kill(pid, 0)
                 return True
-            except (ValueError, IndexError, OSError):
+            except ProcessLookupError:
                 return False
+            except PermissionError:
+                return True                         # it exists, under another user
+            except OSError:
+                return None
         if os.path.isfile(p) and sys.platform == "win32":
             try:
                 open(p, "rb").close()
