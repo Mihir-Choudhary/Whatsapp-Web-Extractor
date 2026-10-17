@@ -337,13 +337,25 @@ class Run:
 
     def request_page(self, key, ts):
         req = WP.history_request(key["remoteJid"], key["id"], key["fromMe"], COUNT, ts)
-        mid = self.c.send_peer(self.own, req, {"category": "peer", "push_priority": "high_force", "privacy_sensitive": "1"})
+        try:
+            mid = self.c.send_peer(self.own, req, {"category": "peer", "push_priority": "high_force", "privacy_sensitive": "1"})
+        except Exception:
+            if self.c.closed.is_set(): return None           # the caller sees the closed connection
+            raise
         self.our_ids.add(mid); self.pending[mid] = []
         deadline = time.time() + REQ_TIMEOUT
         self.pump(lambda: (self.pending[mid] and self.pending[mid][-1] is None) or time.time() > deadline)
         got = self.pending.pop(mid)
         if not got or got[-1] is not None: return None
         return got[:-1]
+
+    def lost_connection(self):
+        """The server closed the connection: keep what arrived, say why, exit 4 (wawf stops the passes)."""
+        tot, nw, chats = self.write_out()
+        say("[x] the server closed the connection%s; %d message(s) recovered before it did are saved"
+            % ((": " + self.c.stream_error) if self.c.stream_error else " (no reason given)", tot))
+        self.c.close()
+        return 4
 
     # -------------------------------------------------------------- the run
     def main(self):
@@ -369,27 +381,41 @@ class Run:
             say("[x] could not connect:", e); return 4
         self.own = self.c.me_lid + "@lid" if self.c.me_lid else self.c.me_pn + "@s.whatsapp.net"
         say("[+] connected; asking the primary for history on %d chat(s)" % len(targets))
-        self.c.query(WB.node("iq", {"to": "s.whatsapp.net", "xmlns": "passive", "type": "set"}, [WB.node("active")]))
+        try:
+            self.c.query(WB.node("iq", {"to": "s.whatsapp.net", "xmlns": "passive", "type": "set"}, [WB.node("active")]))
+        except Exception:
+            if self.c.closed.is_set(): return self.lost_connection()
+            raise
         # answers queue behind the offline backlog: drain it before asking
         t0, done = time.time(), False
         self.c.send(WB.node("ib", {}, [WB.node("offline_batch", {"count": "100"})]))
-        while time.time() - t0 < SETTLE_MAX and not done:
+        while time.time() - t0 < SETTLE_MAX and not done and not self.c.closed.is_set():
             try: ev = self.c.events.get(timeout=1.5)
             except queue.Empty:
-                self.c.send(WB.node("ib", {}, [WB.node("offline_batch", {"count": "100"})])); continue
+                if not self.c.closed.is_set():
+                    self.c.send(WB.node("ib", {}, [WB.node("offline_batch", {"count": "100"})]))
+                continue
             if ev["tag"] == "ib" and any(isinstance(x, dict) and x["tag"] == "offline" for x in (ev.get("content") or [])):
                 done = True
         self.pump(lambda: self.c.messages.empty())          # bank any late answers delivered in the backlog
         say("[i] offline backlog %s (%d stanzas, %d decrypted)" % ("drained" if done else "NOT fully drained",
                                                                     self.c.stats["in"], self.c.stats["decrypted"]))
+        if self.c.closed.is_set():
+            return self.lost_connection()
         self.c.send(WB.node("presence", {"type": "available"}))
         fail = 0; first_fail = None; tripped = False; delay = BASE_DELAY
         probe_silent = probed = served = silent = 0
         for a in targets:
+            if self.c.closed.is_set():
+                # every request from here on would go unanswered and be counted against the failure
+                # budget, and the chats marked silent, for a reason that has nothing to do with them
+                return self.lost_connection()
             key = {"remoteJid": a["chat"], "id": a["oldest_id"], "fromMe": bool(a.get("oldest_fromMe"))}
             ts, got = a["oldest_ts"], 0
             for pg in range(MAXPAGES):
-                msgs = self.request_page(key, ts)
+                msgs = self.request_page(key, ts) if not self.c.closed.is_set() else None
+                if msgs is None and self.c.closed.is_set():
+                    return self.lost_connection()
                 if msgs is None:
                     say("  %s page%d: no response" % (a["chat"][:22], pg))
                     if pg == 0: probe_silent += 1; silent += 1; self.silent.add(a["chat"]); self.write_out()

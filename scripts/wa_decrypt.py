@@ -143,7 +143,22 @@ def _norm_msg(o):
             "iv": iv, "data": data, "scheme": op.get("_scheme") if op else None,
             "filename": as_str(o.get("filename")),
             "view_once": bool(o.get("isViewOnce")),
-            "ack": o.get("ack") if isinstance(o.get("ack"), int) else None}
+            "ack": o.get("ack") if isinstance(o.get("ack"), int) else None,
+            "call": _call_details(o)}
+
+def _call_details(o):
+    """A call log entry's outcome, length and kind, as WhatsApp Web recorded them; None for anything
+    else. `finalCallOutcome`, when present, is the settled outcome and wins over `callOutcome`."""
+    if o.get("type") != "call_log": return None
+    out = as_str(o.get("finalCallOutcome")) or as_str(o.get("callOutcome"))
+    dur = o.get("callDuration")
+    return {"outcome": out, "duration_s": dur if isinstance(dur, (int, float)) else None,
+            "video": bool(o.get("isVideoCall"))}
+
+def _call_settled(m):
+    """Rank of a call log version: a settled outcome over one still 'Ongoing', then the longer call."""
+    c = m.get("call") or {}
+    return (c.get("outcome") not in (None, "Ongoing"), c.get("duration_s") or 0)
 def as_str(x):
     if isinstance(x, str): return x
     if isinstance(x, dict): return x.get("_serialized") or (f"{x.get('user')}@{x.get('server')}" if x.get("user") else None)
@@ -627,6 +642,7 @@ def msg_row(m, when, pt, ids):
             # and an export that merges them has to say which is which.
             "source": "cache"}
     if m.get("filename"): row["filename"] = m["filename"]
+    if m.get("call"): row["call"] = m["call"]
     # WhatsApp does not send view-once content to linked devices: the browser keeps a record that the
     # message exists (sender, time, photo or video) and nothing else. Said here, so an empty row is not
     # read as a gap in the extraction.
@@ -907,7 +923,8 @@ def write_transcripts(path, chats, ids):
                 # its type in parentheses. Nothing is invented: `(image)` is the type the store
                 # recorded, not a guess at content.
                 body = m["text"] or ("(view-once %s: content only on the phones)" % (m.get("type") or "media")
-                                     if m.get("view_once") else "(%s)" % (m.get("type") or "unknown"))
+                                     if m.get("view_once") else _call_line(m.get("call")) if m.get("call")
+                                     else "(%s)" % (m.get("type") or "unknown"))
                 # 3.7% of messages contain newlines, and writing them raw broke the one-line-per-
                 # message structure this file promises: 2,394 continuation lines carried no
                 # timestamp and no sender, and 29 of them began with '#', which is what this file
@@ -924,6 +941,12 @@ def write_transcripts(path, chats, ids):
                 q = _oneline(m.get("quoted_text"), 160)   # marked when cut; full text in chats.json
                 if q:
                     f.write(" " * (len(head) - 6) + "re: " + q + "\n")
+
+def _call_line(c):
+    """'(video call: Completed, 48m03s)' -- what a call log row says in the transcript."""
+    d = c.get("duration_s")
+    length = (", %dh%02dm%02ds" % (d // 3600, d % 3600 // 60, d % 60) if d >= 3600 else ", %dm%02ds" % (d // 60, d % 60)) if d else ""
+    return "(%s call: %s%s)" % ("video" if c.get("video") else "voice", c.get("outcome") or "outcome not recorded", length)
 
 def load_firefox(origin):
     ls = {}
@@ -985,8 +1008,16 @@ def _dedupe_msgs(msgs):
     lines in the transcript, and 37 duplicate `key_id`s in an export whose schema treats that column
     as unique.
     """
-    out, seen = [], set()
+    out, seen, calls = [], set(), {}
     for m in msgs:
+        # A call is stored again as it progresses ('Ongoing', then 'Completed' with its length): one
+        # call, so one row, from the version that says how it ended.
+        if m.get("type") == "call_log" and m.get("call"):
+            if m.get("id") in calls:
+                i = calls[m["id"]]
+                if _call_settled(m) > _call_settled(out[i]): out[i] = m
+                continue
+            calls[m.get("id")] = len(out); out.append(m); continue
         k = (m.get("id"), m.get("t"), m.get("from_me"), m.get("type"), m.get("sender"),
              m.get("iv"), m.get("data"))
         if k in seen: continue

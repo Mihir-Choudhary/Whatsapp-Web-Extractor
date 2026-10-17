@@ -161,7 +161,10 @@ file's own structure does.
 
 **Every message gets a line**, including the ones with no text of their own — caption-less media, a
 revoked message, a call log — shown as the type the store recorded: `(sticker)`, `(image)`,
-`(revoked)`. Omitting them hid 2,374 records of a 22,084-message export from the readable artifact,
+`(revoked)`. A call says how it went: `(video call: Completed, 48m03s)`, and its `chats.json` row
+carries `call` with `outcome`, `duration_s` and `video`. WhatsApp Web stores a call again as it
+progresses (`Ongoing`, then how it ended); the export keeps one row per call, from the settled version.
+Omitting them hid 2,374 records of a 22,084-message export from the readable artifact,
 and with them the `re:` quote on a sticker reply, which is exactly the case the own/quoted split
 exists for. The chat header counts both: `N msgs, M with text`.
 

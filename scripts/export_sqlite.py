@@ -670,15 +670,28 @@ for o in store(POLLV_SID):
     pv += 1
 
 # ---- calls -> call_log (from call_log messages) ----
+# A call is stored again as it progresses ('Ongoing', then 'Completed' with its length): keep one row
+# per call, from the version that says how it ended.
+def _call_rank(o):
+    out = o.get('finalCallOutcome') or o.get('callOutcome')
+    return (out not in (None, 'Ongoing'), o.get('callDuration') or 0)
+_calls = {}
+for o in call_objs:
+    k = o.get('id')
+    if k not in _calls or _call_rank(o) > _call_rank(_calls[k]): _calls[k] = o
+# WhatsApp Web's outcome -> the call_result code this schema uses (5 connected, 2 not)
+_CONNECTED = ('completed', 'acceptedelsewhere', 'accepted', 'answered')
 cl = 0
-for o in call_objs:                      # already collected during the single parse pass above
+for o in _calls.values():                # already collected during the single parse pass above
     cl += 1
     frm = ser(o.get('from')); to = ser(o.get('to')); fm = 1 if is_owner(frm) else 0
     other = to if fm else frm
     db.execute("""INSERT INTO call_log(_id,jid_row_id,from_me,timestamp,video_call,duration,call_result,bytes_transferred,call_id,is_joinable_group_call)
                   VALUES(?,?,?,?,?,?,?,?,?,0)""",
                (cl, jid_id(other) or 0, fm, int(o.get('t') or 0)*1000, 1 if o.get('isVideoCall') else 0,
-                o.get('duration') or 0, 5 if str(o.get('callOutcome') or '').lower() in ('accepted','answered') else 2, 0, as_text(o.get('id'))))
+                int(o.get('callDuration') or o.get('duration') or 0),
+                5 if str(o.get('finalCallOutcome') or o.get('callOutcome') or '').lower() in _CONNECTED else 2,
+                0, as_text(o.get('id'))))
 
 # ---- pins -> message_add_on(type 79) + message_add_on_pin_in_chat ----
 pn = 0
@@ -792,7 +805,7 @@ print(f'  date range  : {(_d(min(_secs)) if _secs else "?")}  →  {(_d(max(_sec
 print(f'  chats       : {len(_cset)}   ({len(_cset)-_grp} direct, {_grp} groups)')
 print(f'  contacts    : {len(contacts):,}   ·   groups: {len(groups):,}   ·   chats(saved): {len(chats):,}')
 print(f'  media msgs  : {_media:,}' + (f' (+{_previews:,} link-preview images)' if _previews else '')
-      + f'   ·   reactions: {rx:,}   ·   calls: {len(call_objs):,}')
+      + f'   ·   reactions: {rx:,}   ·   calls: {len(_calls):,}')
 print(f'  associations: {na:,} albums / HD video copies linked   ·   {nwa:,} as the browser recorded them (wawf_message_association)')
 print('─────────────────────────────────')
 print(f"  media       : {decrypted:,} file(s) from {blobs:,} cached blob(s)"

@@ -2170,7 +2170,7 @@ def cmd_history(a):
             # final _checkpoint. Measured: a 10,842-message pass discarded in full.
             try: passd = json.load(open(pass_out, encoding="utf-8"))
             except Exception:
-                log.error("pass %d produced no output (node exit=%s; connection failed / phone not serving) "
+                log.error("pass %d produced no output (history client exit=%s; connection failed / phone not serving) "
                           "— stopping.", p, rc); break
             WD, _ = _imp()
             # What the phone actually served this pass, as distinct from what was NEW in it: a pass
@@ -2190,6 +2190,13 @@ def cmd_history(a):
             by = _checkpoint(accum)                          # checkpoint the accumulated set every pass
             log.info("pass %d: +%d new%s  ·  total recovered: %d across %d chats", p, new,
                      (", %d enriched" % enriched) if enriched else "", len(master), len(by))
+            if rc == 4 and engine != "node":
+                # the Python client saw the server close the connection: what arrived is banked above;
+                # reading the short pass as "converged" or "nothing answered" would be a wrong diagnosis
+                log.warning("pass %d ended because WhatsApp's server closed the connection (the reason, if "
+                            "it gave one, is printed above). %s messages are banked; re-run to continue.",
+                            p, f"{len(master):,}")
+                break
             if rc == COOLDOWN_RC:
                 _deepen_anchors(anchors_path, master, only=refetch_only,
                                 start_reached=ended_chats, silent=chat_state["silent"])                 # bank before the wait

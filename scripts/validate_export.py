@@ -64,14 +64,20 @@ FIELDS = {'id', 't', 'dir', 'type', 'chat', 'chat_name', 'sender', 'sender_name'
 #   filename, ack/status, and the structured parts of a body (link, location, poll, event, payment,
 #   target_message_key).
 #   view_once + content_note -- a view-once record: WhatsApp sends its content only to the phones.
+#   call -- a call log entry's outcome, duration_s and video flag.
 OPTIONAL = {'filename', 'ack', 'status', 'link', 'location', 'poll', 'event', 'payment', 'target_message_key',
-            'view_once', 'content_note'}
+            'view_once', 'content_note', 'call'}
 def _fields_ok(m):
     extra = set(m) - FIELDS
     if not FIELDS <= set(m) or extra - OPTIONAL - {'body_status'}: return False
     if 'body_status' in m:
         return not (m.get('text') or '').strip() and m['body_status'] in ('none', 'other-scheme', 'failed', 'encrypted')
     return True
+chk("a call log row says how the call ended, how long and what kind",
+    all(isinstance(m.get('call'), dict) and set(m['call']) == {'outcome', 'duration_s', 'video'}
+        for m in msgs if m.get('type') == 'call_log' and m.get('source', 'cache') == 'cache'))
+chk("one row per call", len([m for m in msgs if m.get('type') == 'call_log']) ==
+    len({m.get('id') for m in msgs if m.get('type') == 'call_log'}))
 chk("every row has exactly the documented fields",
     all(_fields_ok(m) for m in msgs),
     next((sorted(set(m) ^ FIELDS) for m in msgs if not _fields_ok(m)), ''))
