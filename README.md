@@ -22,10 +22,7 @@
 
 > **Risk to the account.** The default run (to capture the key), `--queue` and `--history` sign in to
 > WhatsApp as the account's linked device, using a client WhatsApp did not write; `--fetch-media`
-> downloads from WhatsApp's CDN. That is against WhatsApp's Terms of Service, and WhatsApp has banned
-> accounts for using unofficial clients. Each sign-in is recorded as activity on the account. If the
-> account must not be put at risk, use `--offline` with a key captured earlier (`--key`), or without one
-> to export everything except message text.
+> downloads from WhatsApp's CDN.
 
 ## What it does
 
