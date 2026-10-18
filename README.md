@@ -260,7 +260,7 @@ A Windows drive letter is never mistaken for a `FORMAT`, so `D:\case\out` works 
 | `--origin DIR` | Firefox `web.whatsapp.com` storage folder instead of a profile folder. |
 | `--raw-include-keys` | With `--out raw:` — also dump `signal-storage` and `wawc_db_enc`. Those are key material; a dump including them must not travel with a case. |
 | `--history` | **Also** pull chat history older than the browser cache from your phone, iteratively, resuming across runs, and append it to the export. Pure Python, no Node needed. Phone-side and rate-limited — see below. |
-| `--queue` | After the export, record what WhatsApp's server is holding for this device, decrypted with the browser's own keys, into `<out>/server-queue/<time>/`. Networked; acknowledges nothing, so the queue stays for the browser. See [Recording what the server is holding](#recording-what-the-server-is-holding----queue). |
+| `--queue` | After the export, record what WhatsApp's server is holding for this device, decrypted with the browser's own keys, into `<out>/server-queue/<time>/` (with `--chat`, beside it: `<out>-server-queue/<time>/`). Networked; acknowledges nothing, so the queue stays for the browser. See [Recording what the server is holding](#recording-what-the-server-is-holding----queue). |
 | `--fetch-media` | With `--out sqlite:PATH` (with or without `--history`): download, decrypt and verify from the CDN the media the browser never cached, newest first. Networked, and it downloads real bytes — a large account can be a lot of them. Urls whose signature has already expired are skipped without a request. |
 | `--history-refetch` | With `--history`: re-ask for history already recovered, to fill in fields an earlier run did not capture (the group sender). Finds nothing new by design. |
 | `--install-node` | Only with the optional Node engine (`WAWF_HISTORY_ENGINE=node`): allow `--history` to install Node.js via winget when none is found. **Not** covered by `--yes`: it modifies the machine and asks for elevation. A portable Node unzipped beside the tool, or `WAWF_NODE` pointing at one, needs neither. |
@@ -298,8 +298,9 @@ wawf <PROFILE> --chat 123456789012345@lid --history --out D:\case\out
   contacts.csv and wa.db the people in them; group membership the chosen groups only. The receipt
   (`wawf_export.json`) records the scope. `raw` is refused with `--chat`, because it is an image of the whole store.
 - **What cannot be scoped:** signing in delivers whatever the server holds for the device. `--queue`
-  and `--history` keep that, as received, in their own folders (they say so when `--chat` is given);
-  only the chosen chats' messages are merged into the export. On a profile with several sessions,
+  and `--history` keep that, as received, outside the export folder — `--queue` beside it
+  (`<out>-server-queue/`), `--history` in the device's folder — and say so when `--chat` is given; only
+  the chosen chats' messages are merged into the export. On a profile with several sessions,
   `--partition` must name the one to search.
 
 ## What a browser holds — and what it does not
@@ -434,7 +435,8 @@ wawf <profile> --out D:\case\out --queue
 ```
 
 This exports the device's credentials and the browser's **own** Signal state
-(identity, sessions, the group sender keys) into `<out>/server-queue/<time>/`, signs in as the device and
+(identity, sessions, the group sender keys) into `<out>/server-queue/<time>/` (`<out>-server-queue/<time>/`, beside
+the export rather than in it, with `--chat`), signs in as the device and
 records every stanza the server delivers:
 
 - `queue_journal.jsonl` — every stanza exactly as received (after transport decryption), each payload
@@ -695,7 +697,11 @@ python3 wawf.py ~/.config/google-chrome/Default --key companion_enc_static.txt \
   (Windows: `%LOCALAPPDATA%\Google\Chrome\User Data\Default`)
 
 Every writer validates the key against on-disk ciphertext and refuses to write garbage if it is wrong.
-Exit codes: `0` ok · `1` error · `2` bad usage · `3` wrong key · `4` file not found.
+Exit codes: `0` ok · `1` error (with `--history`: nothing recovered, or nothing could be asked) · `2` bad
+usage or a refused combination (also a `--chat` that names no chat or several) · `3` wrong key, or
+nothing for `--history` / `--queue` to work from (no usable device credentials; with `--chat`, no message
+to anchor a request on) · `4` file not found · `6` the server ended a `--queue` capture early · `130`
+interrupted.
 
 **Media.** Message media is recovered from the browser's own cache (Chromium simple-cache and
 blockfile, Firefox CacheStorage and `cache2` — all four layouts verified byte-identical) and verified

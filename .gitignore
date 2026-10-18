@@ -100,6 +100,8 @@ history_metadata.json*
 wawf-history/
 # --queue without --out writes here; it holds the device's credentials and the decrypted queue
 server-queue/
+# ...and with --chat, beside the export folder (`<folder>-server-queue/`), so the scoped export holds no other chat
+*-server-queue/
 queue_*.json*
 placeholder_resend.json*
 

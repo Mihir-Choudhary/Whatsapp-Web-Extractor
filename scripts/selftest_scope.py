@@ -89,6 +89,47 @@ check("in_scope accepts every form of a chosen chat",
 check("in_scope rejects everything else", not any(CS.in_scope(j, sc) for j in ("2222@lid", "120363000000000002@g.us")))
 check("no scope means everything", CS.in_scope("2222@lid", None) and CS.in_scope("2222@lid", []))
 
+print("what --queue keeps, and where")
+# The server hands over the device's whole queue -- it cannot be asked for one chat -- and the capture keeps
+# it decrypted. Inside a --chat export's folder, the folder handed on as "these chats only" held every other
+# conversation the queue carried. cmd_queue with the profile reads and the sign-in replaced (fictional 555 data).
+import json, shutil, tempfile, types
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.argv = ["wawf.py"]
+import wawf
+def _queue(scoped):
+    t = tempfile.mkdtemp(prefix="wawf_selftest_")
+    out = os.path.join(t, "Case 1", "export")
+    def _creds(a, path):
+        json.dump({"user": "15555550100", "device": 45}, open(path, "w")); return True
+    def _sub(script, extra):
+        json.dump({"registrationId": 1}, open(extra[extra.index("--out") + 1], "w")); return 0
+    def _client(cmd, cwd=None, env=None, **k):          # the capture: what it writes, then a clean exit
+        json.dump({"stats": {}}, open(os.path.join(cwd, "queue_summary.json"), "w"))
+        json.dump({"messages": []}, open(os.path.join(cwd, "queue_for_export.json"), "w"))
+        return types.SimpleNamespace(returncode=0)
+    saved = {k: getattr(wawf, k) for k in ("_creds_ok", "_sub", "subprocess", "_require_source", "_is_chromium",
+                                            "_history_homes")}
+    wawf._creds_ok, wawf._sub = _creds, _sub
+    wawf.subprocess = types.SimpleNamespace(run=_client)
+    wawf._require_source = lambda a, cmd="": None; wawf._is_chromium = lambda p: True
+    wawf._history_homes = lambda: []
+    if scoped: os.environ["WAWF_CHAT_SCOPE"] = json.dumps(["15555550101@c.us"])
+    try:
+        a = types.SimpleNamespace(profile="P", origin=None, out=[out], creds=None, browser_running=False)
+        rc = wawf.cmd_queue(a)
+        return rc, os.path.dirname(os.path.abspath(a.queue_export_file)), os.path.abspath(out)
+    finally:
+        os.environ.pop("WAWF_CHAT_SCOPE", None)
+        for k, v in saved.items(): setattr(wawf, k, v)
+        shutil.rmtree(t, ignore_errors=True)
+rc, work, out = _queue(scoped=False)
+check("without --chat the capture is kept with the export, in server-queue",
+      rc == 0 and os.path.dirname(work) == os.path.join(out, "server-queue"))
+rc, work, out = _queue(scoped=True)
+check("with --chat the capture is beside the export folder, not in it",
+      rc == 0 and not (work + os.sep).startswith(out + os.sep) and os.path.dirname(work) == out + "-server-queue")
+
 print()
 if FAIL:
     print(f"{len(FAIL)} CASE(S) FAILED"); [print("  - " + f) for f in FAIL]; sys.exit(1)

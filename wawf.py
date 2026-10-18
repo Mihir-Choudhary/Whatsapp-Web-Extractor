@@ -157,6 +157,12 @@ def _example_profile():
 _OUT_FORMATS = ("txt", "json", "sqlite", "db", "raw")
 
 EXPORT_MANIFEST = "wawf_export.json"
+# what this run has written into each output folder: two --out formats may share one folder (`--out txt:D
+# --out sqlite:D`), and each writer leaves the receipt -- which named only the last writer's files
+_WRITTEN = {}
+
+def _written_here(outdir):
+    return _WRITTEN.get(os.path.normcase(os.path.abspath(outdir)), set())
 
 def _write_export_manifest(outdir, composition, counts, files):
     """Leave a receipt in an output folder: what this export contains, and what produced it.
@@ -168,9 +174,11 @@ def _write_export_manifest(outdir, composition, counts, files):
     """
     try:
         os.makedirs(outdir, exist_ok=True)
+        here = _WRITTEN.setdefault(os.path.normcase(os.path.abspath(outdir)), set())
+        here.update(f for f in files if os.path.isfile(os.path.join(outdir, f)))
         rec = {"tool": "wawf", "version": _wawf_version(), "created_utc": dt.datetime.now(dt.timezone.utc)
                .strftime("%Y-%m-%d %H:%M:%S"), "composition": composition, "counts": counts,
-               "artifacts": sorted(f for f in files if os.path.isfile(os.path.join(outdir, f)))}
+               "artifacts": sorted(here)}
         if os.environ.get("WAWF_CHAT_SCOPE"):           # an export of named chats only says so
             rec["chat_scope"] = {"chats": json.loads(os.environ.get("WAWF_CHAT_SCOPE_LABELS") or "[]"),
                                  "address_forms": json.loads(os.environ["WAWF_CHAT_SCOPE"])}
@@ -190,6 +198,23 @@ def _read_export_manifest(outdir):
 
 _EXPORT_ARTIFACTS = ("chats.json", "transcripts.txt", "identities.json", "msgstore.db", "wa.db",
                      "_manifest.json")
+_TEXT_ARTIFACTS = ("chats.json", "identities.json", "contacts.csv", "transcripts.txt")
+
+def _note_leftovers(outdir, wrote):
+    """Say so when `outdir` still holds text/JSON files of an earlier export that this run did not write
+    (`--out json:` leaves a transcripts.txt there, `--out txt:` a chats.json). They are not deleted -- an
+    earlier run may have decrypted text that cannot be decrypted again without its key -- but they are
+    not part of this export, which the receipt alone would not show anyone opening the folder."""
+    mine = set(wrote) | _written_here(outdir)              # another --out of this same run may share the folder
+    left = [f for f in _TEXT_ARTIFACTS if f not in mine and os.path.isfile(os.path.join(outdir, f))]
+    if left:
+        many = len(left) > 1
+        log.warning("%s also holds %s from an earlier export. This run did not write %s, so %s not part of "
+                    "this export (%s names what is)%s.", outdir, ", ".join(left), "them" if many else "it",
+                    "they are" if many else "it is", EXPORT_MANIFEST,
+                    (" -- and %s may hold chats other than the --chat ones" % ("they" if many else "it"))
+                    if _chat_scope() else "")
+    return left
 
 def _holds_export(path):
     """Does this folder already hold an export? The receipt if there is one, else its artifacts."""
@@ -935,6 +960,7 @@ def cmd_raw(a):
 
 
     os.makedirs(a.out, exist_ok=True)
+    earlier = {f for f in os.listdir(a.out) if f.endswith(".jsonl")}      # a dump already in this folder
     totals = {"stores": 0, "records": 0, "encrypted": 0, "decrypted": 0}
     skipped = collections.Counter()      # encrypted bodies we could NOT decrypt, by reason
     excluded = {}                        # whole stores deliberately not dumped, by database
@@ -1010,6 +1036,19 @@ def cmd_raw(a):
     if excluded:
         log.info("raw: excluded %d record(s) in %s -- key material, not evidence",
                  sum(excluded.values()), ", ".join(sorted(excluded)))
+    # Store files an earlier dump left here are not overwritten by this one, and _manifest.json does not
+    # name them. Not deleted (they may hold decryptions this run could not make), but said: a dump made
+    # with --raw-include-keys leaves the key material behind, while this run reports it excluded.
+    stale = sorted(earlier - {m["file"] for m in manifest if m.get("file")})
+    if stale:
+        keyfiles = [f for f in stale if f.startswith(tuple(re.sub(r"[^A-Za-z0-9._-]", "_", d + "__")
+                                                           for d in _RAW_SKIP_DBS))]
+        log.warning("raw: %s also holds %d store file(s) from an earlier dump that this one did not write, so they "
+                    "are not part of it (_manifest.json names what is): %s", os.path.abspath(a.out), len(stale),
+                    ", ".join(stale[:8]) + (" ..." if len(stale) > 8 else ""))
+        if keyfiles:
+            log.warning("raw: %d of them hold KEY MATERIAL (%s) from a dump made with --raw-include-keys: remove "
+                        "them before this folder travels with a case.", len(keyfiles), ", ".join(keyfiles[:4]))
     return 0
 
 
@@ -1146,6 +1185,7 @@ def cmd_decrypt(a):
                                {"messages": sum(len(v) for v in chats.values()), "chats": len(chats),
                                 "decrypted_from_cache": ok, "recovered_from_phone": hist_added},
                                ("chats.json", "identities.json", "contacts.csv"))
+        _note_leftovers(a.out, ("chats.json", "identities.json", "contacts.csv"))
         return 0
     WD.write_transcripts(f"{a.out}/transcripts.txt", chats, ids)
     # name what was actually written: with --out txt:PATH the JSON side is skipped, and a log line
@@ -1172,10 +1212,13 @@ def cmd_decrypt(a):
     if only != "txt":
         AUDIT.artifact(f"{a.out}/chats.json", kind="decrypted chats (JSON)", records=sum(len(v) for v in chats.values()))
     AUDIT.artifact(f"{a.out}/transcripts.txt", kind="decrypted transcripts (text)", records=sum(len(v) for v in chats.values()))
+    # the receipt names what THIS run wrote: with --out txt:PATH, a chats.json an earlier export left in
+    # the folder was listed as part of this one
+    wrote = ("transcripts.txt",) if only == "txt" else _TEXT_ARTIFACTS
     _write_export_manifest(a.out, "cache+phone" if hist_added else "cache",
                            {"messages": sum(len(v) for v in chats.values()), "chats": len(chats),
-                            "decrypted_from_cache": ok, "recovered_from_phone": hist_added},
-                           ("chats.json", "identities.json", "contacts.csv", "transcripts.txt"))
+                            "decrypted_from_cache": ok, "recovered_from_phone": hist_added}, wrote)
+    _note_leftovers(a.out, wrote)
     return 0
 
 def _wa_user_prefs(profile, origin):
@@ -2030,8 +2073,15 @@ def cmd_queue(a):
     for spec in (a.out or []):
         _, path = _parse_out(spec)
         base = path; break
-    base = base or _history_base()
-    work = os.path.join(base, "server-queue", time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    _folder = os.path.normpath(os.path.abspath(base)) if base else None
+    if _folder and os.path.basename(_folder) and _chat_scope():
+        # A --chat export holds the chosen chats only, and the queue cannot be asked for one chat: what the
+        # server delivers -- every chat, decrypted -- goes BESIDE the export folder. Inside it, the folder
+        # handed on as "these chats only" held every other conversation the queue carried.
+        work = os.path.join(_folder + "-server-queue", stamp)
+    else:
+        work = os.path.join(base or _history_base(), "server-queue", stamp)
     os.makedirs(work, exist_ok=True)
     log.info("server queue capture -> %s", work)
     log.info("[1/3] recovering the device credentials ...")
@@ -2045,8 +2095,10 @@ def cmd_queue(a):
     if _sub("export_signal_state.py", eng + ["--out", os.path.join(work, "signal_state.json")]): return 3
     if _chat_scope():
         log.warning("--chat: the server hands over the device's whole queue -- it cannot be asked for one "
-                    "chat -- so %s keeps everything it delivered, as received. The export is scoped: only "
-                    "the chosen chats' messages are merged into it.", work)
+                    "chat -- so %s keeps everything it delivered, as received%s. The export is scoped: only "
+                    "the chosen chats' messages are merged into it.", work,
+                    ", beside the export folder rather than in it"
+                    if _folder and work.startswith(_folder + "-server-queue") else "")
     log.info("[3/3] signing in as the device and recording the queue (nothing is acknowledged) ...")
     if getattr(sys, "frozen", False):
         qcmd = [sys.executable, "_runpy", "queue_capture.py"]
@@ -2337,9 +2389,15 @@ def cmd_history(a):
     # Exit 2 and 5 from either client mean it stopped BEFORE asking the phone anything: the login was
     # refused, the credentials have no account, the credentials and Signal state are of different
     # registrations, or no Signal session with the phone could be started. Read as an ordinary pass,
-    # that was reported as "no chat answered" and "only the phone's replies were missing".
-    ASKED_NOTHING_RC = (2, 5)
+    # that was reported as "no chat answered" and "only the phone's replies were missing". The Node
+    # client also stops before its first request with 4 (it never connected) and 6 (the account's
+    # device list no longer holds this device), and writes its empty pass file on the way out, so
+    # those passes read the same way. (The Python client's 4 is a dropped connection, handled below.)
+    ASKED_NOTHING_RC = (2, 4, 5, 6) if engine == "node" else (2, 5)
+    # Only a FIRST pass that asked nothing makes the run one that asked nothing: a later pass runs only
+    # after earlier ones were answered, so the run then ends with what they recovered.
     asked_nothing = False
+    dropped = False                                      # the Python client's connection was lost or never made
     ended_chats = chat_state["ended"]                    # chats the phone answered "start reached" for
     try:
         for p in range(1, MAX_PASSES + 1):
@@ -2365,10 +2423,11 @@ def cmd_history(a):
             try: passd = json.load(open(pass_out, encoding="utf-8"))
             except Exception:
                 if rc in ASKED_NOTHING_RC:
-                    asked_nothing = True
+                    asked_nothing = asked_nothing or p == 1
                     log.error("pass %d: the history client stopped before it asked the phone anything (exit %s; "
                               "the reason is printed above) — stopping.", p, rc)
                 else:
+                    dropped = dropped or (rc == 4 and engine != "node")
                     log.error("pass %d produced no output (history client exit=%s; connection failed / phone not "
                               "serving) — stopping.", p, rc)
                 break
@@ -2392,13 +2451,14 @@ def cmd_history(a):
                      (", %d enriched" % enriched) if enriched else "", len(master), len(by))
             if rc in ASKED_NOTHING_RC:
                 # what arrived before it stopped (late answers delivered with the backlog) is banked above
-                asked_nothing = True
+                asked_nothing = asked_nothing or p == 1
                 log.error("pass %d: the history client stopped before it asked the phone anything (exit %s; the "
                           "reason is printed above). %s messages are banked.", p, rc, f"{len(master):,}")
                 break
             if rc == 4 and engine != "node":
                 # the Python client saw the server close the connection: what arrived is banked above;
                 # reading the short pass as "converged" or "nothing answered" would be a wrong diagnosis
+                dropped = True
                 log.warning("pass %d ended because WhatsApp's server closed the connection (the reason, if "
                             "it gave one, is printed above). %s messages are banked; re-run to continue.",
                             p, f"{len(master):,}")
@@ -2495,6 +2555,17 @@ def cmd_history(a):
                     "is printed above), so this says nothing about the phone or about throttling.%s",
                     (" The %s message(s) recovered on earlier runs are in %s%s." %
                      (f"{len(master):,}", pass_out, " and in the export" if targets else "")) if master else "")
+        return 1
+    if dropped and not served_any:
+        # the connection was lost, or never made, before the phone served anything: neither "HISTORY
+        # DONE" (with messages from earlier runs) nor "the login succeeded -- only the phone's replies
+        # were missing" would be true
+        log.warning("NOTHING RECOVERED this run: the connection to WhatsApp's server was lost, or could not be "
+                    "made (the reason is printed above), before the phone served anything. That says nothing "
+                    "about the phone.%s Nothing was lost; run `wawf <PROFILE> --history` again on a stable "
+                    "network.", (" The %s message(s) recovered on earlier runs are in %s%s." %
+                                 (f"{len(master):,}", pass_out, " and in the export" if targets else ""))
+                    if master else "")
         return 1
     if master:
         log.info("HISTORY DONE: recovered %s messages older than the cache, across %d chats -> %s",
@@ -2782,8 +2853,9 @@ def main():
                         "status updates, receipts, call offers received while the browser was closed), "
                         "decrypted with the browser's own keys. NETWORKED; nothing is acknowledged, so the "
                         "server keeps the queue for the browser, and nothing a contact can see is sent. "
-                        "Written to <first --out>/server-queue/<time>/, and its messages are merged "
-                        "into the export, each row marked source=server-queue.")
+                        "Written to <first --out>/server-queue/<time>/ (with --chat beside it, in "
+                        "<first --out>-server-queue/<time>/, since it holds every chat), and its messages "
+                        "are merged into the export, each row marked source=server-queue.")
     g.add_argument("--install-node", action="store_true",
                    help="allow --history to INSTALL Node.js via winget if none is found. Not covered "
                         "by --yes, because it modifies this machine and asks for elevation; a "
@@ -2795,8 +2867,8 @@ def main():
     g.add_argument("--fetch-media", action="store_true",
                    help="with --out sqlite:PATH: download, decrypt and verify the media the browser never "
                         "cached from WhatsApp's CDN, newest first. NETWORKED and can be large; a url whose "
-                        "signature has expired is skipped. Without it the mediaKeys are still exported "
-                        "and scripts/mediafetch.py --cdn can fetch later.")
+                        "signature has expired is skipped. Without it the mediaKeys are still exported, "
+                        "and a later run with --fetch-media (or scripts/mediafetch.py --cdn) can fetch them.")
     g.add_argument("--yes", action="store_true",
                    help="auto-confirm prompts that only affect this tool's own folder (such as "
                         "`npm install` in tools/reconnect). It does NOT authorise installing Node.js "

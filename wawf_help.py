@@ -41,7 +41,9 @@ TIPS = {
                "minutes); a full sweep can take hours; recorded as account activity.\nCommand line: --history.",
     "queue": "While the browser is closed, WhatsApp's server holds for this device what the account receives "
              "(messages, group and status updates, receipts, call offers). This signs in as the device and "
-             "records it all, decrypted with the browser's own keys, into server-queue\\ in the results folder. "
+             "records it all, decrypted with the browser's own keys, into server-queue\\ in the results folder "
+             "(with 'Only these chats': beside the export, in a folder ending -server-queue\\, since it holds "
+             "every chat). "
              "Nothing is acknowledged, so the server keeps it for the browser; nothing a contact can see is "
              "sent. View-once media is never sent to linked devices: only a placeholder is recorded. "
              "Close WhatsApp Web in the browser first: one connection per device, the newer one wins.\n"

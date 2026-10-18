@@ -893,7 +893,7 @@ for h, body in cached.items():
 db.commit(); db.close()
 if byench and not decrypted:
     print(f"  [i] media: {len(byench)} media message(s) have keys but none of their blobs are "
-          f"in this browser's cache — run scripts/mediafetch.py --cdn to download them")
+          f"in this browser's cache — wawf --fetch-media (or scripts/mediafetch.py --cdn) can download them")
 elif decrypted:
     print(f"  [+] media: {decrypted} file(s) recovered from the browser's cache "
           f"({plain_hits} cached already decrypted, {decrypted - plain_hits} decrypted with their media key)")
@@ -934,7 +934,7 @@ if byench and decrypted < len(byench) and os.environ.get("WAWF_FETCH_MEDIA") == 
     print("  [i] the rest were never cached by the browser; they are downloaded from WhatsApp's servers next")
 elif byench and decrypted < len(byench):
     print("  [i] the rest were never cached by the browser (or the cache has since been evicted). Their "
-          "mediaKeys ARE in message_media — fetch them with:")
+          "mediaKeys ARE in message_media — fetch them by adding --fetch-media to the wawf run, or with:")
     print(f"      python3 scripts/mediafetch.py --db {mp} --profile <profile> --cdn")
     print("      NOTE each media url carries a SIGNATURE with its own expiry (the oe= parameter). While "
           "it is valid the CDN serves the object — about a month on a typical profile; once it lapses "

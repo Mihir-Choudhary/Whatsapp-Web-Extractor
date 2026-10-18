@@ -204,6 +204,74 @@ check("a Date becomes exact epoch ms, as Firefox's reader gives it",
       _W._jsonable(_d) == {"__date_ms": 1759337576102.0, "utc": "2025-10-01T16:52:56.102Z"})
 check("...not a Python repr", "__repr__" not in json.dumps(_W._jsonable({"t": [_d]})))
 
+print("an export written again into the same folder, in fewer formats")
+# --out txt:PATH writes transcripts.txt only. Into a folder that held a full export, its receipt listed the
+# chats.json, identities.json and contacts.csv left there as part of THIS export (fictional 555 data).
+import logging, types
+_stores = {"contact": [{"id": "15555550101@c.us", "name": "Test One"}], "group-metadata": [], "chat": []}
+_ls = {"last-wid-md": '"15555550199@c.us"'}
+_ids = WD.Identities(_stores, _ls)
+_msgs = [WD._norm_msg(o) for o in ({"id": "false_15555550101@c.us_A1", "t": 1_700_000_000, "type": "chat",
+                                    "from": "15555550101@c.us"},
+                                   {"id": "true_15555550101@c.us_A2", "t": 1_700_000_060, "type": "chat"})]
+_sv = {k: getattr(_W, k) for k in ("_load_wa", "_require_session", "_summary")}
+_W._load_wa = lambda a: (WD, "firefox", _ls, b"r" * 32, _msgs, {}, _ids)
+_W._require_session = lambda *a: None; _W._summary = lambda *a: None
+_said = []
+class _Keep(logging.Handler):
+    def emit(self, r): _said.append(r.getMessage())
+_h = _Keep(); logging.getLogger().addHandler(_h)
+_dir = tempfile.mkdtemp(prefix="wawf_selftest_")
+def _export(only, new_run=True):
+    _said.clear()
+    if new_run: _W._WRITTEN.clear()              # each call stands for a separate run of the tool
+    return _W.cmd_decrypt(types.SimpleNamespace(profile=None, origin="O", enc_static=None, out=_dir, only=only,
+                                                history_file=None))
+try:
+    _export(None)
+    check("a full export writes the four files", all(os.path.isfile(os.path.join(_dir, f)) for f in
+          ("chats.json", "identities.json", "contacts.csv", "transcripts.txt")))
+    _export("txt")
+    _rec = json.load(open(os.path.join(_dir, "wawf_export.json"), encoding="utf-8"))
+    check("a txt-only export's receipt names only what it wrote", _rec["artifacts"] == ["transcripts.txt"])
+    check("...and the run names the files the earlier export left beside it",
+          any("earlier export" in m and "chats.json" in m for m in _said))
+    _export("json")
+    _rec = json.load(open(os.path.join(_dir, "wawf_export.json"), encoding="utf-8"))
+    check("a json-only export's receipt names its three files, and the transcript left beside them is named",
+          _rec["artifacts"] == ["chats.json", "contacts.csv", "identities.json"]
+          and any("earlier export" in m and "transcripts.txt" in m for m in _said))
+    # one run, two formats into the same folder (--out txt:D --out json:D): nothing is "from an earlier
+    # export", and the receipt names what both wrote
+    for _f in os.listdir(_dir): os.remove(os.path.join(_dir, _f))
+    _export("txt"); _export("json", new_run=False)
+    _rec = json.load(open(os.path.join(_dir, "wawf_export.json"), encoding="utf-8"))
+    check("two formats of one run in one folder: the receipt names all four, nothing called a leftover",
+          _rec["artifacts"] == ["chats.json", "contacts.csv", "identities.json", "transcripts.txt"]
+          and not any("earlier export" in m for m in _said))
+finally:
+    for k, v in _sv.items(): setattr(_W, k, v)
+    shutil.rmtree(_dir, ignore_errors=True)
+# A raw dump made with --raw-include-keys, then one without into the same folder: the second reports the key
+# material excluded, and the first one's key-store files were still there, unmentioned.
+import chromium_reader as _cr
+_idb = {"model-storage": {"message": [{"id": "false_15555550101@c.us_A1", "t": 1_700_000_000}]},
+        "signal-storage": {"identity-store": [{"id": "x"}]}, "wawc_db_enc": {"keys": [{"id": 1}]}}
+_svr = (_cr.load_source, _W._is_chromium, _W._require_source)
+_cr.load_source = lambda *a, **k: {"idb": _idb, "localStorage": {}}
+_W._is_chromium = lambda p: True; _W._require_source = lambda a, cmd="": None
+_rdir = tempfile.mkdtemp(prefix="wawf_selftest_")
+try:
+    for _keys in (True, False):
+        _said.clear()
+        _W.cmd_raw(types.SimpleNamespace(profile="P", origin=None, enc_static=None, out=_rdir, raw_include_keys=_keys))
+    check("a raw dump into a folder holding an earlier dump's key stores says they are still there",
+          any("KEY MATERIAL" in m and "wawc_db_enc__keys.jsonl" in m for m in _said))
+finally:
+    _cr.load_source, _W._is_chromium, _W._require_source = _svr
+    logging.getLogger().removeHandler(_h)
+    shutil.rmtree(_rdir, ignore_errors=True)
+
 print()
 if FAIL:
     print(f"{len(FAIL)} CASE(S) FAILED")

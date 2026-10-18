@@ -261,40 +261,78 @@ def _sub(script, extra):
                    "ondisk_ids": []}, open(out, "w"))
     if script == "mediafetch.py": _st["fetched"] += 1
     return 0
-def _client(cmd, cwd=None, env=None, **k):       # the history client: an empty pass, then its exit code
-    json.dump({"messages": [], "answered_chats": [], "silent_chats": []},
+def _client(cmd, cwd=None, env=None, **k):       # the history client: one pass file, then its exit code
+    rc, msgs = _st["passes"].pop(0) if _st.get("passes") else (_st["rc"], [])
+    json.dump({"messages": msgs, "answered_chats": ["15555550111@s.whatsapp.net"] if msgs else [], "silent_chats": []},
               open(os.path.join(cwd, "history_recovered.json"), "w"))
-    return types.SimpleNamespace(returncode=_st["rc"])
+    return types.SimpleNamespace(returncode=rc)
 def _export(a, targets, history_file=None):      # writes an (empty) database where the export goes
     for fmt, p in targets:
         if fmt == "sqlite": os.makedirs(p, exist_ok=True); open(os.path.join(p, "msgstore.db"), "a").close()
     a._exported = True
     return 0
 _saved = {k: getattr(wawf, k) for k in ("_creds_ok", "_sub", "_history_export", "_require_source", "_is_chromium",
-                                         "subprocess", "_history_base")}
+                                         "subprocess", "_history_base", "_find_reconnect_dir", "_ensure_node",
+                                         "_ensure_baileys")}
 wawf._creds_ok, wawf._sub, wawf._history_export = _creds, _sub, _export
 wawf._require_source = lambda a, cmd="": None; wawf._is_chromium = lambda p: True
 wawf.subprocess = types.SimpleNamespace(run=_client)
-_said = []
+wawf._ensure_node = lambda *a: "node"; wawf._ensure_baileys = lambda *a: True
+_said, _homes = [], []
 class _Keep(logging.Handler):
     def emit(self, r): _said.append(r.getMessage())
 _h = _Keep(); logging.getLogger().addHandler(_h)
-def _history(rc):
-    home = tempfile.mkdtemp(); wawf._history_base = lambda: home
-    _st.update(rc=rc, fetched=0); _said.clear()
+def _history(rc, engine="python", passes=None, prior=0):
+    home = tempfile.mkdtemp(prefix="wawf_selftest_"); _homes.append(home)
+    if prior:                                    # what earlier runs of this device recovered
+        d = os.path.join(home, "devices", "15555550100-45"); os.makedirs(d)
+        json.dump({"messages": [{"id": "P%d" % i, "chat": "15555550111@s.whatsapp.net", "ts": 1_680_000_000 + i,
+                                 "fromMe": False, "text": "x", "type": "conversation"} for i in range(prior)]},
+                  open(os.path.join(d, "history_all.json"), "w"))
+    wawf._history_base = lambda: home; wawf._find_reconnect_dir = lambda: home
+    _st.update(rc=rc, fetched=0, passes=list(passes or [])); _said.clear()
     a = types.SimpleNamespace(profile="P", origin=None, out=["sqlite:" + os.path.join(home, "db")],
                               browser_running=False, history_refetch=False, yes=False, install_node=False,
                               fetch_media=True, verbose=False)
-    return wawf.cmd_history(a)
+    os.environ["WAWF_HISTORY_ENGINE"] = engine
+    try:
+        return wawf.cmd_history(a)
+    finally:
+        os.environ.pop("WAWF_HISTORY_ENGINE", None)
+_asked_nothing = lambda: any("NOTHING WAS ASKED" in m for m in _said)
+_blames_phone = lambda: any("phone's replies were missing" in m for m in _said)
 rc = _history(2)
 check("a client that stopped before asking: the run says so and fails, never blaming the phone",
-      (rc, any("NOTHING WAS ASKED" in m for m in _said), any("phone's replies were missing" in m for m in _said)),
-      (1, True, False))
+      (rc, _asked_nothing(), _blames_phone()), (1, True, False))
 check("...and --fetch-media still runs on the export it wrote", _st["fetched"], 1)
 rc = _history(0)
 check("a phone that answered nothing: --fetch-media runs on the export all the same", (rc, _st["fetched"]), (1, 1))
+# The Node client stops before its first request with 6 (the account's device list no longer holds this
+# device) and 4 (it never connected), writing its empty pass file on the way out.
+for _rc in (6, 4):
+    rc = _history(_rc, engine="node")
+    check("Node client exit %d (stopped before asking): said so, never blamed on the phone" % _rc,
+          (rc, _asked_nothing(), _blames_phone()), (1, True, False))
+# The Python client's 4 is a connection that was lost (or never made): not the phone's silence either,
+# and with messages from earlier runs, not "HISTORY DONE" with exit 0.
+rc = _history(4)
+check("Python client exit 4 with nothing served: the lost connection is named, the phone is not blamed",
+      (rc, any("connection to WhatsApp's server was lost" in m for m in _said), _blames_phone()), (1, True, False))
+rc = _history(4, prior=3)
+check("...and with messages from earlier runs it still fails, naming where those are",
+      (rc, any("connection to WhatsApp's server was lost" in m and "earlier runs" in m for m in _said),
+       any("this is NOT necessarily everything" in m for m in _said)), (1, True, False))
+# A pass after the first runs only once earlier passes were answered: one that stops before asking ends
+# the run with what they recovered -- it is not a run that "asked nothing".
+_page = [{"id": "H%d" % i, "chat": "15555550111@s.whatsapp.net", "ts": 1_690_000_000 + i, "fromMe": False,
+          "text": "x", "type": "conversation"} for i in range(60)]
+rc = _history(0, passes=[(0, _page), (2, [])])
+check("a later pass that stopped before asking: the run keeps what the first pass recovered",
+      (rc, _asked_nothing(), any("this is NOT necessarily everything" in m for m in _said)), (0, False, True))
 logging.getLogger().removeHandler(_h)
 for k, v in _saved.items(): setattr(wawf, k, v)
+import shutil
+for _d in _homes: shutil.rmtree(_d, ignore_errors=True)
 
 print()
 if fails:

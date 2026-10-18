@@ -19,11 +19,44 @@ def check(name, cond):
     print(("  ok   " if cond else "  FAIL ") + name)
     if not cond: FAIL.append(name)
 
+print("Stop ends the run and every helper it started (no display needed)")
+# A run starts helpers (export_sqlite, the history and queue clients). Ending the run alone left them going:
+# on Linux and macOS a history client went on asking the phone after Stop. Here a 'run' starts a 'helper'
+# that writes a heartbeat; the window's own start options and Stop end both.
+import subprocess, time, types
+_stubbed = False
+try:
+    import tkinter as _tkcheck                              # noqa: F401
+except ImportError:                                         # no Tk at all: the process handling needs none
+    _tk = types.ModuleType("tkinter"); _tk.Tk = object
+    for _n in ("ttk", "filedialog", "messagebox"):
+        _m = types.ModuleType("tkinter." + _n); setattr(_tk, _n, _m); sys.modules["tkinter." + _n] = _m
+    sys.modules["tkinter"] = _tk; _stubbed = True
+import wawf_gui as _G
+_t = tempfile.mkdtemp(prefix="wawf_guitest_"); _beat = os.path.join(_t, "beat")
+_helper = "import time,sys\nwhile True:\n    open(sys.argv[1],'w').write(str(time.time())); time.sleep(0.2)\n"
+_run = "import subprocess,sys\nsubprocess.run([sys.executable,'-c',%r,%r])\n" % (_helper, _beat)
+_p = subprocess.Popen([sys.executable, "-c", _run], **_G._run_popen_kwargs())
+for _ in range(50):
+    if os.path.exists(_beat): break
+    time.sleep(0.1)
+_G.App.stop(types.SimpleNamespace(proc=_p, status=types.SimpleNamespace(configure=lambda **k: None)))
+_p.wait(timeout=20); time.sleep(0.6)
+_m1 = os.path.getmtime(_beat); time.sleep(1.0); _m2 = os.path.getmtime(_beat)
+check("Stop ends the helper the run started, not only the run", _m2 == _m1)
+if _m2 != _m1 and sys.platform != "win32":
+    os.system("pkill -f %s" % _beat)                       # the helper it left running
+shutil.rmtree(_t, ignore_errors=True)
+if _stubbed:
+    for _n in [n for n in sys.modules if n == "tkinter" or n.startswith("tkinter.")] + ["wawf_gui"]:
+        sys.modules.pop(_n, None)
+
 try:
     import tkinter as tk
     import wawf_gui as G
     app = G.App(); app.withdraw()
 except Exception as e:                                     # no display / no Tk
+    if FAIL: print("FAILED: " + ", ".join(FAIL)); sys.exit(1)
     print(f"skipped: the window cannot be created here ({type(e).__name__}: {e})"); sys.exit(0)
 
 tmp = tempfile.mkdtemp(prefix="wawf_guitest_")

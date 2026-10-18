@@ -15,6 +15,28 @@ sys.path.insert(0, HERE)
 from wawf_help import TIPS, STEPS, GUIDE
 
 
+def _run_popen_kwargs():
+    """How a run is started: no console window on Windows; elsewhere in a process group of its own, so
+    Stop can reach the helpers it starts as well as the run itself."""
+    if sys.platform == "win32":
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+    return {"start_new_session": True}
+
+
+def _stop_tree(proc):
+    """End a run and every helper process it started. Ending the run alone left its helpers running --
+    on Linux and macOS a history or queue client went on signing in and asking the phone after Stop."""
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return
+    import signal
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)              # the run leads its own group (_run_popen_kwargs)
+    except (ProcessLookupError, PermissionError, OSError):
+        proc.terminate()
+
+
 # which tip explains which toggle (matched on the start of its label)
 _TOGGLE_TIPS = {"Profile folder": "profile_mode", "Separate folders": "stores_mode",
                 "Readable chats": "fmt_text", "SQLite database": "fmt_sqlite", "Raw store dump": "fmt_raw",
@@ -831,7 +853,7 @@ class App(tk.Tk):
                    TMP=self._run_tmp, TEMP=self._run_tmp, TMPDIR=self._run_tmp)
         try:
             self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                         env=env, cwd=cwd or None, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                                         env=env, cwd=cwd or None, **_run_popen_kwargs())
         except OSError as e:
             self._remove_run_tmp()
             messagebox.showerror("WhatsApp Web Extractor", f"Could not start: {e}"); return
@@ -901,11 +923,7 @@ class App(tk.Tk):
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
-            if sys.platform == "win32":                    # the run and every helper it started
-                subprocess.run(["taskkill", "/T", "/F", "/PID", str(self.proc.pid)], capture_output=True,
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            else:
-                self.proc.terminate()
+            _stop_tree(self.proc)                          # the run and every helper it started
             self.status.configure(text="Stopping…")
 
     def open_out(self):
