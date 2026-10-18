@@ -6,6 +6,13 @@ from the profile.
 
 > Authorized use only — your own account or a lawful investigation with permission.
 
+> **Risk to the account.** The default run (to capture the key), `--queue` and `--history` sign in to
+> WhatsApp as the account's linked device, using a client WhatsApp did not write; `--fetch-media`
+> downloads from WhatsApp's CDN. That is against WhatsApp's Terms of Service, and WhatsApp has banned
+> accounts for using unofficial clients. Each sign-in is recorded as activity on the account. If the
+> account must not be put at risk, use `--offline` with a key captured earlier (`--key`), or without one
+> to export everything except message text.
+
 ## Get it
 
 ### Windows — use the `.exe` (no Python needed)
@@ -153,7 +160,7 @@ every jid form they appear under, so any line can be traced back to an identifie
 
 A reply quotes the message it answers, and the quote is stored *inside* the reply. It is kept in its
 own field rather than folded into the reply's text, because otherwise the transcript attributes one
-person's words to another: on a 22,121-message store that affected 4,282 messages, and for 246 of
+person's words to another: in a typical store that affects thousands of messages, and for some of
 them — mostly sticker replies, which have no text of their own — the quoted message was the only
 thing shown. In the transcript the quote appears under the reply as `re:`; a message that spans
 lines is continued under `|`, so every line is attributable and no message content can sit where the
@@ -164,7 +171,7 @@ revoked message, a call log — shown as the type the store recorded: `(sticker)
 `(revoked)`. A call says how it went: `(video call: Completed, 48m03s)`, and its `chats.json` row
 carries `call` with `outcome`, `duration_s` and `video`. WhatsApp Web stores a call again as it
 progresses (`Ongoing`, then how it ended); the export keeps one row per call, from the settled version.
-Omitting them hid 2,374 records of a 22,084-message export from the readable artifact,
+Omitting them hid thousands of records of a typical export from the readable artifact,
 and with them the `re:` quote on a sticker reply, which is exactly the case the own/quoted split
 exists for. The chat header counts both: `N msgs, M with text`.
 
@@ -219,7 +226,7 @@ yourself that an export you were handed is internally consistent. It writes noth
 The other formats summarise. The text writer runs the decrypted payload through a heuristic string
 scraper, which keeps every message's text whole but drops field identity and every non-string field.
 
-`raw` writes one JSONL file per object store — typically **48 stores and ~70,000 records** — with each
+`raw` writes one JSONL file per object store — typically **several dozen stores and tens of thousands of records** — with each
 record exactly as the browser stored it: same field names, same ordering, JavaScript `undefined`
 preserved as a distinct marker (it is not the same as `null`), and a JavaScript `Date` as its exact
 milliseconds since 1970 UTC with the instant beside it. The decryption is **added beside** the
@@ -266,12 +273,13 @@ A Windows drive letter is never mistaken for a `FORMAT`, so `D:\case\out` works 
 | `--install-node` | Only with the optional Node engine (`WAWF_HISTORY_ENGINE=node`): allow `--history` to install Node.js via winget when none is found. **Not** covered by `--yes`: it modifies the machine and asks for elevation. A portable Node unzipped beside the tool, or `WAWF_NODE` pointing at one, needs neither. |
 | `--no-audit` | Do **not** write the chain-of-custody database. It is written by default (see below). |
 | `-v`, `--log-file FILE` | Full logs and tracebacks; mirror them to a file. |
+| `--version` | Print the version — the release, plus the git commit when run from a checkout — the same string the export receipts and the audit database record. |
 
 Sender resolution is **reported, not assumed** — a run prints where every label came from, so the one
 number that matters is visible:
 
 ```
-senders identified: address-book=14,250  pushname=7,325  phone=543  unresolved=0
+senders identified: address-book=8,120  pushname=3,410  phone=212  unresolved=0
 ```
 
 `unresolved` counts messages from jids the profile itself holds no name and no number for. On a
@@ -336,8 +344,7 @@ something to remember to switch on — the run that most needs the trail is the 
 thought to ask for it — so it is written unless you pass `--no-audit`. It costs one file: no network,
 no extra read of the evidence.
 
-The database records everything it did, written
-into the output directory (one DB per case — never a single global log):
+It is written into the output directory (one DB per case — never a single global log):
 
 ```bash
 wawf <PROFILE> --out out/                               # -> out/wawf_audit.db
@@ -390,7 +397,9 @@ account. Own account or authorised investigation only. The captured key is writt
 > `companion_enc_static.txt` decrypts the store, and `creds_in.json` holds the linked device's private
 > Noise key and identity — enough to log in *as* that device. They are left there so a later run can
 > reuse them (automatically, or with `--key` / `--creds`). Remove both before an export is copied,
-> shared or attached to a report; everything else in the folder is safe to hand over.
+> shared or attached to a report; everything else in the folder is safe to hand over. On Linux and
+> macOS these files, and the Signal state a `--queue` or `--history` run keeps, are created readable
+> by their owner only (mode 0600).
 
 **B. Decrypt offline with a key you already hold.** Useful when you must not contact the account at
 all, and it keeps working after the device has been revoked, because decryption is purely local:
@@ -421,7 +430,8 @@ process list.
 A wrong or stale key is **detected, not acted on**: every writer trial-decrypts reference ciphertext
 first and refuses rather than producing garbage. If the key was one the tool found by itself, it
 discards it and captures a fresh one; if you named it with `--key`, it reports the problem and stops
-rather than silently reaching for the network.
+(exit 3) rather than silently reaching for the network. With `--offline` as well, it says so and writes
+the export without message text instead, as it would with no key at all.
 
 ## Recording what the server is holding — `--queue`
 
@@ -476,7 +486,7 @@ logs back in and asks your phone, per chat, for messages **older** than what's o
 toward each chat's start:
 
 ```bash
-wawf <PROFILE> --history                             # pull only; results land in tools/reconnect
+wawf <PROFILE> --history                             # pull only; results land in the device's folder (below)
 wawf <PROFILE> --history --out D:\case\run2          # ...and export the local store WITH them merged
 wawf <PROFILE> --history --out sqlite:D:\case\run2 --fetch-media    # ...and try the CDN for their media
 ```
@@ -501,7 +511,7 @@ one, so if the `--out` path already holds an export the new one is written besid
 what it found and where this one went:
 
 ```
-D:\case\run1 already holds a cache export (2026-10-04 13:20, 22,084 messages). This run
+D:\case\run1 already holds a cache export (2026-01-15 09:30, 12,345 messages). This run
 produces the local store PLUS what the phone returns, which is a different dataset, so it is
 written to D:\case\run1-history and the existing one is left untouched.
 ```
@@ -542,8 +552,8 @@ wawf <PROFILE> --history --history-refetch --out D:\case\run3
 ```
 
 That re-requests history you already have instead of going deeper, and asks **only the chats that
-are missing something** — on this project's own ledger that was 20 group chats out of 249, a 92%
-smaller request budget, which matters because the phone has to answer and WhatsApp rate-limits it.
+are missing something** — for example 15 group chats out of 200, a request budget over 90%
+smaller, which matters because the phone has to answer and WhatsApp rate-limits it.
 It finds nothing new by design.
 
 Where the profile cannot name a recovered sender at all, the name they chose for themselves is used
@@ -573,9 +583,11 @@ Ratchet sessions** (including superseded ones, kept closed, so older messages st
 before it can be recognised as a history reply — indistinguishable from "the phone never answered".
 
 A ratchet is live state, though, not a file: the copy in the profile is a snapshot that the phone has
-already moved past. So `wawf` renegotiates the session with your own device from a freshly fetched
-prekey bundle, asks any sender it cannot read to re-encrypt (a retry receipt carrying our keys), and
-**persists everything it learns** in `signal_runtime.py.json` (`signal_runtime.json` for the Node engine) in
+already moved past. When the phone cannot decrypt a request sent on that snapshot it says so (a retry
+receipt), and `wawf` starts a new session from the phone's keys and sends the request again on it. The
+optional Node engine also asks any sender it cannot read to re-encrypt (a retry receipt carrying our
+keys); the default Python engine, the one in the `.exe`, does not, so a message it cannot decrypt stays
+unread. Either engine **persists everything it learns** in `signal_runtime.py.json` (`signal_runtime.json` for the Node engine) in
 the device's folder, so the next run continues
 from the live ratchet instead of the stale snapshot. That file is key material — protect it like the
 credentials. Your browser's own stored session for this linked device goes stale as a result; WhatsApp
@@ -614,8 +626,10 @@ offline queue the client had not finished pulling (below), with the phone's answ
    that was the whole reason history appeared to stop working.)
 2. **Ask, chat by chat**, skipping chats the phone has said are finished and asking chats that have
    stayed silent last (`history_chat_state.json` in the device's folder remembers both across runs).
-3. **Each answer** is downloaded, decrypted, kept in `history_chunks/`, then released from the CDN
-   the way WhatsApp Web releases it. The log records when the phone produced it.
+3. **Each answer** is downloaded, decrypted and kept in `history_chunks/`. The default client leaves
+   the server's copy where it is; with `HIST_CHUNK_DELETE=1` (and by default in the Node engine) it is
+   then deleted from the server, the way WhatsApp Web releases it. The log records when the phone
+   produced it.
 4. **Before disconnecting**, if a request went unanswered the client waits for late answers.
    Answers that arrive on a later connection are still banked.
 
@@ -698,10 +712,11 @@ python3 wawf.py ~/.config/google-chrome/Default --key companion_enc_static.txt \
 
 Every writer validates the key against on-disk ciphertext and refuses to write garbage if it is wrong.
 Exit codes: `0` ok · `1` error (with `--history`: nothing recovered, or nothing could be asked) · `2` bad
-usage or a refused combination (also a `--chat` that names no chat or several) · `3` wrong key, or
-nothing for `--history` / `--queue` to work from (no usable device credentials; with `--chat`, no message
-to anchor a request on) · `4` file not found · `6` the server ended a `--queue` capture early · `130`
-interrupted.
+usage or a refused combination (also a profile, `--origin` or store folder that does not exist, and a
+`--chat` that names no chat or several) · `3` wrong key or an unusable `--key` file (missing, empty, not a
+key), or nothing for `--history` / `--queue` to work from (no usable device credentials; with `--chat`, no
+message to anchor a request on) · `4` a file the run needs was not found (a `--creds` file, or one that
+vanished mid-run) · `6` the server ended a `--queue` capture early · `130` interrupted.
 
 **Media.** Message media is recovered from the browser's own cache (Chromium simple-cache and
 blockfile, Firefox CacheStorage and `cache2` — all four layouts verified byte-identical) and verified
@@ -710,3 +725,17 @@ on disk: those `mediaKey`s *are* exported in `message_media`, and `scripts/media
 try the CDN. Note that a CDN url carries its own expiry — once it lapses every request is `403`, and
 WhatsApp purges the object itself well before that, after which it returns `410` and the bytes are
 gone server-side.
+
+## Known issues
+
+- **Messages the `.exe` cannot decrypt stay unread.** During `--history` the default Python engine (the
+  one in the `.exe` and the Linux binary) never asks a sender to re-encrypt a message it cannot
+  decrypt. Each such message is kept as received in `received_journal.jsonl` and counted at the end of
+  the pass, but its text is not recovered. The Node engine (`WAWF_HISTORY_ENGINE=node`) does ask, so
+  the sender can send it again. In the other direction it is the opposite: when the *phone* cannot
+  decrypt a history request, the Python engine sends it again on a new Signal session, while the Node
+  engine starts the new session but does not send the request again.
+- **The phone's signed prekey signature is not checked.** When the Python engine starts a new Signal
+  session with the phone (after the phone asks for a request again), it uses the signed prekey from
+  the phone's key bundle without verifying that key's signature. The bundle comes from WhatsApp's
+  server over the authenticated connection; libsignal (the Node engine) does verify it.

@@ -14,16 +14,23 @@ signal_core (the Signal protocol) and wa_proto (protobufs). Networked: it signs 
 whose credentials it is given, so the account sees activity. Own account / authorised use only.
 """
 from __future__ import annotations
-import base64, json, os, queue, secrets, threading, time
+import base64, json, os, queue, re, secrets, threading, time
 
 import wa_reconnect as WR
 import wa_binary as WB
 import signal_core as SC
 import signal_group as SG
 import wa_proto as WP
+from idbutil import open_private
 
 N = WB.node
 S_WA = "s.whatsapp.net"
+RETRY_MAX = 5           # resends of one message, as WhatsApp's own clients cap them
+SENT_KEEP = 256         # sent messages kept for answering retry receipts
+# Each message part that does not decrypt is kept, with its error and ciphertext, in the journal. Only the
+# first few are also printed: an offline backlog this device's state cannot read (redelivered on every
+# connection, since nothing is acknowledged) printed ~500 lines a pass and buried everything else.
+DECRYPT_FAIL_PRINT = 3
 
 
 def _addr(jid):
@@ -116,7 +123,7 @@ class SignalState(SC.MemoryStore):
                             for k, v in self.pre_keys.items()},
                    savedUtc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f: json.dump(out, f)
+        with open_private(tmp) as f: json.dump(out, f)           # key material: owner-only, kept by the rename
         for i in range(10):                         # Windows: a scanner or sync client may hold the file briefly
             try: os.replace(tmp, self.path); break
             except PermissionError:
@@ -153,10 +160,17 @@ class Client:
         self.me_lid = (creds.get("lid") or "").split(":")[0].split("@")[0]
         self.me_pn = str(creds.get("user") or "").split(":")[0].split("@")[0]
         self.stats = {"in": 0, "acked": 0, "not_acked": 0, "journalled": 0, "decrypted": 0,
-                      "decrypt_failed": 0, "sent": 0}
+                      "decrypt_failed": 0, "sent": 0, "retry_receipts": 0, "resent": 0, "resend_failed": 0}
+        # what send_peer sent, by message id, so a retry receipt for it can be answered (see _answer_retry)
+        self._sent = {}
+        self._retry_lock = threading.Lock()
+        self.retry_asked = {}                   # message id -> the device's latest retry count for it
+        self.retried = {}                       # message id -> time it was last sent again
+        self.run_async = lambda f, *args: threading.Thread(target=f, args=args, daemon=True).start()
         # what arrived, counted -- never content: stanza tags, and for messages who sent them and what type
         import collections
         self.tally = collections.Counter()
+        self.decrypt_errors = collections.Counter()      # error -> how many message parts failed with it
 
     # ---------------------------------------------------------------- connection
     def connect(self, timeout=30):
@@ -227,7 +241,9 @@ class Client:
             try:
                 n = self._read_frame(timeout=5)
             except Exception as e:
-                self.log("connection closed: %s" % e); self.closed.set(); return
+                # after close() this is our own doing ("Connection to remote host was lost"), not news
+                if not self.closed.is_set(): self.log("connection closed: %s" % e)
+                self.closed.set(); return
             if n is not None:
                 try: self._handle(n)
                 except Exception as e: self.log("handler error on <%s>: %s" % (n.get("tag"), e))
@@ -303,7 +319,11 @@ class Client:
             return
         if tag in ("receipt", "notification"):
             self.journal(n)
-            self.events.put(n); self.settle(n); return
+            self.events.put(n); self.settle(n)
+            if tag == "receipt" and a.get("type") == "retry" and a.get("id") in self._sent:
+                # off the reader thread: answering it may fetch a prekey bundle, whose reply this thread delivers
+                self.run_async(self._answer_retry, n)
+            return
         # everything else the server pushes (call offers, presence, chat state, <ib> markers, errors) is kept too
         self.journal(n)
         if tag in ("stream:error", "failure", "xmlstreamend"):
@@ -362,7 +382,13 @@ class Client:
                 self.stats["decrypt_failed"] += 1
                 self.tally["undecryptable:%s:%s" % (self.sender_kind(sender), et)] += 1
                 parts.append({"enc": et, "error": str(e), "ciphertext_b64": base64.b64encode(body).decode()})
-                self.log("could not decrypt %s from %s: %s" % (et, sender, e))
+                # counted by kind: who and which counter are in the journal, not in the summary
+                self.decrypt_errors[re.sub(r"\d+", "N", re.sub(r"\S*(@|::)\S*", "<id>", str(e)))[:120]
+                                    or type(e).__name__] += 1
+                if self.stats["decrypt_failed"] <= DECRYPT_FAIL_PRINT:
+                    self.log("could not decrypt %s from %s: %s%s" % (
+                        et, sender, e, "" if self.stats["decrypt_failed"] < DECRYPT_FAIL_PRINT else
+                        " (further failures are counted, not printed; each is kept in the journal)"))
                 self.events.put({"tag": "decrypt-failed", "attrs": dict(a, enc_type=et, error=str(e))})
         self.signal.save()
         return ok, parts
@@ -388,6 +414,12 @@ class Client:
                 except Exception:
                     continue
             raise first
+
+    def decrypt_failure_summary(self):
+        """'N message part(s) could not be decrypted (error x n, ...)', or '' when every part decrypted."""
+        if not self.stats["decrypt_failed"]: return ""
+        return "%d message part(s) could not be decrypted (%s)" % (self.stats["decrypt_failed"], ", ".join(
+            "%s x%d" % kv for kv in self.decrypt_errors.most_common(4)) + (", ..." if len(self.decrypt_errors) > 4 else ""))
 
     def sender_kind(self, jid):
         """own-phone / own-other-device / contact / group-member: who a message came from, for the tally."""
@@ -437,14 +469,76 @@ class Client:
 
     def send_peer(self, jid, message_bytes, attrs=None):
         """Encrypt a Message to one device of our own account and send it as a peer message. -> message id"""
+        mid = self.message_id()
+        attrs = dict({"to": jid, "id": mid, "type": "text"}, **(attrs or {}))
+        self._sent[mid] = {"message": message_bytes, "attrs": attrs, "resent": 0}
+        while len(self._sent) > SENT_KEEP:
+            self._sent.pop(next(iter(self._sent)))
+        self._send_enc(jid, message_bytes, attrs)
+        self.stats["sent"] += 1
+        return mid
+
+    def _send_enc(self, jid, message_bytes, attrs, enc_attrs=None):
         with self._crypto_lock:
             cipher = SC.SessionCipher(self.signal, _addr(jid))
             enc = cipher.encrypt(_pad(message_bytes))
             self.signal.save()
-        content = [N("enc", {"v": "2", "type": enc["type"]}, enc["body"])]
+        content = [N("enc", dict({"v": "2", "type": enc["type"]}, **(enc_attrs or {})), enc["body"])]
         if enc["type"] == "pkmsg":
             content.append(N("device-identity", {}, device_identity(self.creds["account"])))
-        mid = self.message_id()
-        self.send(N("message", dict({"to": jid, "id": mid, "type": "text"}, **(attrs or {})), content))
-        self.stats["sent"] += 1
-        return mid
+        self.send(N("message", attrs, content))
+
+    @staticmethod
+    def bundle_from_retry(n):
+        """The prekey bundle a retry receipt carries in <keys> (with the sender's <registration>), or None."""
+        kids = {c["tag"]: c for c in (n.get("content") or []) if isinstance(c, dict)}
+        keys = kids.get("keys")
+        if keys is None: return None
+        k = {c["tag"]: c for c in (keys.get("content") or []) if isinstance(c, dict)}
+        sub = lambda nd, tag: bytes(next(c for c in nd["content"] if isinstance(c, dict) and c["tag"] == tag)["content"])
+        num = lambda b: int.from_bytes(b, "big")
+        bundle = {"identityKey": _pub33(bytes(k["identity"]["content"])),
+                  "registrationId": num(bytes(kids["registration"]["content"])),
+                  "signedPreKey": {"keyId": num(sub(k["skey"], "id")), "publicKey": _pub33(sub(k["skey"], "value")),
+                                   "signature": sub(k["skey"], "signature")}}
+        if "key" in k:
+            bundle["preKey"] = {"keyId": num(sub(k["key"], "id")), "publicKey": _pub33(sub(k["key"], "value"))}
+        return bundle
+
+    def _answer_retry(self, n):
+        """One of our devices could not decrypt a message we sent it and asks for it again (a retry receipt).
+        The session we sent on is one that device no longer holds -- typically the browser profile's
+        snapshot of a ratchet that has moved on -- so sending again on it fails the same way. As WhatsApp
+        Web and Baileys do: start a new session from the keys the receipt carries, or else from the
+        device's prekey bundle on the server, and send the same message again, same id, as a prekey
+        message on it. Later messages go out on the new session too."""
+        a = n["attrs"]; mid = a.get("id")
+        jid = a.get("participant") or a.get("from")
+        retry = next((c for c in (n.get("content") or []) if isinstance(c, dict) and c["tag"] == "retry"), None)
+        count = int(((retry or {}).get("attrs") or {}).get("count") or 1)
+        with self._retry_lock:
+            sent = self._sent.get(mid)
+            self.stats["retry_receipts"] += 1
+            if sent is None: return
+            if self.sender_kind(jid) == "contact":
+                self.log("retry receipt for %s from a device not of this account: not answered" % mid); return
+            self.retry_asked[mid] = count
+            if count > RETRY_MAX or sent["resent"] >= RETRY_MAX:
+                self.log("retry receipt #%d for %s: sent %d times already, not again" % (count, mid, sent["resent"]))
+                return
+            try:
+                bundle = self.bundle_from_retry(n)
+                how = "the keys in the receipt"
+                if bundle is None:
+                    bundle = self.fetch_prekey_bundle(jid); how = "its prekey bundle"
+                with self._crypto_lock:
+                    SC.SessionBuilder(self.signal, _addr(jid)).init_outgoing(bundle)
+                    self.signal.save()
+                attrs = dict(sent["attrs"], to=jid, device_fanout="false")
+                self._send_enc(jid, sent["message"], attrs, {"count": str(count)})
+            except Exception as e:
+                self.stats["resend_failed"] += 1
+                self.log("could not send %s again after the device's retry receipt: %s" % (mid, e)); return
+            sent["resent"] += 1; self.stats["resent"] += 1; self.retried[mid] = time.time()
+            self.log("the device could not decrypt %s (retry #%d): new Signal session from %s, sent again"
+                     % (mid, count, how))

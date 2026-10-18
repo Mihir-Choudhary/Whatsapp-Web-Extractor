@@ -263,8 +263,8 @@ def _sub(script, extra):
     return 0
 def _client(cmd, cwd=None, env=None, **k):       # the history client: one pass file, then its exit code
     rc, msgs = _st["passes"].pop(0) if _st.get("passes") else (_st["rc"], [])
-    json.dump({"messages": msgs, "answered_chats": ["15555550111@s.whatsapp.net"] if msgs else [], "silent_chats": []},
-              open(os.path.join(cwd, "history_recovered.json"), "w"))
+    json.dump(dict({"messages": msgs, "answered_chats": ["15555550111@s.whatsapp.net"] if msgs else [], "silent_chats": []},
+                   **_st.get("pass_extra", {})), open(os.path.join(cwd, "history_recovered.json"), "w"))
     return types.SimpleNamespace(returncode=rc)
 def _export(a, targets, history_file=None):      # writes an (empty) database where the export goes
     for fmt, p in targets:
@@ -282,15 +282,21 @@ _said, _homes = [], []
 class _Keep(logging.Handler):
     def emit(self, r): _said.append(r.getMessage())
 _h = _Keep(); logging.getLogger().addHandler(_h)
-def _history(rc, engine="python", passes=None, prior=0):
+def _history(rc, engine="python", passes=None, prior=0, pass_extra=None, stopped=0):
     home = tempfile.mkdtemp(prefix="wawf_selftest_"); _homes.append(home)
+    d = os.path.join(home, "devices", "15555550100-45")
+    if stopped:                                  # the pass file of a run stopped mid-pass: banked nowhere else
+        os.makedirs(d, exist_ok=True)
+        json.dump({"messages": [{"id": "S%d" % i, "chat": "15555550111@s.whatsapp.net", "ts": 1_670_000_000 + i,
+                                 "fromMe": False, "text": "x", "type": "conversation"} for i in range(stopped)]},
+                  open(os.path.join(d, "history_recovered.json"), "w"))
     if prior:                                    # what earlier runs of this device recovered
-        d = os.path.join(home, "devices", "15555550100-45"); os.makedirs(d)
+        os.makedirs(d, exist_ok=True)
         json.dump({"messages": [{"id": "P%d" % i, "chat": "15555550111@s.whatsapp.net", "ts": 1_680_000_000 + i,
                                  "fromMe": False, "text": "x", "type": "conversation"} for i in range(prior)]},
                   open(os.path.join(d, "history_all.json"), "w"))
     wawf._history_base = lambda: home; wawf._find_reconnect_dir = lambda: home
-    _st.update(rc=rc, fetched=0, passes=list(passes or [])); _said.clear()
+    _st.update(rc=rc, fetched=0, passes=list(passes or []), pass_extra=pass_extra or {}); _said.clear()
     a = types.SimpleNamespace(profile="P", origin=None, out=["sqlite:" + os.path.join(home, "db")],
                               browser_running=False, history_refetch=False, yes=False, install_node=False,
                               fetch_media=True, verbose=False)
@@ -329,6 +335,37 @@ _page = [{"id": "H%d" % i, "chat": "15555550111@s.whatsapp.net", "ts": 1_690_000
 rc = _history(0, passes=[(0, _page), (2, [])])
 check("a later pass that stopped before asking: the run keeps what the first pass recovered",
       (rc, _asked_nothing(), any("this is NOT necessarily everything" in m for m in _said)), (0, False, True))
+# The phone could not decrypt the requests and sent a retry receipt for each (the .exe, 2026-10-18): it was
+# reached, and its answer was "I cannot read this" -- not silence. The run said "only the phone's replies
+# were missing".
+rc = _history(0, pass_extra={"requests_asked_again": 4, "requests_unreadable": 4})
+check("requests the phone could not decrypt, still unanswered after the resend: said so, the phone not blamed",
+      (rc, any("could not decrypt 4 of this run's requests" in m and "Each was sent again" in m for m in _said),
+       _blames_phone()), (1, True, False))
+rc = _history(0, pass_extra={"requests_asked_again": 4, "requests_unreadable": 4, "requests_not_resent": 4})
+check("...and when none could be sent again, it does not claim they were",
+      (rc, any("None of them could be sent again" in m and "sent again on a new" not in m for m in _said)), (1, True))
+rc = _history(0, pass_extra={"requests_asked_again": 4, "requests_unreadable": 4, "requests_not_resent": 1})
+check("...and a mix is counted as one", any("3 were sent again" in m and "1 could not be sent again" in m for m in _said), True)
+rc = _history(0, pass_extra={"requests_asked_again": 4, "requests_unreadable": 0}, passes=[(0, _page), (0, [])])
+check("...and when the resends were answered, the run is an ordinary one",
+      (rc, any("could not decrypt" in m for m in _said)), (0, False))
+# Stop (the window, a closed terminal) ends a run mid-pass: that pass's pages are only in its pass file,
+# which the next run's first pass deleted before anything read it.
+rc = _history(0, prior=2, stopped=3)
+_led = json.load(open(os.path.join(_homes[-1], "devices", "15555550100-45", "history_all.json"), encoding="utf-8"))
+check("messages a stopped run recovered are kept by the next run, with the earlier runs' ones",
+      sorted(m["id"] for m in _led["messages"]), ["P0", "P1", "S0", "S1", "S2"])
+check("the MODE warning no longer says a stale session cannot be repaired",
+      any(m.startswith("MODE:") for m in _said) and not any("nothing on disk can repair" in m for m in _said), True)
+# The 25-pass cap ended a live run (TOP=1 MAXPAGES=1) with only "HISTORY DONE", which reads as a normal finish.
+_full = [(0, [dict(m, id="C%d_%d" % (p, i), ts=1_660_000_000 + p * 100 + i) for i, m in enumerate(_page)])
+         for p in range(25)]
+rc = _history(0, passes=_full)
+check("a run stopped by the pass limit while passes still added messages says so",
+      (rc, any("25-pass limit" in m for m in _said)), (0, True))
+rc = _history(0, passes=[(0, _page), (0, [])])
+check("...and a run that converged does not", any("pass limit" in m for m in _said), False)
 logging.getLogger().removeHandler(_h)
 for k, v in _saved.items(): setattr(wawf, k, v)
 import shutil

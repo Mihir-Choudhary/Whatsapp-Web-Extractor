@@ -42,7 +42,7 @@ from __future__ import annotations
 import argparse, base64, glob, json, os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from idbutil import store_id, connect_ro, as_bytes as ab
+from idbutil import store_id, connect_ro, open_private, as_bytes as ab
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -154,7 +154,7 @@ def main():
         raise SystemExit("no app-state sync key could be decrypted — is --enc-static the right key "
                          "for THIS profile?")
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-    with open(a.out, "w", encoding="utf-8") as f:
+    with open_private(a.out) as f:
         json.dump(out, f)
     print(f"[+] app-state sync keys: {len(out)} recovered"
           + (f" ({bad} unusable)" if bad else "") + f" -> {a.out}")

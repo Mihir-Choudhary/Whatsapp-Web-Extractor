@@ -214,6 +214,21 @@ _ids = WD.Identities(_stores, _ls)
 _msgs = [WD._norm_msg(o) for o in ({"id": "false_15555550101@c.us_A1", "t": 1_700_000_000, "type": "chat",
                                     "from": "15555550101@c.us"},
                                    {"id": "true_15555550101@c.us_A2", "t": 1_700_000_060, "type": "chat"})]
+# The terminal summary counted media by a fixed list of types (2,576) and msgstore.db's by the media key
+# (2,660 +58 link previews) on the same store. Both now count a message carrying a key or path.
+_mm = [WD._norm_msg(o) for o in ({"id": "false_15555550101@c.us_M1", "t": 1_700_000_000, "type": "image", "mediaKey": "a2V5"},
+                                 {"id": "false_15555550101@c.us_M2", "t": 1_700_000_001, "type": "ptv", "directPath": "/v/x"},
+                                 {"id": "false_15555550101@c.us_M3", "t": 1_700_000_002, "type": "chat", "mediaKey": "a2V5"},
+                                 {"id": "false_15555550101@c.us_M4", "t": 1_700_000_003, "type": "image"})]
+_sl = []
+class _KeepS(logging.Handler):
+    def emit(self, r): _sl.append(r.getMessage())
+_hs = _KeepS(); logging.getLogger().addHandler(_hs)
+_lv = _W.log.level; _W.log.setLevel(logging.INFO)
+try: _W._summary("firefox", _ls, _mm, {})
+finally: logging.getLogger().removeHandler(_hs); _W.log.setLevel(_lv)
+check("the summary counts media by its key, as msgstore.db does, link previews apart",
+      [m for m in _sl if "media msgs" in m] == ["  media msgs  : 2 with a media key (+1 link-preview images)"])
 _sv = {k: getattr(_W, k) for k in ("_load_wa", "_require_session", "_summary")}
 _W._load_wa = lambda a: (WD, "firefox", _ls, b"r" * 32, _msgs, {}, _ids)
 _W._require_session = lambda *a: None; _W._summary = lambda *a: None
@@ -267,6 +282,29 @@ try:
         _W.cmd_raw(types.SimpleNamespace(profile="P", origin=None, enc_static=None, out=_rdir, raw_include_keys=_keys))
     check("a raw dump into a folder holding an earlier dump's key stores says they are still there",
           any("KEY MATERIAL" in m and "wawc_db_enc__keys.jsonl" in m for m in _said))
+    # A wrong --key with --offline: the raw dump said "no key available" for every body, as though no key
+    # had been given. And with --key the device's private key was still written to creds_in.json, which
+    # only a network login uses -- and --key never signs in.
+    _idb["model-storage"]["message"][0]["msgRowOpaqueData"] = {"_data": bytes(16), "iv": bytes(16), "_scheme": 1}
+    _idb["wawc_db_enc"]["keys"] = [{"id": 1, "key": types.SimpleNamespace(key_data=b"r" * 32)}]
+    _cr.load_source = lambda *a, **k: {"idb": _idb, "localStorage": {"WAWebEncKeySalt": json.dumps(base64.b64encode(b"s" * 16).decode())}}
+    _kf = os.path.join(_rdir, "other_device_key.txt")
+    open(_kf, "w").write(base64.b64encode(b"k" * 32).decode())
+    _odir = os.path.join(_rdir, "out"); _crd = []
+    _svc = _W.cmd_creds; _W.cmd_creds = lambda a: _crd.append(a.out) or 0
+    try:
+        _rc = _W._run_with_keys(types.SimpleNamespace(profile="P", origin=None, out=["raw:" + _odir], key=_kf, keys=None,
+                                                      offline=True, creds=None, verbose=False, raw_include_keys=False))
+        _rc2 = _W._run_with_keys(types.SimpleNamespace(profile="P", origin=None, out=["raw:" + _odir + "2"], key=_kf,
+                                                       keys=None, offline=False, creds=None, verbose=False,
+                                                       raw_include_keys=False))
+    finally:
+        _W.cmd_creds = _svc
+    _row = json.loads(open(os.path.join(_odir, "model-storage__message.jsonl"), encoding="utf-8").readline())
+    check("a wrong --key with --offline: the raw dump says the given key did not match (rc %s)" % _rc,
+          _rc == 0 and "--key does not open this session" in _row.get("_wawf_plaintext_error", ""))
+    check("...and with --key, online or not, no device credentials are recovered or written (rc %s)" % _rc2,
+          _rc2 == 3 and _crd == [] and not os.path.exists(os.path.join(_W._out_workdir(_odir), "creds_in.json")))
 finally:
     _cr.load_source, _W._is_chromium, _W._require_source = _svr
     logging.getLogger().removeHandler(_h)

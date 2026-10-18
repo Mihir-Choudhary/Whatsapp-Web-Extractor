@@ -98,10 +98,13 @@ def _newer_than_tables(c):
 _BIDI = {0x200E, 0x200F, 0x061C, 0x2066, 0x2067, 0x2068, 0x2069,
          0x202A, 0x202B, 0x202C, 0x202D, 0x202E}
 def _printable_line(t):
-    """Text safe to write into a line-structured artifact: no bidi reordering, no stray controls."""
+    """Text safe to write into a line-structured artifact: no bidi reordering, no stray controls.
+    A code point this interpreter calls unassigned is kept, as _textlike keeps it: the release builds
+    run Python 3.12, and the same U+1FAE9 that chats.json carried was dropped from transcripts.txt only."""
     return "".join(c for c in str(t or "")
                    if ord(c) not in _BIDI and (c in "\n\t" or unicodedata.category(c)[0] != "C"
-                                               or ord(c) in _JOINERS or 0xE0020 <= ord(c) <= 0xE007F))
+                                               or ord(c) in _JOINERS or 0xE0020 <= ord(c) <= 0xE007F
+                                               or _newer_than_tables(c)))
 
 def leaves(buf, depth=0, out=None):
     if out is None: out = []
@@ -152,6 +155,8 @@ def _norm_msg(o):
             "iv": iv, "data": data, "scheme": op.get("_scheme") if op else None,
             "filename": as_str(o.get("filename")),
             "view_once": bool(o.get("isViewOnce")),
+            # the rule msgstore.db's message_media uses, so both summaries count the same messages
+            "has_media": bool(o.get("mediaKey") or o.get("directPath")),
             "ack": o.get("ack") if isinstance(o.get("ack"), int) else None,
             "call": _call_details(o), "receipt_only": receipt_only(o)}
 
@@ -755,8 +760,12 @@ def hist_row(r, ids, when, chat_key=None):
         name, src = ids.label(sender), src
     else:
         name, src = "(unknown)", "unresolved"
+    typ = r.get("type")
+    # The Python client typed a system event (no payload) "unknown" until 2026-10-18; a payload it could
+    # not read is "unknown" too, but always carries `undecoded`. Rows banked before then are read right.
+    if typ == "unknown" and "undecoded" not in r: typ = "?"
     return {"id": ("true" if fromme else "false") + "_" + str(chat) + "_" + str(r.get("id")),
-            "t": when, "dir": "me" if me else "them", "type": hist_type(r.get("type")),
+            "t": when, "dir": "me" if me else "them", "type": hist_type(typ),
             "chat": chat, "chat_name": ids.label(chat),
             "sender": sender, "sender_name": name,
             "sender_lid": e.get("lid"), "sender_phone": e.get("pn"),

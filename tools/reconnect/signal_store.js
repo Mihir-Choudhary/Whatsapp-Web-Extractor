@@ -165,7 +165,7 @@ function open({ signalState, creds, statePath, bufferJSON, appStateKeys }) {
         rotated = true;
         try { if (fs.existsSync(statePath)) fs.copyFileSync(statePath, bakPath); } catch (e) {}
       }
-      fs.writeFileSync(tmp, body);
+      fs.writeFileSync(tmp, body, { mode: 0o600 });   // key material: owner-only, kept by the rename
       fs.renameSync(tmp, statePath);        // atomic: a crash mid-write cannot truncate the state
     } catch (e) {
       console.error('[!] could not persist runtime state:', e.message);

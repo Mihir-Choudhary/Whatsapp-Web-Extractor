@@ -33,10 +33,24 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller                 # build-only (not a runtime dep)
           pip install -r requirements.txt
+      # Baileys and libsignal-node, for the cross-implementation cases in the binary, signal and capture
+      # self-tests (they compare our encoder, Signal sessions and group keys with the Node libraries).
+      # Not bundled into the binaries. The lockfile names libsignal by a git+ssh URL; the runner has no
+      # SSH key, so GitHub is reached over HTTPS.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install the Node libraries the cross-checks use
+        shell: bash
+        run: |
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          npm ci --prefix tools/reconnect --no-audit --no-fund
       # Needs no profile, no network and no secrets, so it belongs in CI: these cover the parts
       # where a quiet mistake mislabels evidence instead of failing loudly.
       - name: Self-tests
         shell: bash
+        env:
+          WAWF_XTEST_REQUIRE: "1"                 # a cross-check skipped for want of Node fails the build
         run: |
           python scripts/selftest_identities.py
           python scripts/selftest_pipeline.py

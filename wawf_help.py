@@ -154,6 +154,9 @@ WHAT A BROWSER HOLDS — AND WHAT IT DOES NOT
 ONLINE OR NOT
  Nothing goes online unless you choose "Get it from WhatsApp", "download media", "recover history" or
  "record what WhatsApp's server is holding".
+ Signing in uses a client WhatsApp did not write. That is against WhatsApp's Terms of Service, and
+ WhatsApp has banned accounts for using unofficial clients. If the account must not be put at risk,
+ use a saved key or don't go online.
 
 KEY MATERIAL
  companion_enc_static.txt and creds_in.json (in the results folder), a raw dump with key material, and an

@@ -438,6 +438,17 @@ bt = open(p7, encoding="utf-8").read()
 check("...but not into the transcript's text", rlo in bt, False)
 check("...nor into a label there", "AnnBob" in bt, True)
 check("the row still holds the characters the store held", rlo in brow["text"], True)
+# An emoji newer than this interpreter's Unicode tables reads as unassigned (Cn). The release builds run
+# Python 3.12, which dropped U+1FAE9 from the transcript while chats.json kept it. A code point this
+# interpreter calls unassigned is picked from the emoji block, so the check means the same on every version.
+import unicodedata as _ud
+_new = next(chr(o) for o in range(0x1FA70, 0x1FB00) if _ud.category(chr(o)) == "Cn")
+erow = msg_row({"chat": "1@lid", "from_me": False, "type": "chat", "t": 0, "sender": "1@lid",
+                "id": "false_x_6"}, "2026-01-01 00:00:00", pb("tired " + _new + "\U0001FAE9"), bidi_ids)
+p8 = os.path.join(tempfile.mkdtemp(), "e.txt")
+write_transcripts(p8, {"1@lid": [erow]}, bidi_ids)
+et = open(p8, encoding="utf-8").read()
+check("an emoji newer than the Unicode tables reaches the transcript", ("tired " + _new + "\U0001FAE9") in et, True)
 
 print()
 print("a message's own body field is read verbatim, whatever it looks like")

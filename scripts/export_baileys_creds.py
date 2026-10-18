@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse, os, sys, json, base64, glob
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from snappy_pure import uncompress
-from idbutil import store_id, connect_ro
+from idbutil import store_id, connect_ro, open_private
 import sclone
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
@@ -127,7 +127,7 @@ def main():
            "registrationId": int(regid) if regid is not None else None, "user": user, "device": int(dev),
            "me_id": f"{user}:{dev}@s.whatsapp.net", "lid": lid, "account": adv, "cert_chain": cert}
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
-    json.dump(out, open(a.out, "w", encoding="utf-8"), indent=1)
+    with open_private(a.out) as fh: json.dump(out, fh, indent=1)
     print(f"[+] Noise keypair VERIFIED (X25519). reg_id={regid} device=:{dev}. wrote {a.out}")
     print(f"    account creds present: {list(adv.keys()) if adv else 'MISSING adv_signed_identity'}")
 

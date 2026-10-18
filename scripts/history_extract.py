@@ -103,7 +103,10 @@ def flatten(hs):
             row = {"chat": conv.get("id") or k.get("remoteJid"), "id": k["id"], "fromMe": bool(k.get("fromMe")),
                    "participant": k.get("participant") or w.get("participant"), "pushName": w.get("pushName"),
                    "ts": int(w.get("messageTimestamp") or 0), "text": WP.message_text(w.get("message")),
-                   "type": WP.message_type(w.get("message"))}
+                   # no payload: a system event (someone added, left, the subject changed), typed "?" as the
+                   # Node client types it -- "unknown" exported it as content sent by someone else
+                   "type": WP.message_type(w.get("message")) if w.get("message") is not None else "?"}
+            if w.get("messageStubType") is not None: row["stub_type"] = w["messageStubType"]
             und = _undecoded(w)
             if und: row["undecoded"] = und
             out.append(row)
@@ -135,6 +138,9 @@ class Run:
             if a.get("chat_id"): self.anchor_chat[str(a["chat_id"])] = str(a["chat"])
         self.pending = {}                       # request id -> list (filled when answered)
         self.our_ids, self.late_seen = set(), set()
+        # requests the phone could not decrypt (it sent a retry receipt); those of them still unanswered
+        self.asked_again, self.unreadable = set(), set()
+        self.last_unreadable = None
         self.late = self.late_msgs = self.late_ours = 0
         self.kept = self.kept_bytes = self.released = self.release_failed = 0
         self.media_conn = None
@@ -156,7 +162,9 @@ class Run:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"recovered_total": len(arr), "new_not_on_disk": len(nw), "by_chat": by,
                        "start_reached": sorted(self.start_reached), "silent_chats": sorted(self.silent),
-                       "answered_chats": sorted(self.answered), "messages": nw}, f, ensure_ascii=False, indent=1)
+                       "answered_chats": sorted(self.answered), "requests_asked_again": len(self.asked_again),
+                       "requests_unreadable": len(self.unreadable),
+                       "requests_not_resent": len(self.unreadable - set(self.c.retried)), "messages": nw}, f, ensure_ascii=False, indent=1)
         os.replace(tmp, self.out)
         tmp = self.meta_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f: json.dump(self.meta, f, ensure_ascii=False, indent=1)
@@ -344,9 +352,22 @@ class Run:
             raise
         self.our_ids.add(mid); self.pending[mid] = []
         deadline = time.time() + REQ_TIMEOUT
-        self.pump(lambda: (self.pending[mid] and self.pending[mid][-1] is None) or time.time() > deadline)
+        # a request the phone could not decrypt is sent again by the client (retry receipt); its deadline
+        # runs from the last time it was sent
+        self.pump(lambda: (self.pending[mid] and self.pending[mid][-1] is None)
+                  or time.time() > max(deadline, self.c.retried.get(mid, 0) + REQ_TIMEOUT))
         got = self.pending.pop(mid)
-        if not got or got[-1] is not None: return None
+        answered = bool(got) and got[-1] is None
+        # why the request went unanswered, when the phone said: it could not decrypt it
+        self.last_unreadable = None
+        if mid in self.c.retry_asked:
+            self.asked_again.add(mid)
+            if not answered:
+                self.unreadable.add(mid)
+                self.last_unreadable = (" (the phone could not decrypt the request and asked for it again; %s)" %
+                                        ("it was sent again on a new Signal session and went unanswered"
+                                         if mid in self.c.retried else "it could not be sent again"))
+        if not answered: return None
         return got[:-1]
 
     def lost_connection(self):
@@ -400,6 +421,9 @@ class Run:
         self.pump(lambda: self.c.messages.empty())          # bank any late answers delivered in the backlog
         say("[i] offline backlog %s (%d stanzas, %d decrypted)" % ("drained" if done else "NOT fully drained",
                                                                     self.c.stats["in"], self.c.stats["decrypted"]))
+        if self.c.stats["decrypt_failed"]:
+            say("[i] %s: this device's Signal state cannot read them; they are kept as received in "
+                "received_journal.jsonl and left on the server" % self.c.decrypt_failure_summary())
         if self.c.closed.is_set():
             return self.lost_connection()
         self.c.send(WB.node("presence", {"type": "available"}))
@@ -427,8 +451,12 @@ class Run:
                 if msgs is None and self.c.closed.is_set():
                     return self.lost_connection()
                 if msgs is None:
-                    say("  %s page%d: no response" % (a["chat"][:22], pg))
-                    if pg == 0: probe_silent += 1; silent += 1; self.silent.add(a["chat"]); self.write_out()
+                    say("  %s page%d: no response%s" % (a["chat"][:22], pg, self.last_unreadable or ""))
+                    # a request the phone could not decrypt says nothing about the chat: not marked silent
+                    if pg == 0:
+                        probe_silent += 1; silent += 1
+                        if not self.last_unreadable: self.silent.add(a["chat"])
+                        self.write_out()
                     now = time.time(); first_fail = first_fail or now
                     delay = min(MAX_DELAY, max(BASE_DELAY, delay * 2)); fail += 1
                     if fail >= FAIL_LIMIT and now - first_fail < COOLDOWN: tripped = True
@@ -461,7 +489,7 @@ class Run:
             if probed % 10 == 0 or probed == len(targets):
                 say("  [%d/%d] served=%d silent=%d pace=%dms" % (probed, len(targets), served, silent, delay * 1000))
             time.sleep(delay)
-        if LATE_WAIT > 0 and silent > 0 and not self.c.closed.is_set():
+        if LATE_WAIT > 0 and silent > self.late_ours and not self.c.closed.is_set():
             say("[i] %d request(s) unanswered -- staying connected up to %ds for late answers" % (silent - self.late_ours, LATE_WAIT))
             end = time.time() + LATE_WAIT; seen = self.late_ours
             while time.time() < end and self.late_ours < silent and not self.c.closed.is_set():
@@ -469,6 +497,13 @@ class Run:
                 if self.late_ours != seen: seen = self.late_ours; end = max(end, time.time() + 60)
         if self.late:
             say("[*] %d reply(ies) arrived after their request had timed out, carrying %d message(s)" % (self.late, self.late_msgs))
+        if self.asked_again:
+            say("[i] the phone could not decrypt %d request(s) on the Signal session this state held and asked for "
+                "them again (retry receipts); %d were answered after the client sent them again on a new session"
+                % (len(self.asked_again), len(self.asked_again - self.unreadable)))
+        if self.c.stats["resend_failed"]:
+            say("[!] %d time(s) a request the phone could not decrypt could not be sent again (the reason is "
+                "printed above)" % self.c.stats["resend_failed"])
         if self.kept:
             say("[*] kept %d decrypted history chunk(s), %.1f MiB, in %s" % (self.kept, self.kept_bytes / 1048576, self.chunkdir))
         if self.released or self.release_failed:
@@ -485,6 +520,8 @@ class Run:
         if self.undecoded:
             say("[!] %d recovered message(s) are of a type this tool does not decode -- kept raw, marked 'undecoded'"
                 % self.undecoded)
+        if self.c.decrypt_errors:
+            say("[i] in all, " + self.c.decrypt_failure_summary())
         say("[i] received: " + ", ".join("%s=%d" % kv for kv in sorted(self.c.tally.items())))
         self.c.close()
         return 7 if tripped else 0

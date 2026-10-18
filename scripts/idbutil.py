@@ -23,6 +23,22 @@ def sqlite_uri(path):
         p = "/" + p                                    # C:/x -> /C:/x
     return "file://" + quote(p, safe="/:")
 
+def open_private(path, mode="w", encoding="utf-8"):
+    """Open `path` for writing with permissions for its owner only (0600 on Linux and macOS).
+
+    For the files that are key material, not evidence: creds_in.json (the device's Noise private key),
+    companion_enc_static.txt (the at-rest key), the Signal state and the app-state keys. A plain open()
+    creates them with the umask's mode, 0644 on most systems -- readable by every user of a shared
+    examination machine. A file that already exists is tightened too, since O_CREAT keeps its old mode.
+    On Windows the mode only sets the read-only bit, which 0600 leaves clear.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o600)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return os.fdopen(fd, mode, encoding=None if "b" in mode else encoding)
+
 def connect_ro(path):
     """Open one of the evidence's SQLite files without writing to it -- INCLUDING its write-ahead log.
 

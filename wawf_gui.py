@@ -5,7 +5,7 @@ the GUI and the CLI cannot drift apart: every run is an ordinary CLI run, with t
 Standard library only (tkinter).
 """
 from __future__ import annotations
-import os, sys, glob, queue, shutil, subprocess, tempfile, threading, datetime as dt
+import os, re, sys, glob, queue, shutil, subprocess, tempfile, threading, datetime as dt
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -13,6 +13,15 @@ from tkinter import ttk, filedialog, messagebox
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from wawf_help import TIPS, STEPS, GUIDE
+
+# A log line starts with its level ("WARNING msg"; with -v, "<date> <time> WARNING name msg").
+_LEVEL = re.compile(r"^(?:\d{4}-\d\d-\d\d [\d:,.]+ )?(ERROR|CRITICAL|WARNING)\b")
+_PASS = re.compile(r"history pass (\d+)")
+
+def _line_tag(line):
+    """'err', 'warn' or None: the colour a line of the run's output gets in the log pane."""
+    m = _LEVEL.match(line)
+    return None if not m else "warn" if m.group(1) == "WARNING" else "err"
 
 
 def _run_popen_kwargs():
@@ -252,6 +261,8 @@ def _indicator(root, size, kind, on):
 
 
 # ---------------------------------------------------------------- the window
+LOG_LINES, LOG_MIN_LINES = 12, 5        # the log's height during a run, and the least it shrinks to before one
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -572,7 +583,7 @@ class App(tk.Tk):
 
         # log
         lf = ttk.Frame(bottom); lf.pack(fill="both", expand=True, pady=(8, 0))
-        self.log = tk.Text(lf, height=5, font=FONT_MONO, bg=LOG_BG, fg=LOG_FG, insertbackground=LOG_FG,
+        self.log = tk.Text(lf, height=LOG_LINES, font=FONT_MONO, bg=LOG_BG, fg=LOG_FG, insertbackground=LOG_FG,
                            relief="flat", wrap="word", padx=10, pady=8, state="disabled")
         sb = ttk.Scrollbar(lf, command=self.log.yview); self.log.configure(yscrollcommand=sb.set)
         self.log.pack(side="left", fill="both", expand=True); sb.pack(side="right", fill="y")
@@ -643,6 +654,15 @@ class App(tk.Tk):
         avail = self.winfo_screenheight() - 90                 # leave room for a taskbar / dock
         fixed = self.winfo_reqheight() - self._canvas.winfo_reqheight()
         want = self._form.winfo_reqheight()
+        # Before a run the log shrinks (down to LOG_MIN_LINES) until the steps through 3 ("Message key")
+        # are in view; a run gives it LOG_LINES again. At 12 lines on a 1080-pixel screen step 3 was
+        # cut off at the default size.
+        cards = self._form.winfo_children()[:3]
+        need = sum(c.winfo_reqheight() + 10 for c in cards)
+        lines = LOG_LINES
+        while lines > LOG_MIN_LINES and avail - fixed < min(want, need):
+            lines -= 1; self.log.configure(height=lines); self.update_idletasks()
+            fixed = self.winfo_reqheight() - self._canvas.winfo_reqheight()
         self._canvas.configure(height=max(200, min(want, avail - fixed)))
         self.update_idletasks()
         w, h = max(self._form.winfo_reqwidth() + 60, 760), min(self.winfo_reqheight(), avail)
@@ -844,6 +864,8 @@ class App(tk.Tk):
         if self.proc and self.proc.poll() is None:
             messagebox.showinfo("WhatsApp Web Extractor", "A run is already in progress."); return
         self._clear(); self._append("$ " + _cmdline(cmd) + "\n\n")
+        self._stopped, self._run_history = False, "--history" in cmd
+        self.log.configure(height=LOG_LINES)            # a run's log matters more than the steps above it
         # The run and every helper it starts keep their temporary files (parsed copies of the store, which
         # hold key material) in a folder of their own, removed when the run ends: Stop ends the run
         # forcibly, so it never gets to clean up after itself.
@@ -889,8 +911,11 @@ class App(tk.Tk):
                     self._finished_proc = self.proc
                     self._finished(item[1])
                 else:
-                    tag = "err" if " ERROR " in item else "warn" if " WARNING " in item else None
-                    self._append(item, tag)
+                    self._append(item, _line_tag(item))
+                    p = _PASS.search(item) if getattr(self, "_run_history", False) else None
+                    if p and "────" in item and not getattr(self, "_stopped", False):
+                        self.status.configure(text="Recovering history from the phone: pass %s. This can take "
+                                                   "hours; Stop keeps what is recovered." % p.group(1), foreground=MUTED)
         except queue.Empty:
             pass
         self.after(100, self._drain)
@@ -903,7 +928,15 @@ class App(tk.Tk):
         self._remove_run_tmp()
         self.bar.stop(); self.bar.pack_forget()
         self.run_btn.configure(state="normal"); self.stop_btn.configure(state="disabled")
-        if rc == 0:
+        if getattr(self, "_stopped", False):
+            # ended by Stop: the exit code is the forced end, not an error of the run
+            self.status.configure(text="Stopped.", foreground=MUTED)
+            self._append("\nStopped.\n", "warn")
+            if getattr(self, "_run_history", False):
+                self._append("History the phone served before Stop is kept with this linked device's history "
+                             "files, but was not added to this export. The next history run for this device "
+                             "keeps it and adds it to that run's export.\n", "warn")
+        elif rc == 0:
             self.status.configure(text="Done.", foreground=ACTION)
             self._append("\nFinished.\n", "ok")
         else:
@@ -923,6 +956,7 @@ class App(tk.Tk):
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
+            self._stopped = True
             _stop_tree(self.proc)                          # the run and every helper it started
             self.status.configure(text="Stopping…")
 

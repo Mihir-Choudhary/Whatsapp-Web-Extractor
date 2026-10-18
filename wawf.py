@@ -408,8 +408,11 @@ def _summary(engine, ls, msgs, meta):
     chats = set(m["chat"] for m in msgs if m.get("chat") and m["chat"] != "?")
     groups = sum(1 for c in chats if c.endswith("@g.us"))
     sent = sum(1 for m in msgs if m.get("from_me")); recv = len(msgs) - sent
-    MEDIA = {"image", "video", "audio", "ptt", "document", "sticker", "gif"}
-    media = sum(1 for m in msgs if m.get("type") in MEDIA)
+    # The rule the SQLite writer uses: a message carrying a media key or path. A text message that
+    # carries one is a link preview's image. Counting a fixed list of types put 2,576 here and 2,660
+    # (+58) in the SQLite writer's summary of the same store.
+    media = sum(1 for m in msgs if m.get("has_media") and m.get("type") != "chat")
+    previews = sum(1 for m in msgs if m.get("has_media") and m.get("type") == "chat")
     types = collections.Counter((m.get("type") or "?") for m in msgs)
     top = "  ".join(f"{t}:{n}" for t, n in types.most_common(6))
     log.info("──────────── summary ────────────")
@@ -420,7 +423,8 @@ def _summary(engine, ls, msgs, meta):
     if meta:
         log.info("  contacts    : %s   ·   groups: %s   ·   chats(saved): %s",
                  f"{meta.get('contact', 0):,}", f"{meta.get('group-metadata', 0):,}", f"{meta.get('chat', 0):,}")
-    log.info("  media msgs  : %s", f"{media:,}")
+    log.info("  media msgs  : %s with a media key%s", f"{media:,}",
+             (" (+%s link-preview images)" % f"{previews:,}") if previews else "")
     log.info("  msg types   : %s", top)
     log.info("─────────────────────────────────")
 
@@ -552,6 +556,11 @@ def cmd_run(a):
         if getattr(a, "offline", False):
             creds_path = None                         # credentials only serve the network login
             log.info("      --offline: skipped (they are only needed to sign in)")
+        elif getattr(a, "key", None):
+            # a named key that does not fit stops the run (or, offline, exports without text); it never
+            # signs in, so the device's private key would be written to disk for nothing
+            creds_path = None
+            log.info("      --key: skipped (they are only needed to sign in, and --key never does)")
         else:
             try:
                 bad = cmd_creds(argparse.Namespace(profile=a.profile, origin=a.origin, out=creds_path, _internal=True))
@@ -567,6 +576,9 @@ def cmd_run(a):
     # failure made the tool discard a seconds-old key, announce it was "left over from before the
     # browser last re-paired", and perform a second pointless network reconnect.
     key_was_guessed = key is not None and not getattr(a, "key", None)
+    # why there is no key, for the raw dump's per-record reason: "no key available" read as though no
+    # key had been given at all when the one given simply did not open this session
+    no_key_why = "the key given with --key does not open this session" if getattr(a, "_no_key", False) else None
     if not key and getattr(a, "key", None):
         # The user named this file. Falling back to a networked reconnect here would contradict the
         # entire reason --key exists -- it is how you decrypt WITHOUT touching the account -- and
@@ -636,6 +648,7 @@ def cmd_run(a):
                         "left over from before the browser last re-paired); --offline: exporting everything "
                         "except message text")
             key, guessed = None, False
+            no_key_why = "the key found beside the output does not open this session"
     if guessed and key:
         log.warning("that key does not match this profile -- it is almost certainly left over from "
                     "before the browser last re-paired. Discarding it and capturing a fresh one.")
@@ -659,7 +672,8 @@ def cmd_run(a):
             if hf: log.info("raw: an image of the local store only -- messages recovered from the "
                             "phone were never in it, so they are in the other formats")
             rc = cmd_raw(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=key, out=path,
-                                            raw_include_keys=getattr(a, "raw_include_keys", False)))
+                                            raw_include_keys=getattr(a, "raw_include_keys", False),
+                                            no_key_why=None if key else no_key_why))
         else:
             rc = cmd_decrypt(argparse.Namespace(profile=a.profile, origin=a.origin, enc_static=key,
                                                 out=path, only=fmt, history_file=hf))
@@ -914,7 +928,7 @@ def cmd_raw(a):
     def decrypt(op):
         """(plaintext, reason) -- reason is None on success, else why it was not decrypted."""
         if cipher_key is None:
-            return None, "no key available"
+            return None, getattr(a, "no_key_why", None) or "no key available"
         data, iv = ab(op.get("_data")), ab(op.get("iv"))
         if not data or not iv:
             return None, "no _data/iv on the record"
@@ -929,8 +943,8 @@ def cmd_raw(a):
         return pt[:-pt[-1]], None
 
     if cipher_key is None:
-        log.warning("no at-rest key available: the raw dump will carry the records as stored, with "
-                    "msgRowOpaqueData still encrypted.")
+        log.warning("%s: the raw dump will carry the records as stored, with msgRowOpaqueData still "
+                    "encrypted.", getattr(a, "no_key_why", None) or "no at-rest key available")
     else:
         # VALIDATE BEFORE WRITING, and report a wrong key with the same exit code the other writers
         # use (3). Without this, cmd_raw returned 0 whatever happened: a stale key produced a dump in
@@ -1404,7 +1418,9 @@ def cmd_creds(a):
         log.info("client version from the profile: %s (announced instead of a third-party lookup)",
                  ".".join(str(x) for x in _wv))
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
-    json.dump(out, open(a.out, "w", encoding="utf-8"), indent=1)
+    from idbutil import open_private                  # the device's private key: owner-only
+    with open_private(a.out) as fh:
+        json.dump(out, fh, indent=1)
     abs_out = os.path.abspath(a.out)
     log.info("Noise keypair VERIFIED (X25519). reg_id=%s device=:%s account=%s -> %s",
              int(regid) if regid is not None else "?", dev, "present" if adv else "MISSING", abs_out)
@@ -2086,8 +2102,9 @@ def cmd_queue(a):
     log.info("server queue capture -> %s", work)
     log.info("[1/3] recovering the device credentials ...")
     if a.creds:
-        import shutil
-        shutil.copyfile(a.creds, os.path.join(work, "creds_in.json"))
+        from idbutil import open_private              # a copy of the device's private key: owner-only
+        with open(a.creds, "rb") as src, open_private(os.path.join(work, "creds_in.json"), "wb") as dst:
+            dst.write(src.read())
     elif not _creds_ok(a, os.path.join(work, "creds_in.json")):
         log.error("server queue not recorded: no usable device credentials in this copy")
         return 3
@@ -2251,10 +2268,13 @@ def cmd_history(a):
         log.warning("MODE: this run rides the BROWSER PROFILE's registration, because this tool has "
                     "not been paired as its own device. On-demand history is a REQUEST TO THE LIVE "
                     "PRIMARY PHONE -- it is not recoverable from the image, and the profile's Signal "
-                    "material is a snapshot of a ratchet the phone keeps advancing. It serves history "
-                    "while that snapshot is still current and then stops, and nothing on disk can "
-                    "repair it. Everything else this tool extracts (cached messages, contacts, media, "
-                    "identities, app-state) comes from the files and is unaffected.")
+                    "material is a snapshot of a ratchet the phone keeps advancing. When the phone can "
+                    "no longer read a request sent on that snapshot it says so, and the history client "
+                    "starts a new session from the phone's keys and sends the request again. What no "
+                    "tool can repair is the registration itself: once the browser is logged out or "
+                    "linked again, these credentials no longer sign in. Everything else this tool "
+                    "extracts (cached messages, contacts, media, identities, app-state) comes from the "
+                    "files and is unaffected.")
         log.warning("TO MAKE HISTORY KEEP WORKING: pair this tool as its own linked device, once -- "
                     "`node tools/reconnect/pair.js` in a repo checkout, then run history with "
                     "WAWF_HISTORY_ENGINE=node (the Python client cannot use a paired device). It then holds its own Noise key, Signal identity "
@@ -2297,6 +2317,24 @@ def cmd_history(a):
                    "by_chat": dict(by), "messages": list(master.values())}, open(tmp, "w", encoding="utf-8"))
         os.replace(tmp, path)
         return by
+
+    # A run stopped mid-pass (the window's Stop, a closed terminal) leaves that pass's pages only in
+    # pass_out, which the first pass below deletes: fold them into the ledger before anything else.
+    if os.path.exists(pass_out):
+        try:
+            WD, _ = _imp()
+            if os.path.exists(accum):
+                WD.bank_history(master, json.load(open(accum, encoding="utf-8")).get("messages"))
+            kept, _e = WD.bank_history(master, json.load(open(pass_out, encoding="utf-8")).get("messages"))
+            if kept:
+                _checkpoint(accum)
+                log.info("kept %d message(s) that an earlier run recovered before it was stopped", kept)
+        except Exception as e:
+            log.warning("could not read %s, left by an earlier run (%s); kept aside as %s.unread", pass_out, e,
+                        os.path.basename(pass_out))
+            try: os.replace(pass_out, pass_out + ".unread")
+            except OSError: pass
+        master.clear()
 
     # RESUME across separate `wawf history` runs: step [3/4] just rebuilt anchors.json fresh from what's on
     # disk (i.e. back at the browser-cache boundary), so reload everything recovered on prior runs and push
@@ -2386,6 +2424,9 @@ def cmd_history(a):
     MAX_COOLDOWNS = int(os.environ.get("WAWF_MAX_COOLDOWNS", 6))
     cooldowns_used = 0
     served_any = False                                   # did the phone serve anything, any pass?
+    # requests the phone said it could not decrypt (retry receipts) and that stayed unanswered after the
+    # client sent them again on a new Signal session; written by the Python client only
+    unreadable = not_resent = 0
     # Exit 2 and 5 from either client mean it stopped BEFORE asking the phone anything: the login was
     # refused, the credentials have no account, the credentials and Signal state are of different
     # registrations, or no Signal session with the phone could be started. Read as an ordinary pass,
@@ -2398,6 +2439,7 @@ def cmd_history(a):
     # after earlier ones were answered, so the run then ends with what they recovered.
     asked_nothing = False
     dropped = False                                      # the Python client's connection was lost or never made
+    capped = False                                       # every pass up to MAX_PASSES still added messages
     ended_chats = chat_state["ended"]                    # chats the phone answered "start reached" for
     try:
         for p in range(1, MAX_PASSES + 1):
@@ -2441,6 +2483,8 @@ def cmd_history(a):
             # answered", and pointed the user at the phone.
             answered = len(passd.get("answered_chats") or [])
             served_any = served_any or served > 0
+            unreadable += int(passd.get("requests_unreadable") or 0)
+            not_resent += int(passd.get("requests_not_resent") or 0)
             # Chats the phone itself ended this pass. Accumulated across passes because the anchors
             # are rewritten every pass and a chat ended in pass 1 must stay ended in pass 3.
             _note_pass(chat_state, passd)
@@ -2512,6 +2556,11 @@ def cmd_history(a):
                                 ("%d chat(s) the phone has ended are now recorded and will be "
                                  "skipped next run." % len(ended_chats)) if ended_chats else
                                 "Re-run to continue; the queue order is updated each pass.")
+                    if passd.get("requests_unreadable"):
+                        log.warning("pass %d: the phone could not decrypt %d of those request(s) and asked for "
+                                    "them again; %d could not be sent again, the rest were sent again on a new "
+                                    "Signal session and still went unanswered (see the client's lines above).",
+                                    p, passd["requests_unreadable"], int(passd.get("requests_not_resent") or 0))
                 elif not master:
                     log.warning("pass %d came back empty — the phone answered none of the requests. "
                                 "Stopping.", p)
@@ -2522,6 +2571,8 @@ def cmd_history(a):
                 break
             _deepen_anchors(anchors_path, master, only=refetch_only,
                             start_reached=ended_chats, silent=chat_state["silent"])                     # go deeper next pass
+        else:
+            capped = True
     except KeyboardInterrupt:
         log.warning("interrupted — checkpointing %s recovered messages before exit.", f"{len(master):,}")
         _checkpoint(accum); _checkpoint(pass_out)
@@ -2570,6 +2621,10 @@ def cmd_history(a):
     if master:
         log.info("HISTORY DONE: recovered %s messages older than the cache, across %d chats -> %s",
                  f"{len(master):,}", len(by), pass_out)
+        if capped:
+            # the last pass still added messages, so this is the cap and not the end of what the phone serves
+            log.warning("stopped at the %d-pass limit while passes were still adding messages; run `wawf "
+                        "<PROFILE> --history` again to continue (progress is saved).", MAX_PASSES)
         if not served_any:
             log.warning("NOTE: this run was served nothing new — every message above came from "
                         "earlier runs. Before reading that as throttling, note the client stops "
@@ -2584,6 +2639,19 @@ def cmd_history(a):
                     "a pass that adds nothing does not mean the older history is gone.")
         return 0
     # Nothing at all came back: explain WHY, so an empty result isn't read as a broken tool.
+    if unreadable:
+        # the phone answered, with retry receipts: "only the phone's replies were missing" would be false
+        log.warning("NOTHING RECOVERED: the phone could not decrypt %d of this run's requests and said so (a retry "
+                    "receipt for each), so the phone was reached and the run is not a statement about its "
+                    "silence. %s The client's lines above say how often the phone asked again and why.",
+                    unreadable,
+                    ("None of them could be sent again (the reason is printed above)." if not_resent >= unreadable else
+                     ("%s sent again on a new Signal session started from the phone's own keys and %s not answered "
+                      "either%s; the new session is saved (signal_runtime.py.json in %s) and the next run sends on it."
+                      % ("Each was" if not not_resent else "%d were" % (unreadable - not_resent),
+                         "was" if not not_resent else "were",
+                         "" if not not_resent else ", and %d could not be sent again" % not_resent, work))))
+        return 1
     log.warning("NOTHING RECOVERED — and this is usually NOT a fault in this tool. On-demand history is "
                 "served by your PHONE (WhatsApp's servers only relay the request). Your phone answered none "
                 "of the requests this run. That happens even with the phone online and connected: WhatsApp "
@@ -2732,7 +2800,7 @@ def main():
             print(f"the window is unavailable here ({e}); run `wawf -h` for the command line", file=sys.stderr)
             return 2
         return wawf_gui.main()
-    if not getattr(sys, "frozen", False) and not ({"-h", "--help"} & set(sys.argv[1:])):
+    if not getattr(sys, "frozen", False) and not ({"-h", "--help", "--version"} & set(sys.argv[1:])):
         missing = _missing_packages()
         if missing:
             print("This Python (%s) is missing package(s) the tool needs: %s\n"
@@ -2895,6 +2963,10 @@ def main():
     g = p.add_argument_group("diagnostics")
     g.add_argument("-v", "--verbose", action="store_true", help="DEBUG logs + full tracebacks on error")
     g.add_argument("--log-file", metavar="FILE", help="mirror all logs (DEBUG) to this file")
+    # the same string the export receipts and the audit database record, so a report can quote it
+    version = _wawf_version()
+    g.add_argument("--version", action="version", version="wawf " + version,
+                   help="print the version (release, and the git commit when run from a checkout) and stop")
 
     a = p.parse_args()
     if getattr(a, "fetch_media", False):
@@ -2919,7 +2991,7 @@ def main():
         a.profile = _given_stores_profile(a.idb, a.local_storage, a.media_cache or [])
     # One version string for this run, inherited by the audit database (audit._tool_version reads
     # WAWF_VERSION) and by every helper process, so they cannot record different values.
-    os.environ["WAWF_VERSION"] = _wawf_version()
+    os.environ["WAWF_VERSION"] = version
     setup_logging(a.verbose, a.log_file)
     # Pick the action. The default IS the job: credentials -> key -> decrypt. --history and --memory are
     # the two alternative actions; everything else is an option on the default job.
@@ -3019,7 +3091,9 @@ def main():
         rc = action(a)
         status = "ok" if not rc else "error"
     except SystemExit as e:
-        log.error("%s", e); rc = int(e.code) if isinstance(e.code, int) else 1
+        # a bare exit code (_usage) has already said what is wrong; logging it added a line reading "ERROR 2"
+        if e.code is not None and not isinstance(e.code, int): log.error("%s", e)
+        rc = int(e.code) if isinstance(e.code, int) else 1
         status, err = "error", e
     except KeyboardInterrupt:
         log.error("interrupted by user"); rc, status = 130, "interrupted"

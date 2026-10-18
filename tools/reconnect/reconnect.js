@@ -73,7 +73,8 @@ const findFile = (name, override) => {
   const done = (code) => { try { sock.end(); } catch(e){}
     if (captured) {
       const outPath = path.resolve(process.cwd(), 'companion_enc_static.txt');
-      fs.writeFileSync(outPath, captured);
+      fs.writeFileSync(outPath, captured, { mode: 0o600 });   // the at-rest key: owner-only
+      try { fs.chmodSync(outPath, 0o600); } catch (e) {}     // an existing file keeps its mode otherwise
       console.error('[done] captured=YES -> ' + outPath);
     } else { console.error('[done] captured=NO'); }
     process.exit(captured?0:code); };

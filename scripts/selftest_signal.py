@@ -77,6 +77,8 @@ harness = os.path.join(os.path.dirname(HERE), "tests", "crosscheck", "sig.js")
 if not (node and os.path.isdir(os.path.join(mods, "libsignal")) and os.path.isfile(harness)):
     print("\nlibsignal-node not available: cross-implementation cases skipped "
           "(npm install in tools/reconnect, or set WAWF_XTEST_NODE_MODULES)")
+    if os.environ.get("WAWF_XTEST_REQUIRE"):          # CI installs them: a skip there is a failure
+        FAIL.append("libsignal-node not available (WAWF_XTEST_REQUIRE is set)"); print("  FAIL libsignal-node not available (WAWF_XTEST_REQUIRE is set)")
 else:
     tmp = tempfile.mkdtemp(prefix="wawf_sig_")
     env = dict(os.environ, NODE_PATH=mods)

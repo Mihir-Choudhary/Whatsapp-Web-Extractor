@@ -74,6 +74,8 @@ if node and os.path.isdir(os.path.join(mods, "@whiskeysockets", "baileys")):
           and P.message_type(m1['message']) == 'imageMessage' and P.message_text(m1['message']) == 'a photo')
 else:
     print("Baileys not available: byte-for-byte comparison skipped")
+    if os.environ.get("WAWF_XTEST_REQUIRE"):          # CI installs them: a skip there is a failure
+        FAIL.append("Baileys not available (WAWF_XTEST_REQUIRE is set)"); print("  FAIL Baileys not available (WAWF_XTEST_REQUIRE is set)")
 print()
 if FAIL:
     print(f"{len(FAIL)} CASE(S) FAILED"); [print("  - " + f) for f in FAIL]; sys.exit(1)

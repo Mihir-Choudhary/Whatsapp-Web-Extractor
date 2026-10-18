@@ -46,9 +46,15 @@ the helper's `__main__` in-process via `runpy`. In dev mode it just runs
 
 ## What a build must do
 - `wawf --help`, clean argparse errors (the release workflow runs `--help` on every build)
+- the self-tests, including the cross-checks against Baileys and libsignal-node: the release workflow
+  installs `tools/reconnect`'s Node libraries and sets `WAWF_XTEST_REQUIRE=1`, so a cross-check skipped
+  for want of them fails the build instead of passing quietly
 - `wawf <PROFILE> --offline` — root key read from Firefox and Chromium profiles, export without text
 - `wawf <PROFILE> --key <correct file> --offline` — key validated against on-disk ciphertext, all bodies decrypted
-- `wawf <PROFILE> --key <wrong file> --offline` — refused (exit 3) rather than writing garbage
+- `wawf <PROFILE> --key <wrong file>` — refused (exit 3) without going online, nothing written
+- `wawf <PROFILE> --key <wrong file> --offline` — the key is refused and the export is written without
+  message text instead (exit 0, warned), never garbage; a raw dump says per record that the key given
+  does not open this session. With `--key`, no `creds_in.json` is written (only a network login uses it)
 - `wawf <PROFILE>` — device credentials recovered and X25519-verified, key captured over the network
 - `--out sqlite:DIR` — the same validation, refuses a wrong key (exit 3), writes nothing on rejection
 - frozen `.exe`: `_runpy` dispatch of the helpers, `--history` with the Python client

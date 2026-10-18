@@ -47,6 +47,30 @@ check("Stop ends the helper the run started, not only the run", _m2 == _m1)
 if _m2 != _m1 and sys.platform != "win32":
     os.system("pkill -f %s" % _beat)                       # the helper it left running
 shutil.rmtree(_t, ignore_errors=True)
+
+print("the log pane's colours, and how a run that was stopped ends")
+# The run logs "WARNING msg" (with -v: "<date> <time> WARNING name msg"); the pane looked for " WARNING "
+# with a space before it, so no warning or error was ever coloured.
+check("warnings and errors are coloured, in both log formats",
+      [_G._line_tag(x) for x in ("WARNING NOTHING RECOVERED", "ERROR   pass 1: stopped", "CRITICAL x",
+                                 "2026-10-18 11:28:01,123 WARNING root MODE: x", "INFO    history pass 1",
+                                 "  history chunk failed: a WARNING inside")]
+      == ["warn", "err", "err", "warn", None, None])
+def _ended(stopped, history, rc):
+    said, status = [], {}
+    w = types.SimpleNamespace(_stopped=stopped, _run_history=history, _remove_run_tmp=lambda: None,
+                              bar=types.SimpleNamespace(stop=lambda: None, pack_forget=lambda: None),
+                              run_btn=types.SimpleNamespace(configure=lambda **k: None),
+                              stop_btn=types.SimpleNamespace(configure=lambda **k: None),
+                              status=types.SimpleNamespace(configure=lambda **k: status.update(k)),
+                              _append=lambda text, tag=None: said.append(text), proc=None)
+    _G.App._finished(w, rc)
+    return status.get("text"), "".join(said)
+_st, _said = _ended(True, True, 1)
+check("a history run ended by Stop says 'Stopped.', not an error, and where the recovered messages are",
+      _st == "Stopped." and "not added to this export" in _said and "code 1" not in _said)
+_st, _said = _ended(False, False, 1)
+check("...while a run that failed on its own still says so", "error (code 1)" in (_st or ""))
 if _stubbed:
     for _n in [n for n in sys.modules if n == "tkinter" or n.startswith("tkinter.")] + ["wawf_gui"]:
         sys.modules.pop(_n, None)
@@ -198,6 +222,20 @@ try:
         import shlex
         back = shlex.split(shown)
     check("parses back to exactly the arguments that run (spaces, quotes, &)", back == cmd)
+
+    # At 12 log lines on a 1080-pixel screen, step 3 ("Message key") was cut off at the default size: before
+    # a run the log now shrinks until steps 1-3 show, and a run gives it its 12 lines back.
+    for _scr, _want in ((1080, "shrinks"), (4000, "full")):
+        app.log.configure(height=G.LOG_LINES); app.winfo_screenheight = lambda h=_scr: h
+        app._fit_screen()
+        _need = sum(c.winfo_reqheight() + 10 for c in app._form.winfo_children()[:3])
+        _lines, _cv = int(app.log.cget("height")), int(app._canvas.cget("height"))
+        if _want == "full":
+            check("a tall screen keeps the log at %d lines" % G.LOG_LINES, _lines == G.LOG_LINES)
+        else:
+            check("a 1080-pixel screen: steps 1-3 in view (%d px for %d), log at %d lines" % (_cv, _need, _lines),
+                  _cv >= _need or _lines == G.LOG_MIN_LINES)
+    del app.winfo_screenheight
 finally:
     app.destroy()
     shutil.rmtree(tmp, ignore_errors=True)

@@ -917,14 +917,17 @@ _secs=[m['timestamp']/1000 for m in messages if m.get('timestamp') and 1e9 < m['
 def _d(t): return _dt.datetime.fromtimestamp(t, _dt.timezone.utc).strftime('%Y-%m-%d')
 _cset=set(m['chat_jid'] for m in messages if m.get('chat_jid'))
 _grp=sum(1 for c in _cset if c.endswith('@g.us')); _sent=sum(1 for m in messages if m.get('from_me'))
-_media=sum(1 for m in messages if m.get('media') and m.get('message_type') != 0)
-_previews=sum(1 for m in messages if m.get('media') and m.get('message_type') == 0)   # link-preview images
+# a media key or path on a text message is a link preview's image; on anything else it is the media. By
+# WhatsApp's type, not message_type: types msgstore.db has no number for are 0 there too, and were
+# counted as link previews. wawf's own summary counts the same way.
+_media=sum(1 for m in messages if m.get('media') and m['media'].get('type') != 'chat')
+_previews=sum(1 for m in messages if m.get('media') and m['media'].get('type') == 'chat')
 print('──────────── summary ────────────')
 print(f'  messages    : {len(messages):,} total   ({_sent:,} sent / {len(messages)-_sent:,} received)')
 print(f'  date range  : {(_d(min(_secs)) if _secs else "?")}  →  {(_d(max(_secs)) if _secs else "?")}')
 print(f'  chats       : {len(_cset)}   ({len(_cset)-_grp} direct, {_grp} groups)')
 print(f'  contacts    : {len(contacts):,}   ·   groups: {len(groups):,}   ·   chats(saved): {len(chats):,}')
-print(f'  media msgs  : {_media:,}' + (f' (+{_previews:,} link-preview images)' if _previews else '')
+print(f'  media msgs  : {_media:,} with a media key' + (f' (+{_previews:,} link-preview images)' if _previews else '')
       + f'   ·   reactions: {rx:,}   ·   calls: {len(_calls):,}')
 print(f'  associations: {na:,} albums / HD video copies linked   ·   {nwa:,} as the browser recorded them (wawf_message_association)')
 print('─────────────────────────────────')

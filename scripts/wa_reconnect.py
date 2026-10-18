@@ -451,7 +451,8 @@ def run(creds, out_path, timeout=30, log=lambda *a: None, print_key=False, passi
                     log("stream error/end")
                     A.end_run(4, status="error", error=RuntimeError("stream error/end <%s>" % tag)); return 4
         if captured:
-            with open(out_path, "w") as f: f.write(captured)
+            from idbutil import open_private          # the at-rest key: owner-only
+            with open_private(out_path) as f: f.write(captured)
             A.artifact(out_path, kind="companion_enc_static (at-rest key captured from the server)")
             # The key is NOT printed by default. It used to go to stdout unconditionally as a
             # scripting contract ("stdout = just the key"), which meant the one secret the browser
