@@ -1,10 +1,24 @@
-# WhatsApp Web Extractor
+<p align="center">
+  <img src="assets/wawf.png" width="120" alt="WhatsApp Web Extractor logo">
+</p>
 
-A forensic CLI that decrypts and exports **WhatsApp Web** from a browser's on-disk storage.
-Works with **Firefox** and **Chromium** (Chrome / Edge / Brave / Opera), auto-detecting the engine
-from the profile.
+<h1 align="center">WhatsApp Web Extractor</h1>
 
-> Authorized use only — your own account or a lawful investigation with permission.
+<p align="center">
+  <b>Forensic export of WhatsApp Web from a browser profile on disk.</b><br>
+  Firefox and Chromium (Chrome, Edge, Brave, Opera) · Windows, Linux and macOS · command line or window
+</p>
+
+<p align="center">
+  <a href="../../releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/Mihir-Choudhary/Whatsapp-Web-Extractor"></a>
+  <a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-blue"></a>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/window.png" width="680" alt="The wawf window: browser profile, where to save the results, and how to get the message key">
+</p>
+
+> **Authorized use only:** your own account, or a lawful investigation with permission.
 
 > **Risk to the account.** The default run (to capture the key), `--queue` and `--history` sign in to
 > WhatsApp as the account's linked device, using a client WhatsApp did not write; `--fetch-media`
@@ -12,6 +26,52 @@ from the profile.
 > accounts for using unofficial clients. Each sign-in is recorded as activity on the account. If the
 > account must not be put at risk, use `--offline` with a key captured earlier (`--key`), or without one
 > to export everything except message text.
+
+## What it does
+
+Point it at a browser profile (or a copy of one) and it reads WhatsApp Web's own stores, decrypts them
+and writes an export an examiner can read, check and hand over:
+
+- **Message text, decrypted.** The at-rest key is captured by signing in once as the linked device, or
+  read from a key file captured earlier, so later runs work fully offline. A wrong key is refused,
+  never turned into garbage.
+- **Several output formats.** A readable transcript; `chats.json`, `identities.json` and
+  `contacts.csv`; an Android-layout `msgstore.db` + `wa.db` that Android WhatsApp parsers already read;
+  and a raw dump of every store, record for record.
+- **Every sender named.** lid, phone number, address-book name and the contact's own name are
+  correlated from the profile itself; where none is known the identifier is printed as it is, never
+  guessed.
+- **Media** recovered from the browser's cache and checked against each message's hash, with
+  `--fetch-media` for what the browser never cached.
+- **More than the browser holds.** `--history` asks the phone for messages older than the browser's
+  window; `--queue` records what WhatsApp's server is holding for the device without taking it.
+- **Chain of custody by default.** Every file read, every decryption and every output is recorded,
+  with SHA-256 hashes, in a SQLite case database beside the export.
+- **One conversation only**, when that is all an examination covers (`--chat`).
+
+The profile is only read, never written. The phone is not modified.
+
+## Quick start
+
+```powershell
+wawf <PROFILE> --out D:\case\out              # capture the key (signs in once), decrypt everything
+wawf <PROFILE> --offline --out D:\case\out    # never go online: everything except message text
+wawf <PROFILE> --key companion_enc_static.txt --out D:\case\out   # decrypt offline with a saved key
+wawf                                          # no arguments: open the window
+```
+
+`<PROFILE>` is the browser profile folder, for example
+`%LOCALAPPDATA%\Microsoft\Edge\User Data\Default`; `wawf -h` lists the locations on your machine.
+
+## Contents
+
+- [Get it](#get-it) · [Use](#use) · [Output formats](#choosing-the-output----out-formatpath) ·
+  [Options](#options) · [One conversation only](#one-conversation-only----chat)
+- [What a browser holds](#what-a-browser-holds--and-what-it-does-not) ·
+  [Chain of custody](#chain-of-custody-on-by-default) · [Where the key comes from](#where-the-key-comes-from)
+- [Recording the server queue](#recording-what-the-server-is-holding----queue) ·
+  [Recovering older history](#recovering-history-older-than-the-cache) · [Known issues](#known-issues) ·
+  [License](#license)
 
 ## Get it
 
@@ -68,6 +128,11 @@ to get the key. Everything else the command line offers is under *Advanced optio
 the exact command it will run, live, with a **Copy** button: every run from the window is an ordinary
 command-line run, with the same audit trail, and can be repeated from a terminal or quoted in a report.
 
+<p align="center">
+  <img src="docs/screenshots/run.png" width="680" alt="The wawf window after a run: the command it ran, the run's log and its summary">
+  <br><sub>After a run: the command line it ran, and its log. (All names, numbers and paths in these screenshots are made up.)</sub>
+</p>
+
 ### Acquiring the profile
 
 Close the browser completely first (on Windows also Edge's *Startup boost* / Chrome's *Continue running
@@ -115,7 +180,7 @@ LevelDB keeps a `LOG` whose lines carry the absolute path it was opened at, so:
 profile: Microsoft Edge 154.0.4258.62, originally C:\Users\<user>\AppData\Local\Microsoft\Edge\User Data\Profile 8, labelled 'Profile 9' in the browser
 ```
 
-The label and the folder name are different things (the example is a real pair). Stores passed with
+The label and the folder name are different things. Stores passed with
 `--idb`/`--local-storage` are traced the same way, from their own `LOG` files.
 
 ### Choosing the output — `--out [FORMAT:]PATH`
@@ -241,7 +306,7 @@ decryption:
 Because `raw` is an image of the store, it keeps **every** record the store holds, including
 superseded versions of the same message — the browser's IndexedDB retains them and they are evidence
 of edits and re-deliveries. The derived formats are per *message*, so they drop records that are
-byte-for-byte identical to one already taken (25 ids, 37 records in the reference profile) and keep
+byte-for-byte identical to one already taken (a few dozen in a typical profile) and keep
 any version that actually differs. So `raw` legitimately shows a few more records than `chats.json`
 has rows; the difference is duplicates, not content.
 
@@ -739,3 +804,7 @@ gone server-side.
   session with the phone (after the phone asks for a request again), it uses the signed prekey from
   the phone's key bundle without verifying that key's signature. The bundle comes from WhatsApp's
   server over the authenticated connection; libsignal (the Node engine) does verify it.
+
+## License
+
+Apache License 2.0; see [LICENSE](LICENSE).
