@@ -43,7 +43,7 @@ history_chunks/
 *_recovered.json
 onehistory_recovered.json
 
-# Akhil Dara's WAInsight is a SEPARATE MIT repo — do NOT bundle it
+# WAInsight is a SEPARATE MIT repo — do NOT bundle it
 WAInsight/
 wainsight_case/
 storage_export/

@@ -110,9 +110,9 @@ check("...and says so rather than guessing", noone["sender_name"], "(unknown)")
 # missing, or is one the profile cannot name, that is the only identification there is -- and it
 # beats printing "(unknown)" or a bare number.
 named = hist_row({"chat": "120300000009@g.us", "id": "S5", "fromMe": False, "participant": None,
-                  "pushName": "Dev", "ts": 1760000005, "text": "hi", "type": "conversation"},
+                  "pushName": "Kai", "ts": 1760000005, "text": "hi", "type": "conversation"},
                  IDS, ts(1760000005))
-check("a nameless sender is labelled by the name they gave", named["sender_name"], "Dev")
+check("a nameless sender is labelled by the name they gave", named["sender_name"], "Kai")
 check("...with the provenance of that name", named["sender_source"], "history-pushname")
 check("...and no jid is invented for them", named["sender"], None)
 

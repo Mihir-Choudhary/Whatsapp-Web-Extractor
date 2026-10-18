@@ -11,7 +11,7 @@ Works on BOTH Firefox (--origin) and Chromium (--profile: Chrome/Edge/Brave/Oper
 (Firefox additionally decrypts on-disk cached media into Media/; on Chromium the media keys + metadata
 are exported to message_media but the browser cache isn't decoded — recover media separately.)
 
-(The Android schema is also ingestable by third-party suites such as akhil-dara/WAInsight.)
+(The Android schema is also ingestable by third-party suites such as WAInsight.)
 """
 import sys as _sys
 def _force_utf8_stdio():
