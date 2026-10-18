@@ -227,6 +227,76 @@ for f in (sp, ledger):
     if os.path.exists(f): os.remove(f)
 
 print()
+print("a record holding only a delivery receipt is not a message on disk")
+# Both history clients keep only what the phone serves that is NOT on disk: a receipt counted as on
+# disk made them discard the phone's copy of the very message the store was missing.
+import io, contextlib
+build_anchors._iter_messages = lambda profile, origin: iter([
+    {"id": "false_120300000009@g.us_MSG1", "t": 1_760_000_000, "type": "chat"},
+    {"id": "false_120300000009@g.us_RCPT1", "ack": 3}])
+build_anchors._history_jid_map = lambda profile, origin: ({}, {})
+outp = os.path.join(tempfile.mkdtemp(), "anchors.json")
+sys.argv = ["build_anchors.py", "--profile", "X", "--out", outp]
+with contextlib.redirect_stdout(io.StringIO()):
+    build_anchors.main()
+a = json.load(open(outp, encoding="utf-8"))
+check("the receipt's id is not on disk, so the phone's copy of it is kept", a["ondisk_ids"], ["MSG1"])
+check("...and it anchors no request", [x["oldest_id"] for x in a["anchors"]], ["MSG1"])
+
+print()
+print("the history run around the anchors: what it says when nothing was asked, and media for its export")
+# cmd_history with everything that reads the profile or the network replaced (fictional 555 account).
+# A client exit of 2 or 5 means it stopped BEFORE asking -- that used to be reported as the phone's
+# silence -- and --fetch-media used to run only after a pass had recovered something.
+import logging, types
+_st = {}
+def _creds(a, path):
+    json.dump({"user": "15555550100", "device": 45, "account": {"details": ""}}, open(path, "w")); return True
+def _sub(script, extra):
+    out = extra[extra.index("--out") + 1] if "--out" in extra else None
+    if script == "export_signal_state.py": json.dump({"registrationId": 1}, open(out, "w"))
+    if script == "build_anchors.py":
+        json.dump({"anchors": [{"chat": "15555550111@s.whatsapp.net", "chat_id": "15555550111@s.whatsapp.net",
+                                "oldest_id": "X", "oldest_ts": 1_700_000_000, "more_on_primary": True}],
+                   "ondisk_ids": []}, open(out, "w"))
+    if script == "mediafetch.py": _st["fetched"] += 1
+    return 0
+def _client(cmd, cwd=None, env=None, **k):       # the history client: an empty pass, then its exit code
+    json.dump({"messages": [], "answered_chats": [], "silent_chats": []},
+              open(os.path.join(cwd, "history_recovered.json"), "w"))
+    return types.SimpleNamespace(returncode=_st["rc"])
+def _export(a, targets, history_file=None):      # writes an (empty) database where the export goes
+    for fmt, p in targets:
+        if fmt == "sqlite": os.makedirs(p, exist_ok=True); open(os.path.join(p, "msgstore.db"), "a").close()
+    a._exported = True
+    return 0
+_saved = {k: getattr(wawf, k) for k in ("_creds_ok", "_sub", "_history_export", "_require_source", "_is_chromium",
+                                         "subprocess", "_history_base")}
+wawf._creds_ok, wawf._sub, wawf._history_export = _creds, _sub, _export
+wawf._require_source = lambda a, cmd="": None; wawf._is_chromium = lambda p: True
+wawf.subprocess = types.SimpleNamespace(run=_client)
+_said = []
+class _Keep(logging.Handler):
+    def emit(self, r): _said.append(r.getMessage())
+_h = _Keep(); logging.getLogger().addHandler(_h)
+def _history(rc):
+    home = tempfile.mkdtemp(); wawf._history_base = lambda: home
+    _st.update(rc=rc, fetched=0); _said.clear()
+    a = types.SimpleNamespace(profile="P", origin=None, out=["sqlite:" + os.path.join(home, "db")],
+                              browser_running=False, history_refetch=False, yes=False, install_node=False,
+                              fetch_media=True, verbose=False)
+    return wawf.cmd_history(a)
+rc = _history(2)
+check("a client that stopped before asking: the run says so and fails, never blaming the phone",
+      (rc, any("NOTHING WAS ASKED" in m for m in _said), any("phone's replies were missing" in m for m in _said)),
+      (1, True, False))
+check("...and --fetch-media still runs on the export it wrote", _st["fetched"], 1)
+rc = _history(0)
+check("a phone that answered nothing: --fetch-media runs on the export all the same", (rc, _st["fetched"]), (1, 1))
+logging.getLogger().removeHandler(_h)
+for k, v in _saved.items(): setattr(wawf, k, v)
+
+print()
 if fails:
     print(f"FAILED ({len(fails)}): " + ", ".join(fails))
     sys.exit(1)

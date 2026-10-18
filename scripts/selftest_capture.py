@@ -248,6 +248,64 @@ else:
         acks = {n["attrs"]["id"] for n in c.sent if n["tag"] == "ack"}
         check("both group stanzas acknowledged (fully decrypted, ack=saved)", {"G1", "G2"} <= acks)
 
+print("\nsending to the account's phone when the session has to be started (prekey message)")
+import wa_reconnect as WR
+ACCOUNT = {"details": base64.b64encode(b"details-bytes").decode(),
+           "accountSignatureKey": base64.b64encode(b"\x05" + b"k" * 32).decode(),
+           "accountSignature": base64.b64encode(b"s" * 64).decode(),
+           "deviceSignature": base64.b64encode(b"d" * 64).decode()}   # as cmd_creds writes creds_in.json
+c, me, _b = client("none", name="pkmsg")
+c.creds["account"] = ACCOUNT
+phone, phone_bundle = party(4242)
+S.SessionBuilder(me, "99990000000.0").init_outgoing(phone_bundle)    # a new session: its first message is a pkmsg
+try:
+    c.send_peer("99990000000@lid", b"\x0a\x01x")
+    sent = c.sent[-1]
+    kinds = [(x["tag"], (x.get("attrs") or {}).get("type")) for x in sent["content"]]
+    ident = next((x["content"] for x in sent["content"] if x["tag"] == "device-identity"), None)
+    got = WR._pb_read(ident) if ident else {}
+    check("a prekey message is sent with the device's identity", ("enc", "pkmsg") in kinds and ident is not None)
+    check("the identity is the signed device identity protobuf (details, key, account and device signatures)",
+          [got.get(i, [None])[0] for i in (1, 2, 3, 4)] ==
+          [base64.b64decode(ACCOUNT[k]) for k in ("details", "accountSignatureKey", "accountSignature", "deviceSignature")])
+except Exception as e:
+    check("a prekey message can be sent (%s: %s)" % (type(e).__name__, e), False)
+
+print("\nstarting a session with the phone before the first request (ensure_session)")
+# The reader thread decrypts under the crypto lock; ensure_session must read and change the same state
+# under it too, but fetch the bundle OUTSIDE it -- the bundle's reply is delivered by the reader thread.
+c, me, _b = client("none", name="ensure")
+phone, phone_bundle = party(4343)
+seen = {"load_locked": [], "fetch_locked": None, "fetches": 0}
+_load = me.load_session
+def _spy_load(addr):
+    seen["load_locked"].append(c._crypto_lock._is_owned()); return _load(addr)
+me.load_session = _spy_load
+def _spy_fetch(jid):
+    seen["fetches"] += 1; seen["fetch_locked"] = c._crypto_lock._is_owned(); return phone_bundle
+c.fetch_prekey_bundle = _spy_fetch
+OWN = "99990000000@lid"
+started = c.ensure_session(OWN)
+rec = _load(WC._addr(OWN))
+check("no session yet: one is started from the phone's prekey bundle",
+      started is True and rec is not None and rec.get_open_session().registrationId == 4343)
+check("the Signal state is read and changed under the crypto lock",
+      bool(seen["load_locked"]) and all(seen["load_locked"]))
+check("...and the bundle is fetched outside it (the reader thread delivers the reply)", seen["fetch_locked"] is False)
+check("a session already open: nothing is fetched, nothing replaced",
+      c.ensure_session(OWN) is False and seen["fetches"] == 1)
+# the phone opens a session itself while the bundle is on its way: that one is kept, not replaced
+c2, me2, _b2 = client("none", name="ensure2")
+def _phone_starts_meanwhile(jid):
+    S.SessionBuilder(me2, WC._addr(jid)).init_outgoing(party(4444)[1])   # what the reader thread did meanwhile
+    return phone_bundle
+c2.fetch_prekey_bundle = _phone_starts_meanwhile
+kept = c2.ensure_session(OWN)
+rec2 = me2.load_session(WC._addr(OWN))
+check("a session the device started meanwhile is kept, not replaced",
+      kept is False and rec2.get_open_session().registrationId == 4444
+      and not any(s.registrationId == 4343 for s in rec2.sessions.values()))
+
 for c in CLIENTS: c._journal.close()
 shutil.rmtree(tmp, ignore_errors=True)
 print()

@@ -1,6 +1,10 @@
-import sqlite3, sys, json
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from idbutil import connect_ro
 db = sys.argv[1]
-con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+# connect_ro, not a plain mode=ro open: on a WAL database that one creates -shm and -wal files
+# beside the evidence (and it read nothing still in the log)
+con = connect_ro(db)
 KEYS = ["last-wid-md","WALid","WANoiseInfo","WANoiseInfoIv","WAWebEncKeySalt","WebEncKeySalt",
         "Session","CanonicalRegistrationTraceId","WACachedProfilePicEURL","WADailyStatsStartTime",
         "WALangPhonePref","banzai:last_storage_flush","calls_tab_last_seen","selected_audio_input_device",

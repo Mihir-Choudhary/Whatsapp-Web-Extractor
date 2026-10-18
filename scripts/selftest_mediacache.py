@@ -45,10 +45,13 @@ def build(tmp):
 
 def main():
     tmp = tempfile.mkdtemp(prefix="wawf_mediacache_selftest_")
+    # in a folder named like a real case folder: a '[' there is a glob character class, and the scan
+    # used to find nothing at all under it
+    root = os.path.join(tmp, "Case #12 [m] 100%")
     try:
-        bodies = build(tmp)
+        bodies = build(root)
         want = {base64.b64encode(hashlib.sha256(b).digest()).decode(): n for n, b in bodies.items()}
-        found, st = mc.recover(want.keys(), tmp)
+        found, st = mc.recover(want.keys(), root)
         print(f"scanned {st['files']} file(s) under {st['roots']} root(s), "
               f"{st['bodies']} candidate body/bodies")
         print("matched by source:", st["by_source"] or "{}")

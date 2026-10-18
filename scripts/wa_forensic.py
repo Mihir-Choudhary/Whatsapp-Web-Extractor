@@ -5,10 +5,10 @@
 #   KNOWN : python3 wa_forensic.py --enc-static <base64>  (you already have the salt)
 # It asks for authorization, finds companion_enc_static by validating candidates against real
 # ciphertext, then decrypts every message body and exports them.
-import sqlite3, sys, os, re, base64, glob, argparse, struct, hashlib
+import sys, os, re, base64, glob, argparse, struct, hashlib
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 from snappy_pure import uncompress
-from idbutil import store_id
+from idbutil import store_id, connect_ro
 import sclone
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
@@ -33,10 +33,10 @@ def find_profile():
 class Vault:
     def __init__(self, origin):
         self.origin = origin
-        ro = lambda p: sqlite3.connect(f'file:{p}?mode=ro&immutable=1', uri=True)   # safe on live/locked profile
+        ro = connect_ro   # safe on live/locked profile
         self.ls   = ro(f'{origin}/ls/data.sqlite')
         def _idb(name):
-            m = glob.glob(f'{origin}/idb/*{name}*.sqlite')
+            m = glob.glob(f'{glob.escape(origin)}/idb/*{name}*.sqlite')
             if not m: raise SystemExit(f"IndexedDB *{name}* not found in {origin}")
             return ro(m[0])
         self.idb = _idb

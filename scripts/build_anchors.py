@@ -9,24 +9,34 @@ disk can be filtered out). Works on Firefox (--origin) and Chromium (--profile).
 """
 import sys, os, json, glob, argparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from wa_decrypt import receipt_only as _receipt_only
+
+
+def _chromium(profile):
+    """A Chromium source, by chromium_reader's one definition: a legacy IndexedDB folder, the WebStorage
+    layout newer builds use, or stores given on their own (--idb/--local-storage). Testing for an
+    `IndexedDB` folder alone sent the last two down the Firefox path, which then exited asking for
+    --origin -- so --history stopped at its third step for them."""
+    if not profile: return False
+    import chromium_reader as cr
+    return cr.is_chromium_profile(profile)
 
 
 def _iter_messages(profile, origin):
     """Yield WhatsApp message objects (dicts) from either engine."""
-    if profile and os.path.isdir(os.path.join(profile, 'IndexedDB')):
+    if _chromium(profile):
         import chromium_reader as cr
         for o in cr.load_source(profile)['idb'].get('model-storage', {}).get('message', []):
             if isinstance(o, dict): yield o
     else:
-        import sqlite3
         from snappy_pure import uncompress
-        from idbutil import store_id
+        from idbutil import store_id, connect_ro
         import sclone
         if not origin or not os.path.isdir(origin):
             sys.exit('ERROR: pass --profile <Chromium dir> or --origin <Firefox storage dir>')
-        mm = glob.glob(f'{origin}/idb/*meogdaerlo*.sqlite')
+        mm = glob.glob(f'{glob.escape(origin)}/idb/*meogdaerlo*.sqlite')
         if not mm: sys.exit(f'ERROR: message-store IndexedDB (*meogdaerlo*.sqlite) not found under {origin}')
-        con = sqlite3.connect(f'file:{mm[0]}?mode=ro&immutable=1', uri=True)
+        con = connect_ro(mm[0])
         sid = store_id(con, 'message')
         if sid is None: sys.exit("ERROR: 'message' store not found in Firefox model-storage")
         for (row,) in con.execute("SELECT data FROM object_data WHERE object_store_id=?", (sid,)):
@@ -38,18 +48,17 @@ def _iter_messages(profile, origin):
 
 def _iter_chats(profile, origin):
     """Yield WhatsApp chat records (dicts) from either engine."""
-    if profile and os.path.isdir(os.path.join(profile, 'IndexedDB')):
+    if _chromium(profile):
         import chromium_reader as cr
         for o in cr.load_source(profile)['idb'].get('model-storage', {}).get('chat', []):
             if isinstance(o, dict): yield o
     else:
-        import sqlite3
         from snappy_pure import uncompress
-        from idbutil import store_id
+        from idbutil import store_id, connect_ro
         import sclone
-        mm = glob.glob(f'{origin}/idb/*meogdaerlo*.sqlite') if origin else []
+        mm = glob.glob(f'{glob.escape(origin)}/idb/*meogdaerlo*.sqlite') if origin else []
         if not mm: return
-        con = sqlite3.connect(f'file:{mm[0]}?mode=ro&immutable=1', uri=True)
+        con = connect_ro(mm[0])
         sid = store_id(con, 'chat')
         if sid is None: return
         for (row,) in con.execute("SELECT data FROM object_data WHERE object_store_id=?", (sid,)):
@@ -137,6 +146,9 @@ def main():
         parts = idv.split('_')
         if len(parts) < 3: continue
         from_me, chat, keyid = parts[0] == 'true', parts[1], parts[2]
+        # A record holding only a delivery receipt is not the message (wa_decrypt.receipt_only). Counted
+        # as on disk, it made both history clients throw away the copy the phone served for it.
+        if _receipt_only(o): continue
         ondisk.add(keyid); cnt[chat] = cnt.get(chat, 0) + 1
         # @c.us belongs here too: it is the phone form WhatsApp Web uses for history, and leaving it
         # out silently dropped those chats from the anchor list entirely.

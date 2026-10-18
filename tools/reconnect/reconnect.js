@@ -61,7 +61,8 @@ const findFile = (name, override) => {
     if (node.attrs) for (const k in node.attrs) {
       if (/companion_enc_static|companion_enc|enc_static/i.test(k)) {
         captured = node.attrs[k];
-        console.log('CAPTURED ' + k + ' = ' + captured);
+        // the key goes to companion_enc_static.txt only: a console line ends up in scrollback and logs
+        console.error('CAPTURED ' + k + ' (' + String(captured).length + ' characters; written to companion_enc_static.txt, never printed)');
       }
     }
     if (Array.isArray(node.content)) node.content.forEach(c => scan(c, depth+1));

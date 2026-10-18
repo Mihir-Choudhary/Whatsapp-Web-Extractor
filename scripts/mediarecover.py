@@ -4,10 +4,10 @@ cached media blobs with the plaintext mediaKey stored on disk and verify each ag
 
   python3 scripts/mediarecover.py [<origin dir>] [<out dir>]
 """
-import sqlite3, sys, os, base64, hashlib, glob, collections
+import sys, os, base64, hashlib, glob, collections
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from snappy_pure import uncompress as unc_row
-from idbutil import store_id
+from idbutil import store_id, connect_ro
 import sclone
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
@@ -30,9 +30,9 @@ def unframe(data):
         elif t==0x01: out+=ch[4:]
     return bytes(out)
 
-_mm = glob.glob(O + '/idb/*meogdaerlo*.sqlite')      # per-profile numeric prefix; never hardcode it
+_mm = glob.glob(glob.escape(O) + '/idb/*meogdaerlo*.sqlite')      # per-profile numeric prefix; never hardcode it
 if not _mm: sys.exit(f"message-store IndexedDB (*meogdaerlo*) not found under {O}")
-conm = sqlite3.connect(f'file:{_mm[0]}?mode=ro&immutable=1', uri=True)
+conm = connect_ro(_mm[0])
 _msid = store_id(conm, 'message')                    # by NAME (per-profile), not a hardcoded id
 if _msid is None: sys.exit("message store not found in model-storage")
 byench={}
@@ -56,7 +56,7 @@ def dec_media(blob,mk,mt):
 C = os.path.join(O, 'cache/morgue')                  # media cache lives under the origin dir
 os.makedirs(OUT, exist_ok=True)
 ok=0; scanned=0; bytype=collections.Counter()
-for f in glob.glob(C+"/*/*.final"):
+for f in glob.glob(glob.escape(C)+"/*/*.final"):
     scanned+=1
     try: body=unframe(open(f,'rb').read())
     except Exception: continue

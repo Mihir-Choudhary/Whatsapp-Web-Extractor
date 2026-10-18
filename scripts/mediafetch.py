@@ -103,6 +103,8 @@ def main():
     ap.add_argument("--ignore-expiry", action="store_true",
                     help="try the CDN even when the url signature (oe=) has already expired")
     a = ap.parse_args()
+    import audit                       # the case database of the run that started this (no-op otherwise)
+    A = audit.from_env("mediafetch")
 
     out = a.out or os.path.join(os.path.dirname(os.path.abspath(a.db)), "Media", "WhatsApp Web")
     os.makedirs(out, exist_ok=True)
@@ -112,8 +114,20 @@ def main():
                          WHERE media_key IS NOT NULL AND file_hash IS NOT NULL""").fetchall()
     print(f"[i] {len(rows)} media message(s) with a mediaKey in {a.db}")
     if not rows:
-        print("[!] nothing to do — the export has no media rows with keys"); return 0
+        print("[!] nothing to do — the export has no media rows with keys")
+        A.end_run(0, status="ok"); return 0
 
+    # A file the export already holds is not fetched again. The SQLite export recovers what the browser
+    # cached -- most of it cached ALREADY DECRYPTED, which this script's cache scan (encrypted blobs) does
+    # not see -- so those were reported as "no cached blob" and, with --cdn, downloaded a second time.
+    dbdir = os.path.dirname(os.path.abspath(a.db))
+    have = {mid for mid, fp_ in db.execute("SELECT message_row_id, file_path FROM message_media "
+                                           "WHERE file_path IS NOT NULL AND file_path <> ''")
+            if os.path.isfile(os.path.join(dbdir, fp_))}
+    already = sum(1 for r in rows if r[0] in have)
+    rows = [r for r in rows if r[0] not in have]
+    if already:
+        print(f"[i] {already} of them already have their file in this export; not fetched again")
     by_ench = {}
     for r in rows:
         if r[3]:
@@ -180,8 +194,17 @@ def main():
         rel = f"Media/WhatsApp Web/{name}"              # the path shape WAInsight/Android expect
         with open(os.path.join(out, name), "wb") as f:
             f.write(pt)
+        # each file in the chain of custody, with where it came from: a download from WhatsApp's
+        # servers is a network acquisition and has to be on the record like any other
+        A.artifact(os.path.join(out, name), kind="media file (%s, verified against the message's sha256)"
+                   % ("downloaded from WhatsApp's CDN" if src == "cdn" else "the browser's cache"),
+                   detail={"message_row_id": rid, "mime": mime})
         updates.append((rel, rid)); ok += 1
 
+    if a.cdn:
+        A.net("out", endpoint=CDN_HOST, protocol="https", kind="media download",
+              status="%d download(s) attempted; %d file(s) written, cache and CDN" % (dl, len(updates)), nbytes=dl_bytes,
+              detail={"skipped_expired_signature": expired, "refused": {str(k): v for k, v in gone.items()}})
     if updates and not a.no_update_db:
         db.executemany("UPDATE message_media SET file_path=? WHERE message_row_id=?", updates)
         db.commit()
@@ -210,6 +233,7 @@ def main():
     if failed:  print(f"[!] {failed} blob(s) found but failed verification (not written)")
     if nocache: print(f"[i] {nocache} media message(s) had no cached blob"
                       + ("" if a.cdn else " — re-run with --cdn to download them"))
+    A.end_run(0, status="ok")
     return 0
 
 if __name__ == "__main__":

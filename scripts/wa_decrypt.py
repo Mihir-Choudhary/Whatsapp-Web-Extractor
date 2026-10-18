@@ -14,12 +14,12 @@ bodies + exports readable transcripts. Same capability for both engines; only th
 Without --enc-static it still reports the offline inventory + recovers/verifies the Noise key.
 """
 from __future__ import annotations
-import argparse, os, sys, json, base64, glob, sqlite3, collections, datetime as dt, re, logging
+import argparse, os, sys, json, base64, glob, collections, datetime as dt, re, logging
 import unicodedata                 # text filter: symbol/punctuation categories
 log = logging.getLogger("wawf.decrypt")  # inherits wawf's handlers when imported; quiet standalone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from snappy_pure import uncompress
-from idbutil import store_id
+from idbutil import store_id, connect_ro
 import sclone
 import wa_opaque
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -131,6 +131,15 @@ def leaves(buf, depth=0, out=None):
     return out
 
 # ---------------- normalized source loaders ----------------
+def receipt_only(o):
+    """A message-store record that holds no message: no time, no type and no body, only an id and its
+    delivery state (`ack`, sometimes `pendingReadReceipt`). WhatsApp Web keeps one when a receipt
+    arrives for a message it does not hold -- 31 of 51,577 records in one Firefox store. It is
+    exported as what it is (`body_status: receipt-only`; a table of its own in msgstore.db). As a
+    message of no time and no type, msgstore.db showed it as an empty text message dated 1970, and its
+    id counted as already on disk, so a full copy the phone served for it was discarded."""
+    return isinstance(o, dict) and not o.get("t") and not o.get("type") and not o.get("msgRowOpaqueData")
+
 def _norm_msg(o):
     """Web message dict -> normalized fields the decryptor needs."""
     idv = o.get("id") or ""; parts = idv.split("_")
@@ -144,7 +153,7 @@ def _norm_msg(o):
             "filename": as_str(o.get("filename")),
             "view_once": bool(o.get("isViewOnce")),
             "ack": o.get("ack") if isinstance(o.get("ack"), int) else None,
-            "call": _call_details(o)}
+            "call": _call_details(o), "receipt_only": receipt_only(o)}
 
 def _call_details(o):
     """A call log entry's outcome, length and kind, as WhatsApp Web recorded them; None for anything
@@ -504,7 +513,7 @@ def _primary_text(buf):
     property: the text of a text message, but for image / video / sticker messages the BASE64 JPEG
     THUMBNAIL ("/9j/4AAQ..."). `leaves()` guards against such blobs with a 12+ digit / 40+ base64 /
     90%-text test, and applied to a text message's own body those guards deleted real messages: a
-    number someone sent ("1234567812345678", "919876543210"), a pasted hash, and -- with
+    number someone sent ("1234567812345678", "155555501234"), a pasted hash, and -- with
     _newer_than_tables -- anything containing a new emoji. So: take field 1 verbatim unless it is an
     encoded image, which is decided by decoding it, not by its shape.
     (A first version also read field 6 as extendedTextMessage; this is not the Message schema, so
@@ -793,9 +802,10 @@ def bodyless_row(m, when, ids, status):
     from chats.json and the transcript while msgstore.db -- which writes every message -- kept it.
     Measured: a message deleted by its sender ("revoked", body cleared) was in msgstore.db and in
     neither of the other two formats. A deletion marker is evidence. `status` says why there is no
-    text: "none" (no body was stored), "other-scheme" (a body this key does not open), "failed"."""
+    text: "none" (no body was stored), "other-scheme" (a body this key does not open), "failed" --
+    and "receipt-only" whatever the caller says, for a record that is no message (see receipt_only)."""
     row = msg_row(m, when, b"", ids)
-    row["body_status"] = status
+    row["body_status"] = "receipt-only" if m.get("receipt_only") else status
     return row
 
 def merge_history(chats, recovered, ids, ts):
@@ -807,9 +817,16 @@ def merge_history(chats, recovered, ids, ts):
     the store has `@lid` -- so it is mapped through the identity before being filed, or the same
     conversation would split into two chats in the output.
 
+    A receipt-only row is not the message (see receipt_only): when the phone serves that message, its
+    copy is added and the receipt row it stood in for is removed.
+
     Returns (added, skipped_already_present, chats_touched).
     """
-    have = {stanza_of(m.get("id")) for ml in chats.values() for m in ml}
+    have, stubs = set(), {}
+    for c, ml in chats.items():
+        for m in ml:
+            if m.get("body_status") == "receipt-only": stubs[stanza_of(m.get("id"))] = (c, m)
+            else: have.add(stanza_of(m.get("id")))
     bykey = {}                                  # identity key of a chat -> the key the store used
     for c in chats:
         bykey.setdefault(ids.key(c), c)
@@ -826,8 +843,13 @@ def merge_history(chats, recovered, ids, ts):
         raw = canon_jid(r.get("chat"))
         key = bykey.get(ids.key(raw)) or bykey.get(raw) or raw
         chats.setdefault(key, []).append(hist_row(r, ids, ts(r.get("ts")), chat_key=key))
+        if sid in stubs:                        # the message itself, where the store held its receipt
+            c0, m0 = stubs.pop(sid)
+            chats[c0].remove(m0); touched.add(c0)
         have.add(sid); added += 1; touched.add(key)
-    for c in touched:
+    for c in list(touched):
+        if not chats.get(c):                    # held nothing but a receipt the phone's copy replaced
+            chats.pop(c, None); touched.discard(c); continue
         chats[c].sort(key=lambda x: x["t"])
     return added, skipped, touched
 
@@ -857,25 +879,37 @@ CONTACT_COLUMNS = (("jid", "id"), ("phone_number", "phoneNumber"), ("name", "nam
                    ("about_updated", "textStatusLastUpdateTime"), ("in_address_book", "isAddressBookContact"),
                    ("type", "type"), ("display_name_lid", "displayNameLID"))
 
-def write_contacts_csv(path, ids):
+def write_contacts_csv(path, ids, only=None):
     """contacts.csv -- the `contact` store, one row per stored record, as stored. WhatsApp keeps a
-    person under both their lid and their phone jid; `phone_number` on the lid row links the two."""
+    person under both their lid and their phone jid; `phone_number` on the lid row links the two.
+    `only`: identity keys (Identities.key) to keep -- an export scoped to some chats lists the people
+    in those chats, not the whole address book."""
     import csv
     def v(x):
         if x is None or type(x).__name__ == "_Undefined": return ""
         if isinstance(x, bool): return "yes" if x else "no"
-        return as_str(x) if not isinstance(x, (int, float)) else x
+        if isinstance(x, (int, float)): return x
+        s = as_str(x)
+        # A spreadsheet runs a cell that starts like a formula, and these values are typed by the contacts
+        # themselves (pushname, about): `=HYPERLINK(...)` in a pushname would run on the examiner's machine,
+        # and a name like "-Raj-" showed as #NAME?. Such a cell gets a leading apostrophe, which a
+        # spreadsheet shows as text; identities.json and wa.db keep every value exactly as stored.
+        return "'" + s if s and s[0] in "=+-@\t\r" else s
     seen = set()
     with open(path, "w", encoding="utf-8-sig", newline="") as f:      # BOM: Excel opens it as UTF-8
         w = csv.writer(f)
         w.writerow([c for c, _ in CONTACT_COLUMNS])
         n = 0
         for o in ids.contact_records:
+            if only is not None and ids.key(as_str(o.get("id")) or "") not in only: continue
             row = [v(o.get(src)) for _, src in CONTACT_COLUMNS]
             k = tuple(row)
             if k in seen: continue                 # superseded copies of an identical record
             seen.add(k); w.writerow(row); n += 1
     return n
+
+NO_TIME = "time not recorded"
+RECEIPT_ONLY_LINE = "(receipt only: the message itself is not in the store)"
 
 def write_transcripts(path, chats, ids):
     """transcripts.txt -- the artifact people actually read. Every line names its sender, and each
@@ -889,7 +923,9 @@ def write_transcripts(path, chats, ids):
                 "# A message that spans lines is continued under '|', and 're:' is the message being\n"
                 "# replied to -- quoted by the client, written by whoever is named on that line.\n"
                 "# '(image)', '(sticker)', '(revoked)' and the like are messages with no text of\n"
-                "# their own, shown as the type the store recorded.\n")
+                "# their own, shown as the type the store recorded. '[%s]' with '%s'\n"
+                "# is a delivery receipt the store kept for a message it does not hold.\n"
+                % (NO_TIME, RECEIPT_ONLY_LINE))
         for c, ml in sorted(chats.items(), key=lambda kv: -len(kv[1])):
             tm = [m for m in ml if m["text"]]
             if not ml: continue
@@ -924,13 +960,14 @@ def write_transcripts(path, chats, ids):
                 # recorded, not a guess at content.
                 body = m["text"] or ("(view-once %s: content only on the phones)" % (m.get("type") or "media")
                                      if m.get("view_once") else _call_line(m.get("call")) if m.get("call")
+                                     else RECEIPT_ONLY_LINE if m.get("body_status") == "receipt-only"
                                      else "(%s)" % (m.get("type") or "unknown"))
                 # 3.7% of messages contain newlines, and writing them raw broke the one-line-per-
                 # message structure this file promises: 2,394 continuation lines carried no
                 # timestamp and no sender, and 29 of them began with '#', which is what this file
                 # uses for its own header. Continuations are now indented under a '|' so every line
                 # is attributable and no message content can be mistaken for structure.
-                head = "[%s] %s %22s: " % (m["t"], "->" if m["dir"] == "me" else "<-",
+                head = "[%s] %s %22s: " % (m["t"] or NO_TIME, "->" if m["dir"] == "me" else "<-",
                                            disp.get(ids.key(m["sender"]) if m.get("sender") else "")
                                            or _oneline(m.get("sender_name") or m["dir"], _LABEL_MAX))
                 cont = " " * (len(head) - 2) + "| "
@@ -952,7 +989,7 @@ def load_firefox(origin):
     ls = {}
     lsp = os.path.join(origin, "ls/data.sqlite")
     if os.path.exists(lsp):
-        c = sqlite3.connect(f"file:{lsp}?mode=ro&immutable=1", uri=True)
+        c = connect_ro(lsp)
         for k, v, comp in c.execute("SELECT key,value,compression_type FROM data"):
             if comp:
                 try: v = uncompress(v if isinstance(v, (bytes, bytearray)) else v.encode("latin-1"))
@@ -961,8 +998,8 @@ def load_firefox(origin):
         c.close()
     # root key from wawc_db_enc (marker extraction)
     root = None
-    for sq in glob.glob(origin + "/idb/*wcanwec__bd*.sqlite"):
-        conn = sqlite3.connect(f"file:{sq}?mode=ro&immutable=1", uri=True)
+    for sq in glob.glob(glob.escape(origin) + "/idb/*wcanwec__bd*.sqlite"):
+        conn = connect_ro(sq)
         kid = store_id(conn, "keys")                                  # by NAME; store ids are per-profile
         row = conn.execute("SELECT data FROM object_data WHERE object_store_id=?", (kid,)).fetchone() if kid else None
         if not row: continue
@@ -976,8 +1013,8 @@ def load_firefox(origin):
     msgs = []
     meta = {"contact": 0, "group-metadata": 0, "chat": 0}
     stores = {}
-    for sq in glob.glob(origin + "/idb/*meogdaerlo*.sqlite"):
-        c = sqlite3.connect(f"file:{sq}?mode=ro&immutable=1", uri=True)
+    for sq in glob.glob(glob.escape(origin) + "/idb/*meogdaerlo*.sqlite"):
+        c = connect_ro(sq)
         sid = store_id(c, "message")
         if sid:
             skipped = 0

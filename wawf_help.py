@@ -57,6 +57,10 @@ TIPS = {
     "key_offline": "Never contact WhatsApp. Without a key everything except message text is exported "
                    "(chats, senders, times, types, media, reactions, polls, calls, contacts, groups).\n"
                    "Command line: --offline.",
+    "chat": "Export, and ask the phone about, these conversations only: a contact or group name, a phone "
+            "number with its country code, a lid or a jid; separate several with ;. A name that fits more "
+            "than one chat, or none, stops the run and lists the candidates.\nCommand line: --chat WHO "
+            "[--chat WHO ...].",
     # step 4
     "case_id": "Case or exhibit number, stored in the chain-of-custody database.\nCommand line: --case-id ID.",
     "examiner": "Who ran this; stored with the case and with each run.\nCommand line: --examiner NAME.",
@@ -98,8 +102,11 @@ STEPS = {
     "2": ("Save results to",
           "Where the results go and in which forms. Readable chats + JSON are for reading and scripting; the SQLite "
           "database follows the Android WhatsApp layout; the raw dump is the store itself plus its decryption.\n\n"
-          "Optional, online: download media the browser never cached, and recover history older than the "
-          "browser's ~90 days from the phone."),
+          "Optional, online: download media the browser never cached, recover history older than the "
+          "browser's ~90 days from the phone, and record what WhatsApp's server is holding for the device.\n\n"
+          "Only these chats: export (and ask the phone about) the named conversations only — a contact or group "
+          "name, a phone number with its country code, a lid or a jid, several separated by ;. A name that fits "
+          "more than one chat, or none, stops the run and lists the candidates."),
     "3": ("Message key",
           "WhatsApp Web encrypts message text with a key the server gives the browser at sign-in; the browser "
           "never writes that key to disk.\n\n"
@@ -143,7 +150,8 @@ WHAT A BROWSER HOLDS — AND WHAT IT DOES NOT
  • Media: keys for everything; the files only if cached, or downloaded while their links are valid.
 
 ONLINE OR NOT
- Nothing goes online unless you choose "Get it from WhatsApp", "download media" or "recover history".
+ Nothing goes online unless you choose "Get it from WhatsApp", "download media", "recover history" or
+ "record what WhatsApp's server is holding".
 
 KEY MATERIAL
  companion_enc_static.txt and creds_in.json (in the results folder), a raw dump with key material, and an

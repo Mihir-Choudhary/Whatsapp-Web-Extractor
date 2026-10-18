@@ -19,8 +19,9 @@ path writes transcripts.txt + chats.json; sqlite: writes an Android-style msgsto
 writes every object store verbatim with the bodies decrypted in place, changing nothing else. A
 Windows drive letter is never mistaken for a FORMAT.
 
-Two alternative actions replace the default job:
-  --history                     pull chat history OLDER than the browser cache from the phone (Node)
+Networked options that go further than the store:
+  --history                     pull chat history OLDER than the browser cache from the phone
+  --queue                       record what WhatsApp's server holds for the device
 
 Examples:
   wawf "C:\\Users\\<you>\\AppData\\Local\\Microsoft\\Edge\\User Data\\Default"
@@ -170,6 +171,9 @@ def _write_export_manifest(outdir, composition, counts, files):
         rec = {"tool": "wawf", "version": _wawf_version(), "created_utc": dt.datetime.now(dt.timezone.utc)
                .strftime("%Y-%m-%d %H:%M:%S"), "composition": composition, "counts": counts,
                "artifacts": sorted(f for f in files if os.path.isfile(os.path.join(outdir, f)))}
+        if os.environ.get("WAWF_CHAT_SCOPE"):           # an export of named chats only says so
+            rec["chat_scope"] = {"chats": json.loads(os.environ.get("WAWF_CHAT_SCOPE_LABELS") or "[]"),
+                                 "address_forms": json.loads(os.environ["WAWF_CHAT_SCOPE"])}
         tmp = os.path.join(outdir, EXPORT_MANIFEST + ".tmp")
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(rec, fh, ensure_ascii=False, indent=1)
@@ -595,6 +599,10 @@ def cmd_run(a):
         log.info("[3/3] decrypting to %d output(s) ...", len(outs))
         rc = _decrypt_all(key)
         if rc != 3:
+            # the key found beside the output opened the store: finish the run here, media included --
+            # returning straight away skipped --fetch-media on every re-run into the same folder
+            if rc == 0 and getattr(a, "fetch_media", False) and not getattr(a, "history_file", None):
+                _fetch_media(a, [path for fmt, path in outs if fmt == "sqlite"])
             return rc
         if getattr(a, "offline", False):
             # --offline promises no contact with WhatsApp, so the fresh key is not fetched: everything
@@ -1051,13 +1059,20 @@ def cmd_decrypt(a):
             v = float(v); v = v/1000 if v > 1e12 else v
             return dt.datetime.fromtimestamp(v, dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if 1e9 < v < 2e9 else ""
         except Exception: return ""
-    chats = collections.defaultdict(list); ok = fail = nobody = other = 0
+    chats = collections.defaultdict(list); ok = fail = nobody = other = receipts = 0
+    scope = _chat_scope()
+    import chat_scope as CSC
+    if scope:
+        msgs = [m for m in msgs if CSC.in_scope(m.get("chat"), scope)]
+        log.info("--chat: exporting %d message(s) from the chosen chat(s) only", len(msgs))
     for m in msgs:
         # Every message is written. One without a decryptable body used to be skipped here, so it was
         # missing from chats.json and the transcript while msgstore.db kept it (a sender-deleted
         # message, measured). It is now a row with no text and a body_status saying why.
         if not m["data"]:
-            nobody += 1; chats[m["chat"]].append(WD.bodyless_row(m, ts(m["t"]), ids, "none")); continue
+            if m.get("receipt_only"): receipts += 1
+            else: nobody += 1
+            chats[m["chat"]].append(WD.bodyless_row(m, ts(m["t"]), ids, "none")); continue
         if key is None:
             chats[m["chat"]].append(WD.bodyless_row(m, ts(m["t"]), ids, "encrypted")); continue
         if m["scheme"] != 1:                     # never decrypt another scheme's body into garbage
@@ -1085,6 +1100,7 @@ def cmd_decrypt(a):
     if hf and os.path.isfile(hf):
         try:
             rec = (json.load(open(hf, encoding="utf-8")) or {}).get("messages") or []
+            if scope: rec = [r for r in rec if CSC.in_scope(r.get("chat"), scope)]
             hist_added, hist_skipped, touched = WD.merge_history(chats, rec, ids, ts)
             _n = collections.Counter(r.get("source") or "phone" for r in rec)
             _from = " and ".join("%s (%s offered)" % ({"phone": "the phone", "server-queue": "the server queue"}
@@ -1110,11 +1126,14 @@ def cmd_decrypt(a):
         # subjects and membership. chats.json carries the resolved name on every message; this is what
         # you join on, and what shows the alternatives a label was chosen from.
         tbl = ids.table(set(chats) | set(senders))
+        if scope:                                # group membership of the chosen groups only
+            tbl["groups"] = {g: v for g, v in tbl["groups"].items() if g in scope}
         json.dump(tbl, open(f"{a.out}/identities.json", "w", encoding="utf-8"), ensure_ascii=False,
                   indent=1, default=str)
         AUDIT.artifact(f"{a.out}/identities.json", kind="identity correlation (jid/lid/phone/name)",
                        records=len(tbl["identities"]))
-        nc = WD.write_contacts_csv(f"{a.out}/contacts.csv", ids)
+        nc = WD.write_contacts_csv(f"{a.out}/contacts.csv", ids,      # with --chat: the people in those chats
+                                   only={ids.key(j) for j in set(chats) | set(senders)} if scope else None)
         AUDIT.artifact(f"{a.out}/contacts.csv", kind="contacts (contact store, one row per record)", records=nc)
         log.info("contacts: %s record(s) -> %s/contacts.csv", f"{nc:,}", a.out)
     if only == "json":
@@ -1126,7 +1145,7 @@ def cmd_decrypt(a):
         _write_export_manifest(a.out, "cache+phone" if hist_added else "cache",
                                {"messages": sum(len(v) for v in chats.values()), "chats": len(chats),
                                 "decrypted_from_cache": ok, "recovered_from_phone": hist_added},
-                               ("chats.json", "identities.json"))
+                               ("chats.json", "identities.json", "contacts.csv"))
         return 0
     WD.write_transcripts(f"{a.out}/transcripts.txt", chats, ids)
     # name what was actually written: with --out txt:PATH the JSON side is skipped, and a log line
@@ -1140,6 +1159,10 @@ def cmd_decrypt(a):
     if nobody or other or fail:
         log.info("also written without text, not dropped: %d message(s) with no stored body, %d with a "
                  "body of another scheme, %d that failed to decrypt (see body_status)", nobody, other, fail)
+    if receipts:
+        log.info("%d record(s) hold only a delivery receipt -- a message id and its delivery state, no time, "
+                 "no type, no body -- for a message the store does not hold: kept as body_status "
+                 "receipt-only", receipts)
     # outcome of the bulk decrypt + hashes of what was produced (so the exports are tamper-evident)
     if key is not None: AUDIT.crypto("decrypt", algorithm="AES-CBC-128", scheme="1 (final)", key=key,
                  input_desc="all scheme-1 msgRowOpaqueData bodies", records_in=ok + fail,
@@ -1152,7 +1175,7 @@ def cmd_decrypt(a):
     _write_export_manifest(a.out, "cache+phone" if hist_added else "cache",
                            {"messages": sum(len(v) for v in chats.values()), "chats": len(chats),
                             "decrypted_from_cache": ok, "recovered_from_phone": hist_added},
-                           ("chats.json", "identities.json", "transcripts.txt"))
+                           ("chats.json", "identities.json", "contacts.csv", "transcripts.txt"))
     return 0
 
 def _wa_user_prefs(profile, origin):
@@ -1169,15 +1192,15 @@ def _wa_user_prefs(profile, origin):
             import chromium_reader as _cr
             recs = _cr.load_source(profile)["idb"].get("model-storage", {}).get("user-prefs", [])
         elif origin:
-            import glob as _glob, sqlite3 as _sq
+            import glob as _glob
             sys.path.insert(0, os.path.join(HERE, "scripts"))
             from snappy_pure import uncompress as _unc
-            from idbutil import store_id as _sidf
+            from idbutil import store_id as _sidf, connect_ro as _ro
             import sclone as _sc
-            mm = _glob.glob(f"{origin}/idb/*meogdaerlo*.sqlite")
+            mm = _glob.glob(f"{_glob.escape(origin)}/idb/*meogdaerlo*.sqlite")
             if not mm:
                 return {}
-            con = _sq.connect(f"file:{mm[0]}?mode=ro&immutable=1", uri=True)
+            con = _ro(mm[0])
             sid = _sidf(con, "user-prefs")
             if sid is None:
                 return {}
@@ -1289,7 +1312,7 @@ def cmd_creds(a):
                  key=K, key_source="HKDF(root, salt=WAWebEncKeySalt, info=0x00)",
                  salt=salt, salt_source="WAWebEncKeySalt (localStorage, on disk)", info="0x00",
                  input_desc="WANoiseInfo (privKey/pubKey/certificateChainBuffer)")
-    ni = json.loads(ls["WANoiseInfo"]); ivs = [base64.b64decode(x) for x in json.loads(ls["WANoiseInfoIv"])]
+    ni = json.loads(ls["WANoiseInfo"]); ivs = [base64.b64decode(x) for x in json.loads(ls.get("WANoiseInfoIv") or "[]")]
     def dc(b64, iv):
         pt = Cipher(algorithms.AES(K), modes.CBC(iv)).decryptor().update(base64.b64decode(b64)); p = pt[-1]
         return pt[:-p] if 1 <= p <= 16 and pt[-p:] == bytes([p])*p else pt
@@ -1323,7 +1346,8 @@ def cmd_creds(a):
             v = o["value"]; adv = {k: base64.b64encode(BC.as_bytes(v.get(k))).decode()
                                    for k in ("details","accountSignatureKey","accountSignature","deviceSignature") if BC.as_bytes(v.get(k))}
         if o.get("key") == "signal_reg_id": regid = o.get("value")
-    wid = json.loads(ls["last-wid-md"]); lid = json.loads(ls["WALid"])
+    wid = json.loads(ls["last-wid-md"])
+    lid = json.loads(ls["WALid"]) if ls.get("WALid") else None   # absent on profiles from before LIDs
     _ud = wid.split("@")[0].split(":"); user, dev = _ud[0], (_ud[1] if len(_ud) > 1 else "0")
     out = {"noise_priv": base64.b64encode(priv).decode(), "noise_pub": base64.b64encode(pub).decode(),
            "registrationId": int(regid) if regid is not None else None, "user": user, "device": int(dev),
@@ -1455,6 +1479,54 @@ def _senderless_chats(master):
         out.add(chat)
     return out
 
+def _chat_scope():
+    """The address forms of the chats --chat chose (canonical), or None when the run is not scoped.
+    Held in the environment so the helper processes (the SQLite writer) apply the same scope."""
+    v = os.environ.get("WAWF_CHAT_SCOPE")
+    return set(json.loads(v)) if v else None
+
+def _scope_anchors(anchors_path, scope):
+    """Keep only the anchors of the --chat chats. -> (the jid strings a later deepen may use, kept)."""
+    import chat_scope as CSC
+    a = json.load(open(anchors_path, encoding="utf-8"))
+    keep = [x for x in a.get("anchors") or []
+            if CSC.in_scope(str(x.get("chat") or ""), scope) or CSC.in_scope(str(x.get("chat_id") or ""), scope)]
+    a["anchors"] = keep
+    tmp = anchors_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh: json.dump(a, fh)
+    os.replace(tmp, anchors_path)
+    only = {str(x.get(k)) for x in keep for k in ("chat", "chat_id") if x.get(k)}
+    for f in scope:                                  # the forms the phone may label a reply with
+        only.add(f)
+        if f.endswith("@c.us"): only.add(f[:-len("@c.us")] + "@s.whatsapp.net")
+    return only, len(keep), sum(1 for x in keep if x.get("more_on_primary") is not False)
+
+def _apply_chat_scope(a):
+    """Resolve every --chat to the chats it names, BEFORE anything is exported or requested. A value
+    that fits no chat or several stops the run with the candidates listed (exit 2): never a guess."""
+    import chat_scope as CSC
+    WD, _ = _imp()
+    if a.profile and _is_chromium(a.profile) and not getattr(a, "partition", None):
+        import chromium_reader as cr
+        cr.load_source(a.profile)
+        if len([r for r in cr.ACQUISITION.get("partitions", []) if r.get("account") and r.get("messages")]) > 1:
+            log.error("--chat: this profile holds several WhatsApp sessions; name the one to search with "
+                      "--partition (see --list-partitions), so a name is never matched in the wrong account.")
+            return 2
+    _engine, _ls, _root, msgs, _meta, ids = WD.load(getattr(a, "profile", None), getattr(a, "origin", None))
+    try:
+        picked = CSC.resolve(a.chat, ids, CSC.chat_counts(msgs))
+    except CSC.ScopeError as e:
+        for line in str(e).splitlines(): log.error("%s", line)
+        return 2
+    for c in picked.values():
+        log.info("--chat: %s  (%s; %d message(s) in the browser)", c["label"], ", ".join(c["forms"]), c["messages"])
+    os.environ["WAWF_CHAT_SCOPE"] = json.dumps(CSC.forms(picked))
+    os.environ["WAWF_CHAT_SCOPE_LABELS"] = json.dumps(sorted(c["label"] for c in picked.values()), ensure_ascii=False)
+    AUDIT.event("export and history scoped to %d chat(s)" % len(picked), category="scope",
+                detail={"requested": a.chat, "chats": picked})
+    return 0
+
 def _target_anchors(anchors_path, chats):
     """Keep only the anchors for `chats`, so a refetch spends its request budget on what is broken.
 
@@ -1584,7 +1656,7 @@ def _deepen_anchors(anchors_path, master, only=None, start_reached=(), silent=No
     with open(tmp, "w", encoding="utf-8") as f: json.dump({"anchors": newanchors, "ondisk_ids": sorted(ondisk)}, f)  # corrupt
     os.replace(tmp, anchors_path)                          # the anchors.json the node client reads next pass
 
-def _resume_master(accum, anchors_path, master, deepen=True, chat_state=None):
+def _resume_master(accum, anchors_path, master, deepen=True, chat_state=None, only=None):
     """Reload messages recovered on prior `wawf history` runs (from the accumulated ledger) into `master`
     and push the freshly-built anchors past them, so a new run continues older than prior runs instead of
     re-requesting the same window. Returns how many prior messages were reloaded (0 if none / on error)."""
@@ -1592,7 +1664,7 @@ def _resume_master(accum, anchors_path, master, deepen=True, chat_state=None):
     if not os.path.exists(accum):
         # No ledger yet, but saved per-chat outcomes still apply to the freshly built anchors.
         if cs["ended"] or cs["silent"]:
-            try: _deepen_anchors(anchors_path, {}, start_reached=cs["ended"], silent=cs["silent"])
+            try: _deepen_anchors(anchors_path, {}, only=only, start_reached=cs["ended"], silent=cs["silent"])
             except Exception as e: log.warning("could not apply saved chat state (%s)", e)
         return 0
     try:
@@ -1603,9 +1675,9 @@ def _resume_master(accum, anchors_path, master, deepen=True, chat_state=None):
         # messages are banked but missing fields an older extractor never captured (the group
         # sender), and the only way to fill them is to have the phone serve them again.
         if master and deepen:
-            _deepen_anchors(anchors_path, master, start_reached=cs["ended"], silent=cs["silent"])
+            _deepen_anchors(anchors_path, master, only=only, start_reached=cs["ended"], silent=cs["silent"])
         elif cs["ended"] or cs["silent"]:                    # refetch: no deepening, state still applies
-            _deepen_anchors(anchors_path, {}, start_reached=cs["ended"], silent=cs["silent"])
+            _deepen_anchors(anchors_path, {}, only=only, start_reached=cs["ended"], silent=cs["silent"])
         return len(master)
     except Exception as e:
         log.warning("could not reload prior history (%s) — starting fresh.", e)
@@ -1658,7 +1730,7 @@ def _find_node():
     for r in roots:
         cands += [os.path.join(r, "node", exe), os.path.join(r, "node", "bin", exe),
                   os.path.join(r, exe)]
-        cands += sorted(glob.glob(os.path.join(r, "node-v*", exe)), reverse=True)
+        cands += sorted(glob.glob(os.path.join(glob.escape(r), "node-v*", exe)), reverse=True)
     for c in cands:
         if c and os.path.isfile(c): return c
     n = shutil.which("node")
@@ -1789,6 +1861,84 @@ def _pick_work_dir():
             log.debug("work dir unusable (%s): %s", c, e)
     raise SystemExit("could not create a writable folder for history output (tried: %s)" % ", ".join(cands))
 
+# Everything a history run keeps for one linked device: what it signs in with, its own Signal state,
+# the resume ledger and per-chat state, and what the server and the phone delivered.
+_DEVICE_FILES = ("creds_in.json", "signal_state.json", "anchors.json", "history_all.json",
+                 "history_recovered.json", "history_chat_state.json", "history_metadata.json",
+                 "signal_runtime.py.json", "signal_runtime.json", "received_journal.jsonl", "notifs.json",
+                 "history_chunks")
+
+def _device_tag(creds_path):
+    """'<account>-<device>' of the linked device a creds_in.json describes, or None."""
+    try:
+        with open(creds_path, encoding="utf-8") as fh:
+            c = json.load(fh)
+        u = str(c.get("user") or "").strip()
+        return "%s-%d" % (u, int(c.get("device") or 0)) if u.isdigit() else None
+    except Exception:
+        return None
+
+def _history_homes():
+    """Every folder history data may live in, without creating any: the checkout's tools/reconnect,
+    and for the .exe the folders _pick_work_dir chooses from."""
+    homes = [_find_reconnect_dir(), os.path.join(HERE, "tools", "reconnect")]
+    if getattr(sys, "frozen", False):
+        homes.append(os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "wawf-history"))
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~")
+        homes.append(os.path.join(base, "wawf", "history"))
+    out = []
+    for h in homes:
+        if h and os.path.abspath(h) not in out: out.append(os.path.abspath(h))
+    return out
+
+def _history_base():
+    """Where history (and a --queue run without --out) keeps its data: beside a repo checkout's
+    tools/reconnect, so earlier runs' ledgers keep resuming; for the .exe, a persistent folder beside
+    the executable (_pick_work_dir). Run from source, that used to be a folder beside python.exe."""
+    rec = _find_reconnect_dir()
+    if rec and not (getattr(sys, "frozen", False) and
+                    os.path.abspath(rec) == os.path.abspath(os.path.join(HERE, "tools", "reconnect"))):
+        return rec
+    return _pick_work_dir()
+
+def _device_work_dir(a, base):
+    """Recover the device credentials, and return the folder this linked device's history data lives
+    in: <base>/devices/<account>-<device>. None when the copy yields no credentials.
+
+    The data used to sit directly in <base>, ONE set for every device ever examined on the machine.
+    The resume ledger is reloaded on every run, so after a history run on one account the next
+    account's export took in the first account's recovered chats -- as messages its own phone had
+    served -- and its phone was asked for chats it does not have, spending the failure budget. And
+    each run overwrote the previous device's own Signal state, which the run's own warning calls the
+    only copy of keys the phone has encrypted to."""
+    # named per process: two runs at once (two exhibits) must not take each other's credentials
+    staged = os.path.join(base, "creds_in.json.recovering-%d" % os.getpid())
+    if not _creds_ok(a, staged):
+        return None
+    tag = _device_tag(staged) or "unknown-device"
+    work = os.path.join(base, "devices", tag)
+    os.makedirs(work, exist_ok=True)
+    # Earlier versions' flat layout: its creds_in.json names the device that ran last. That device's
+    # files move into its own folder (once), so its ledger and Signal state follow it; another
+    # device's are left exactly where they are.
+    legacy = _device_tag(os.path.join(base, "creds_in.json"))
+    if legacy and any(os.path.exists(os.path.join(base, f)) for f in _DEVICE_FILES[1:]):
+        if legacy == tag:
+            moved = []
+            for f in _DEVICE_FILES:
+                src, dst = os.path.join(base, f), os.path.join(work, f)
+                if os.path.exists(src) and not os.path.exists(dst):
+                    os.replace(src, dst); moved.append(f)
+            if moved:
+                log.info("this device's earlier history data moved into its own folder: %s", ", ".join(moved))
+        else:
+            log.info("%s also holds history data of another linked device (%s), left as it is", base, legacy)
+    os.replace(staged, os.path.join(work, "creds_in.json"))
+    AUDIT.event("device credentials moved into the device's history folder", category="stage",
+                detail={"from": staged, "to": os.path.join(work, "creds_in.json"), "device": tag})
+    log.info("history data for this device: %s", work)
+    return work
+
 def _history_out_targets(a):
     """Where a `--history --out` run writes, never over an earlier run's export.
 
@@ -1880,7 +2030,7 @@ def cmd_queue(a):
     for spec in (a.out or []):
         _, path = _parse_out(spec)
         base = path; break
-    base = base or _pick_work_dir()
+    base = base or _history_base()
     work = os.path.join(base, "server-queue", time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
     os.makedirs(work, exist_ok=True)
     log.info("server queue capture -> %s", work)
@@ -1893,6 +2043,10 @@ def cmd_queue(a):
         return 3
     log.info("[2/3] exporting the browser's Signal state (sessions, group sender keys) ...")
     if _sub("export_signal_state.py", eng + ["--out", os.path.join(work, "signal_state.json")]): return 3
+    if _chat_scope():
+        log.warning("--chat: the server hands over the device's whole queue -- it cannot be asked for one "
+                    "chat -- so %s keeps everything it delivered, as received. The export is scoped: only "
+                    "the chosen chats' messages are merged into it.", work)
     log.info("[3/3] signing in as the device and recording the queue (nothing is acknowledged) ...")
     if getattr(sys, "frozen", False):
         qcmd = [sys.executable, "_runpy", "queue_capture.py"]
@@ -1902,8 +2056,13 @@ def cmd_queue(a):
     env.update(PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYINSTALLER_RESET_ENVIRONMENT="1")
     # The state this tool's own history runs left for this device (if any): after talking to the phone,
     # its sessions with the phone are newer than the browser's, and the phone encrypts to them.
-    extra = [p for p in (os.path.join(d, "signal_runtime.py.json") for d in
-                         (os.path.join(HERE, "tools", "reconnect"), _pick_work_dir())) if os.path.isfile(p)]
+    # Looked up, never created: this used to call _pick_work_dir(), which makes a folder beside the
+    # executable -- run from source, beside python.exe -- on every queue run.
+    tag = _device_tag(os.path.join(work, "creds_in.json"))
+    extra = [p for h in _history_homes()
+             for p in ((os.path.join(h, "devices", tag, "signal_runtime.py.json") if tag else None),
+                       os.path.join(h, "signal_runtime.py.json"))       # an earlier version's flat layout
+             if p and os.path.isfile(p)]
     if extra and not env.get("WAWF_QUEUE_EXTRA_STATE"):
         env["WAWF_QUEUE_EXTRA_STATE"] = os.pathsep.join(extra)
         log.info("also trying the Signal state this tool's history runs left: %s", ", ".join(extra))
@@ -1964,14 +2123,8 @@ def cmd_history(a):
         if node_dir and node_dir not in os.environ.get("PATH", "").split(os.pathsep):
             os.environ["PATH"] = node_dir + os.pathsep + os.environ.get("PATH", "")
         if not _ensure_baileys(rec, node, getattr(a, "yes", False)): return 2
-    # Where OUTPUTS (creds/state/anchors/recovered history) go: beside a repo checkout's tools/reconnect,
-    # so earlier runs' ledgers keep resuming; for the .exe, a persistent folder next to the executable.
-    if rec and not (getattr(sys, "frozen", False) and
-                    os.path.abspath(rec) == os.path.abspath(os.path.join(HERE, "tools", "reconnect"))):
-        work = rec
-    else:
-        work = _pick_work_dir()
-        log.info("history data dir: %s", work)
+    # Where OUTPUTS (creds/state/anchors/recovered history) go -- one folder per linked device inside it
+    base = _history_base()
     # engine args shared by creds / signal-state / anchors
     _require_source(a, "history")                           # a profile (or --origin) is required; nothing is auto-detected
     if getattr(a, "browser_running", False):
@@ -1986,9 +2139,14 @@ def cmd_history(a):
         if not origin: log.error("pass a profile or --origin"); return 2
         eng = ["--origin", origin]
     log.info("[1/4] recovering reconnect creds ...")
-    if not _creds_ok(a, os.path.join(work, "creds_in.json")):
+    work = _device_work_dir(a, base)
+    if not work:
         log.error("history not recovered: no usable device credentials in this copy")
         return 3
+    if _chat_scope():
+        log.warning("--chat: only the chosen chats are asked for, but signing in also delivers whatever the "
+                    "server holds for the device; the client's received_journal.jsonl in %s keeps that as "
+                    "received. The export is scoped.", work)
     log.info("[2/4] recovering Signal state (identity, prekeys, sessions, sender keys) ...")
     if _sub("export_signal_state.py", eng + ["--out", os.path.join(work, "signal_state.json")]): return 3
     # Verify what we just exported actually describes the device this profile is on. This should
@@ -2035,7 +2193,9 @@ def cmd_history(a):
     # it was previously visible only as one informational line from the Node client. Riding the
     # profile's registration works while its Signal snapshot is still near the primary's ratchet and
     # decays after that, with a symptom -- every request silent -- that reads as a phone problem.
-    if not os.path.isdir(os.path.join(rec, "wawf_device")):
+    # Only the Node client can use a device paired by pair.js; the Python client, the default and the only
+    # one in the .exe (where `rec` is None), always rides the profile's registration.
+    if not (engine == "node" and rec and os.path.isdir(os.path.join(rec, "wawf_device"))):
         log.warning("MODE: this run rides the BROWSER PROFILE's registration, because this tool has "
                     "not been paired as its own device. On-demand history is a REQUEST TO THE LIVE "
                     "PRIMARY PHONE -- it is not recoverable from the image, and the profile's Signal "
@@ -2044,7 +2204,8 @@ def cmd_history(a):
                     "repair it. Everything else this tool extracts (cached messages, contacts, media, "
                     "identities, app-state) comes from the files and is unaffected.")
         log.warning("TO MAKE HISTORY KEEP WORKING: pair this tool as its own linked device, once -- "
-                    "`node tools/reconnect/pair.js`. It then holds its own Noise key, Signal identity "
+                    "`node tools/reconnect/pair.js` in a repo checkout, then run history with "
+                    "WAWF_HISTORY_ENGINE=node (the Python client cannot use a paired device). It then holds its own Noise key, Signal identity "
                     "and prekeys, so the session is ours to keep current and nothing this tool does "
                     "can degrade the subject's own linked device. It needs lawful access to the "
                     "UNLOCKED PHONE once: companion linking requires approval on the primary, and no "
@@ -2055,9 +2216,9 @@ def cmd_history(a):
     log.warning("FOR THE BEST CHANCE: keep WhatsApp open on your phone with a stable network, and "
                 "CLOSE every web.whatsapp.com tab -- a live web session competes for the same linked "
                 "device. If a run comes back empty, do not immediately retry: that burns the failure "
-                "budget and extends the quiet window. Run tools/reconnect/diag_onehistory.js instead, "
-                "which sends ONE request and reports whether the server acknowledged it, so a throttle "
-                "is distinguishable from a refusal.")
+                "budget and extends the quiet window. From a repo checkout, run "
+                "tools/reconnect/diag_onehistory.js inside %s instead, which sends ONE request and reports "
+                "whether the server acknowledged it, so a throttle is distinguishable from a refusal.", work)
     log.warning("SIDE EFFECT ON THE DEVICE: your phone's replies are end-to-end encrypted to a Signal "
                 "session, and the copy in the browser profile is a snapshot of a ratchet that keeps moving, "
                 "so this renegotiates that session and then keeps its own copy (signal_runtime.py.json, or "
@@ -2096,7 +2257,21 @@ def cmd_history(a):
     if chat_state["ended"] or chat_state["silent"]:
         log.info("from earlier runs: %d chat(s) the phone has ended (skipped), %d chat(s) silent on "
                  "their last attempt (asked last).", len(chat_state["ended"]), len(chat_state["silent"]))
-    n = _resume_master(accum, anchors_path, master, deepen=not refetch, chat_state=chat_state)
+    scope_only, nothing_to_ask = None, False
+    if _chat_scope():
+        scope_only, kept, askable = _scope_anchors(anchors_path, _chat_scope())
+        if not kept:
+            log.error("--chat: none of the chosen chats has a message to anchor a request on; nothing to "
+                      "request.")
+            return 3
+        if not askable:
+            # WhatsApp Web would not ask either; saying so beats a pass that reads as "the phone did not answer"
+            log.warning("--chat: the browser records that the phone holds nothing older than what is already "
+                        "in the browser for the chosen chat(s), so there is nothing to ask for.")
+            nothing_to_ask = True
+        log.info("--chat: asking the phone about %d chat(s) only%s", askable,
+                 (" (%d more hold nothing older on the phone)" % (kept - askable)) if kept > askable else "")
+    n = _resume_master(accum, anchors_path, master, deepen=not refetch, chat_state=chat_state, only=scope_only)
     if n and not refetch:
         log.info("resuming: %s messages recovered on prior runs — continuing older than those.", f"{n:,}")
     elif n:
@@ -2108,6 +2283,7 @@ def cmd_history(a):
             log.info("--history-refetch: every recovered message already names its sender — nothing "
                      "to fill in. Run without the flag to fetch history deeper instead.")
             return 0
+        if scope_only is not None: gaps = gaps & scope_only
         kept, dropped = _target_anchors(anchors_path, gaps)
         refetch_only = gaps                              # keep every later deepen inside this set
         log.warning("--history-refetch: %s recovered message(s) in %d group chat(s) have no sender, "
@@ -2120,7 +2296,16 @@ def cmd_history(a):
     # the phone returns, so it is written to its own folder (see _history_out_targets) and an earlier
     # run's export is never touched. The local half is written FIRST: the pulls take hours, and there
     # is no reason to have nothing on disk until they finish.
+    if refetch_only is None: refetch_only = scope_only    # every later deepen stays inside the --chat chats
     targets = _history_out_targets(a) if getattr(a, "out", None) else []
+
+    def _media_for_export():
+        # --fetch-media works on the export this run wrote, whether or not the phone added to it: it
+        # used to run only after a pass had recovered something, so a run the phone did not answer
+        # downloaded no media at all
+        if getattr(a, "fetch_media", False):
+            _fetch_media(a, [path for fmt, path in targets if fmt == "sqlite"])
+
     if targets:
         log.info("──── decrypting the local store first, before pulling anything ────")
         rc = _history_export(a, targets)
@@ -2129,6 +2314,9 @@ def cmd_history(a):
                       "recovered messages to. Fix that first; nothing has been requested from the "
                       "phone yet.", rc)
             return rc
+    if nothing_to_ask:
+        _media_for_export()
+        return 0
 
     MIN_NEW, MAX_PASSES = 40, 25                             # stop when a pass adds < MIN_NEW; hard safety cap
     # Exit 7 from the Node client means its cooldown breaker stopped the pass: ten unanswered requests
@@ -2146,6 +2334,12 @@ def cmd_history(a):
     MAX_COOLDOWNS = int(os.environ.get("WAWF_MAX_COOLDOWNS", 6))
     cooldowns_used = 0
     served_any = False                                   # did the phone serve anything, any pass?
+    # Exit 2 and 5 from either client mean it stopped BEFORE asking the phone anything: the login was
+    # refused, the credentials have no account, the credentials and Signal state are of different
+    # registrations, or no Signal session with the phone could be started. Read as an ordinary pass,
+    # that was reported as "no chat answered" and "only the phone's replies were missing".
+    ASKED_NOTHING_RC = (2, 5)
+    asked_nothing = False
     ended_chats = chat_state["ended"]                    # chats the phone answered "start reached" for
     try:
         for p in range(1, MAX_PASSES + 1):
@@ -2170,8 +2364,14 @@ def cmd_history(a):
             # final _checkpoint. Measured: a 10,842-message pass discarded in full.
             try: passd = json.load(open(pass_out, encoding="utf-8"))
             except Exception:
-                log.error("pass %d produced no output (history client exit=%s; connection failed / phone not serving) "
-                          "— stopping.", p, rc); break
+                if rc in ASKED_NOTHING_RC:
+                    asked_nothing = True
+                    log.error("pass %d: the history client stopped before it asked the phone anything (exit %s; "
+                              "the reason is printed above) — stopping.", p, rc)
+                else:
+                    log.error("pass %d produced no output (history client exit=%s; connection failed / phone not "
+                              "serving) — stopping.", p, rc)
+                break
             WD, _ = _imp()
             # What the phone actually served this pass, as distinct from what was NEW in it: a pass
             # can be served hundreds of messages and have none of them be new (a refetch), or be
@@ -2190,6 +2390,12 @@ def cmd_history(a):
             by = _checkpoint(accum)                          # checkpoint the accumulated set every pass
             log.info("pass %d: +%d new%s  ·  total recovered: %d across %d chats", p, new,
                      (", %d enriched" % enriched) if enriched else "", len(master), len(by))
+            if rc in ASKED_NOTHING_RC:
+                # what arrived before it stopped (late answers delivered with the backlog) is banked above
+                asked_nothing = True
+                log.error("pass %d: the history client stopped before it asked the phone anything (exit %s; the "
+                          "reason is printed above). %s messages are banked.", p, rc, f"{len(master):,}")
+                break
             if rc == 4 and engine != "node":
                 # the Python client saw the server close the connection: what arrived is banked above;
                 # reading the short pass as "converged" or "nothing answered" would be a wrong diagnosis
@@ -2277,20 +2483,19 @@ def cmd_history(a):
                       pass_out, rc)
             return rc
         if getattr(a, "fetch_media", False):
-            for fmt, path in targets:
-                if fmt != "sqlite": continue
-                db = os.path.join(path, "msgstore.db")
-                if not os.path.isfile(db):
-                    log.warning("--fetch-media: no msgstore.db in %s to work from", path); continue
-                log.info("--fetch-media: asking the CDN for media the browser never cached "
-                         "(NETWORKED; a url whose signature has expired returns 403 and is skipped)")
-                _sub("mediafetch.py", ["--db", db, "--cdn"] +
-                     (["--profile", a.profile] if a.profile else []) +
-                     (["--origin", a.origin] if a.origin else []))
+            _media_for_export()
         elif any(f == "sqlite" for f, _ in targets):
             log.info("media for the recovered messages is not downloaded: their mediaKeys ARE in "
                      "message_media, and --fetch-media (or scripts/mediafetch.py --cdn) will try the "
                      "CDN for the bytes.")
+    else:
+        _media_for_export()                              # the local export is all there is this time
+    if asked_nothing:
+        log.warning("NOTHING WAS ASKED this run: the history client stopped before it sent a request (the reason "
+                    "is printed above), so this says nothing about the phone or about throttling.%s",
+                    (" The %s message(s) recovered on earlier runs are in %s%s." %
+                     (f"{len(master):,}", pass_out, " and in the export" if targets else "")) if master else "")
+        return 1
     if master:
         log.info("HISTORY DONE: recovered %s messages older than the cache, across %d chats -> %s",
                  f"{len(master):,}", len(by), pass_out)
@@ -2304,7 +2509,7 @@ def cmd_history(a):
                         _PROBE_CHATS, os.path.basename(state_path))
         log.warning("NOTE: this is NOT necessarily everything. What you get is whatever your phone chose to "
                     "serve — it commonly returns only part of what it holds, and the rest may come on a later "
-                    "run. Re-run `wawf history` to continue deeper from here (progress is saved and deduped); "
+                    "run. Re-run `wawf <PROFILE> --history` to continue deeper from here (progress is saved and deduped); "
                     "a pass that adds nothing does not mean the older history is gone.")
         return 0
     # Nothing at all came back: explain WHY, so an empty result isn't read as a broken tool.
@@ -2316,7 +2521,7 @@ def cmd_history(a):
                 "succeeded — only the phone's replies were missing.")
     log.warning("WHAT TO TRY: open WhatsApp on your phone and leave it on-screen on a stable network, close "
                 "every web.whatsapp.com tab (a live web session fights this one for the same linked device), "
-                "then run `wawf history` again. Nothing was lost — it resumes where it left off. Repeated "
+                "then run `wawf <PROFILE> --history` again. Nothing was lost — it resumes where it left off. Repeated "
                 "attempts at different times are normal and often succeed where one did not.")
     return 1
 
@@ -2365,7 +2570,8 @@ def cmd_sqlite(a):
         counts = {}
         try:
             import sqlite3 as _sq
-            con = _sq.connect("file:%s?mode=ro" % os.path.join(a.out, "msgstore.db"), uri=True)
+            from idbutil import sqlite_uri as _uri
+            con = _sq.connect(_uri(os.path.join(a.out, "msgstore.db")) + "?mode=ro", uri=True)
             counts["messages"] = con.execute("SELECT COUNT(*) FROM message").fetchone()[0]
             counts["chats"] = con.execute("SELECT COUNT(*) FROM chat").fetchone()[0]
             try:
@@ -2486,19 +2692,23 @@ def main():
         "\n"
         "OPTIONAL EXTRAS\n"
         "  --key companion_enc_static.txt    already have the at-rest key? use it and skip the reconnect\n"
+        "  --chat WHO            only this conversation: a contact or group name, a phone number\n"
+        "                        with its country code, a lid or a jid (repeatable). A name that\n"
+        "                        fits more than one chat, or none, stops with the candidates listed\n"
         "  --history             ALSO pull chat history OLDER than the browser cache from your\n"
-        "                        phone, and append it to the export (networked, needs Node, takes\n"
-        "                        hours; the phone must answer). With --out it decrypts the local\n"
-        "                        store first, then appends what the phone returns -- one timeline\n"
-        "                        per chat, written beside an earlier export, never over it.\n"
-        "  --fetch-media         with --history --out sqlite:PATH, also ask the CDN for media the\n"
-        "                        browser never cached (networked, slow, expired urls give 403)\n"
+        "                        phone, and append it to the export (networked, can take hours;\n"
+        "                        the phone must answer). With --out it decrypts the local store\n"
+        "                        first, then appends what the phone returns -- one timeline per\n"
+        "                        chat, written beside an earlier export, never over it.\n"
+        "  --fetch-media         with --out sqlite:PATH, also ask the CDN for media the browser\n"
+        "                        never cached (networked, slow; expired links are skipped)\n"
         "  --no-audit            do NOT write the chain-of-custody database (written by default)\n"
         "\n"
         "EXAMPLES\n"
         "  wawf \"" + _example_profile() + "\"\n"
         "  wawf \"" + _example_profile() + "\" --out sqlite:D:\\case\\db\n"
         "  wawf \"" + _example_profile() + "\" --key companion_enc_static.txt --out json:D:\\case\n"
+        "  wawf \"" + _example_profile() + "\" --chat +15555550101 --out D:\\case\\out\n"
         "\n"
         "PROFILE LOCATIONS ON THIS SYSTEM\n" + _profile_help() + "\n",
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -2527,6 +2737,11 @@ def main():
     p.add_argument("--offline", action="store_true",
                    help="never contact WhatsApp: decrypt with a key file if one is given or found, otherwise "
                         "export everything except message text")
+    p.add_argument("--chat", metavar="WHO", action="append",
+                   help="only this conversation: a contact or group name, a phone number with its country "
+                        "code, a lid or a jid; repeat for several. The export holds those chats only and "
+                        "--history asks the phone about those chats only. A name that fits more than one "
+                        "chat, or none, stops the run with the candidates listed -- never a guess.")
     p.add_argument("--partition", metavar="WHICH",
                    help="when a profile holds more than one WhatsApp session, which one to examine: the "
                         "account number, the storage key, or the layout name shown by --list-partitions")
@@ -2643,6 +2858,16 @@ def main():
         return cmd_list_partitions(a)
     if getattr(a, "queue", False) and getattr(a, "offline", False):
         _usage("--queue signs in to WhatsApp's server, and --offline forbids going online")
+    # the same pairs the window refuses: a run told to stay offline must not sign in for history
+    if a.history and getattr(a, "offline", False):
+        _usage("--history signs in and asks the phone, and --offline forbids going online")
+    for _flag, _set in (("--history-refetch", getattr(a, "history_refetch", False)),
+                        ("--install-node", getattr(a, "install_node", False))):
+        if _set and not a.history:
+            _usage("%s belongs to history recovery; add --history, or leave it out" % _flag)
+    if getattr(a, "chat", None) and any(_parse_out(o)[0] == "raw" for o in (a.out or [])):
+        _usage("--chat cannot be combined with --out raw:PATH: raw is an image of the whole store, so it "
+               "cannot hold some chats only")
     if getattr(a, "queue", False) and a.history:
         def _queue_then_history(a):
             # the queue first (it is what the server holds now), then history; the export merges both
@@ -2679,6 +2904,13 @@ def main():
         a.cmd, action = "history", _history_then_export
     else:
         a.cmd, action = "decrypt", cmd_run_sessions
+    for _v in ("WAWF_CHAT_SCOPE", "WAWF_CHAT_SCOPE_LABELS"):
+        os.environ.pop(_v, None)                     # set only by --chat below, never inherited
+    if getattr(a, "chat", None):
+        # the scope is settled before anything is exported, captured or requested
+        def _scoped(a, _inner=action):
+            return _apply_chat_scope(a) or _inner(a)
+        action = _scoped
     # Inputs are checked BEFORE a case database is opened. Every command here needs a profile and
     # valid --out formats, and with the audit on by default a mistyped path was leaving a
     # chain-of-custody file behind for a run that never started -- in the working directory, which

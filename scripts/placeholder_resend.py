@@ -72,6 +72,7 @@ def main():
         req = WP.encode({"protocolMessage": {"type": WP.PROTOCOL_TYPE_PDO_REQUEST, "peerDataOperationRequestMessage": {
             "peerDataOperationRequestType": 4,                       # PLACEHOLDER_MESSAGE_RESEND
             "placeholderMessageResendRequest": [{"messageKey": k} for k in keys]}}}, WP.MESSAGE)
+        c.ensure_session(own)                   # a session with the phone, started first if the state has none
         mid = c.send_peer(own, req, {"category": "peer", "push_priority": "high_force"})
         say("[i] asked the phone to resend %d placeholder message(s) (request %s); waiting up to %ds" % (len(keys), mid, WAIT))
         end = time.time() + WAIT

@@ -331,13 +331,16 @@ def fetch_version():
 
 import audit                                    # appends to the case DB from --audit (no-op otherwise)
 A = audit.NoAudit()                             # replaced in main()
+LAST_FAILURE = None                             # the reason code of the last login <failure>, if any
 
 def run(creds, out_path, timeout=30, log=lambda *a: None, print_key=False, passive=False):
+    global LAST_FAILURE
+    LAST_FAILURE = None                            # this login's, not an earlier one's
     import websocket   # websocket-client; imported here so import errors are actionable
     noise_priv = base64.b64decode(creds["noise_priv"])
     noise_pub  = base64.b64decode(creds["noise_pub"])
     if not creds.get("account"):
-        print("[!] creds has no account (adv_signed_identity missing) — re-run `wawf creds`", file=sys.stderr)
+        print("[!] creds has no account (adv_signed_identity missing) — re-run `wawf <PROFILE>`, which recovers it", file=sys.stderr)
         return 6
     user, device = creds["user"], int(creds.get("device") or 0)
 
@@ -346,7 +349,14 @@ def run(creds, out_path, timeout=30, log=lambda *a: None, print_key=False, passi
     eph_pub  = eph.public_key().public_bytes_raw()
     noise = Noise(eph_pub)
 
-    version = fetch_version()
+    # The build the examined browser itself announces (cmd_creds reads it from the profile into
+    # creds_in.json). Asking GitHub for Baileys' version instead sent an unrecorded request to a third
+    # party on every key capture, and announced a version the browser never ran.
+    version = [int(x) for x in creds["wa_version"]] if creds.get("wa_version") else None
+    if not version:
+        A.net("out", endpoint="raw.githubusercontent.com", protocol="https", kind="client version lookup",
+              detail={"why": "the profile does not name its client version"})
+        version = fetch_version()
     log("using WA version %s" % ".".join(map(str, version)))
 
     A.net("out", endpoint=WS_URL, protocol="websocket", kind="connect",
@@ -422,7 +432,8 @@ def run(creds, out_path, timeout=30, log=lambda *a: None, print_key=False, passi
                 hits = []; scan_for_key(node, hits)
                 if hits:
                     captured = hits[0][1]
-                    log("CAPTURED %s = %s" % (hits[0][0], captured))
+                    log("CAPTURED %s (%d characters; written to the --out file, never printed)"
+                        % (hits[0][0], len(captured or "")))
                     # the server-issued at-rest key: fingerprint only unless --audit-secrets
                     A.crypto("receive", algorithm="companion_enc_static (server-issued)",
                              key=base64.b64decode(captured) if captured else None,
@@ -430,6 +441,7 @@ def run(creds, out_path, timeout=30, log=lambda *a: None, print_key=False, passi
                              validated="captured", input_desc="post-login stanza")
                     break
                 if tag == "failure":
+                    LAST_FAILURE = str((node.get("attrs") or {}).get("reason") or "")
                     A.net("in", endpoint=WS_URL, protocol="noise/websocket", kind="stanza <failure>",
                           status="login rejected", detail={"attrs": node.get("attrs")})
                     print("[!] " + login_failure_reason(node.get("attrs")), file=sys.stderr)
@@ -459,7 +471,7 @@ def run(creds, out_path, timeout=30, log=lambda *a: None, print_key=False, passi
 
 def main():
     ap = argparse.ArgumentParser(description="pure-Python WhatsApp reconnect -> companion_enc_static")
-    ap.add_argument("--creds", default="creds_in.json", help="creds_in.json from `wawf creds` (default: ./creds_in.json)")
+    ap.add_argument("--creds", default="creds_in.json", help="creds_in.json written by `wawf <PROFILE>` (default: ./creds_in.json)")
     ap.add_argument("--out", default="companion_enc_static.txt", help="write the captured key here")
     ap.add_argument("--timeout", type=int, default=30)
     ap.add_argument("--print-key", action="store_true",
@@ -472,7 +484,7 @@ def main():
     A = audit.from_env("reconnect")
     log = (lambda *m: print("[ns]", *m, file=sys.stderr)) if a.verbose else (lambda *m: None)
     if not os.path.exists(a.creds):
-        print("[!] creds file not found: %s — run `wawf creds <profile>` first" % a.creds, file=sys.stderr)
+        print("[!] creds file not found: %s — run `wawf <PROFILE>`, which writes it first" % a.creds, file=sys.stderr)
         A.end_run(6, status="error", error=RuntimeError("creds file not found: %s" % a.creds)); return 6
     A.file_read(a.creds, purpose="reconnect credentials (disk-recovered Noise keypair)", hash_it=True)
     creds = json.load(open(a.creds, encoding="utf-8"))
@@ -484,12 +496,20 @@ def main():
     try:
         # passive first (it does not take the device's active role); the active login only if the
         # server sent no key to the passive one
-        rc = run(creds, a.out, a.timeout, log, print_key=a.print_key, passive=True)
-        if rc == 5:
-            print("[i] no key on a passive login; signing in once more, actively", file=sys.stderr)
-            rc = run(creds, a.out, a.timeout, log, print_key=a.print_key, passive=False)
-        elif rc == 0:
-            print("[i] key received on a passive login", file=sys.stderr)
+        def attempt(c):
+            rc = run(c, a.out, a.timeout, log, print_key=a.print_key, passive=True)
+            if rc == 5:
+                print("[i] no key on a passive login; signing in once more, actively", file=sys.stderr)
+                rc = run(c, a.out, a.timeout, log, print_key=a.print_key, passive=False)
+            elif rc == 0:
+                print("[i] key received on a passive login", file=sys.stderr)
+            return rc
+        rc = attempt(creds)
+        if rc == 2 and LAST_FAILURE == "405" and creds.get("wa_version"):
+            # the profile's own client version is too old for the server now (an old image): the current one
+            print("[i] the server refused the profile's client version as outdated (405); trying the current "
+                  "WhatsApp Web version", file=sys.stderr)
+            rc = attempt(dict(creds, wa_version=None))
     except Exception as e:
         import traceback as _tb
         A.end_run(1, status="error", error=e, tb=_tb.format_exc()); raise

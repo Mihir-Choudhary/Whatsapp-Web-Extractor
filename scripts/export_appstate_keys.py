@@ -39,10 +39,10 @@ Output is keyed by the base64 keyId, which is exactly how Baileys addresses
 TREAT THE OUTPUT AS KEY MATERIAL.
 """
 from __future__ import annotations
-import argparse, base64, glob, json, os, sqlite3, sys
+import argparse, base64, glob, json, os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from idbutil import store_id, as_bytes as ab
+from idbutil import store_id, connect_ro, as_bytes as ab
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -74,10 +74,10 @@ def load_chromium(profile):
 def load_firefox(origin):
     from snappy_pure import uncompress
     import sclone
-    wc = glob.glob(f"{origin}/idb/*wcanwec__bd*.sqlite")
+    wc = glob.glob(f"{glob.escape(origin)}/idb/*wcanwec__bd*.sqlite")
     if not wc:
         raise SystemExit("wawc_db_enc IndexedDB not found under " + origin)
-    con = sqlite3.connect(f"file:{wc[0]}?mode=ro&immutable=1", uri=True)
+    con = connect_ro(wc[0])
     sid = store_id(con, "keys")
     row = con.execute("SELECT data FROM object_data WHERE object_store_id=?", (sid,)).fetchone() if sid else None
     if not row:
@@ -86,13 +86,13 @@ def load_firefox(origin):
     i = d.find(b"\x0a\x80\xff\xff")                      # CryptoKey marker, as in export_sqlite
     j = d.find(b"\x1f\x00\xff\xff", i)
     root = d[j + 12:j + 12 + 128] if j >= 0 else None
-    lsdb = sqlite3.connect(f"file:{origin}/ls/data.sqlite?mode=ro&immutable=1", uri=True)
+    lsdb = connect_ro(f"{origin}/ls/data.sqlite")
     r = lsdb.execute("SELECT value FROM data WHERE key=?", ("WAWebEncKeySalt",)).fetchone()
     salt = r[0].encode("latin-1", "ignore") if r else None
-    mm = glob.glob(f"{origin}/idb/*meogdaerlo*.sqlite")
+    mm = glob.glob(f"{glob.escape(origin)}/idb/*meogdaerlo*.sqlite")
     if not mm:
         raise SystemExit("model-storage IndexedDB not found under " + origin)
-    con2 = sqlite3.connect(f"file:{mm[0]}?mode=ro&immutable=1", uri=True)
+    con2 = connect_ro(mm[0])
     sid2 = store_id(con2, "sync-keys")
     recs = []
     if sid2 is not None:

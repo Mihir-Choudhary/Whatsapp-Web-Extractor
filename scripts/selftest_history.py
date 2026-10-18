@@ -236,6 +236,24 @@ check("the line names an unknown sender", lines, ["(unknown)"])
 check("...and the legend lists it", legend, ["(unknown)"])
 check("...saying the message carried no sender", "(no sender recorded in the message)" in ut, True)
 
+print("\na receipt-only row is replaced by the message the phone serves")
+# The store held only a receipt for these (an id and its ack): the phone's copy is the message itself,
+# so it must be added -- not skipped as "already present" -- and the receipt row it stood in for goes.
+from wa_decrypt import bodyless_row, _norm_msg
+rows = local()
+rows["120300000009@g.us"].insert(0, bodyless_row(_norm_msg({"id": "false_120300000009@g.us_RCPTA", "ack": 2}), "", IDS, "none"))
+rows["555500000098@g.us"] = [bodyless_row(_norm_msg({"id": "false_555500000098@g.us_RCPTB", "ack": 2}), "", IDS, "none")]
+REC2 = [{"chat": "120300000009@g.us", "id": "RCPTA", "fromMe": False, "participant": "965000000001@lid",
+         "ts": 1759500000, "text": "the message itself", "type": "conversation"},
+        {"chat": "555500000099@g.us", "id": "RCPTB", "fromMe": False, "participant": "965000000001@lid",
+         "ts": 1759500001, "text": "filed under another chat", "type": "conversation"}]
+added, skipped, touched = merge_history(rows, REC2, IDS, ts)
+grp = rows["120300000009@g.us"]
+check("the phone's copies are added, not skipped as already present", (added, skipped), (2, 0))
+check("...the receipt row is gone and the message is there with its text",
+      [(m.get("body_status"), m["text"]) for m in grp if stanza_of(m["id"]) == "RCPTA"], [(None, "the message itself")])
+check("a chat left holding nothing is removed, not kept as an empty list", "555500000098@g.us" in rows, False)
+
 print()
 if FAIL:
     print("%d CASE(S) FAILED" % len(FAIL))

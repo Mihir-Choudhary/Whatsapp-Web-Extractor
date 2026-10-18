@@ -111,7 +111,7 @@ def main():
     print("    WhatsApp Web has re-paired since these were exported, so this registration is gone.")
     print("    Running --history with them authenticates as the dead device: it will connect, ask every")
     print("    chat, and get nothing back -- which looks exactly like throttling but is not.")
-    print("    FIX: re-export. `wawf history` does this on every run; for the diag_*.js tools, re-run")
+    print("    FIX: re-export. `wawf <PROFILE> --history` does this on every run; for the diag_*.js tools, re-run")
     print("    the creds export and scripts/export_signal_state.py first.")
     return 1
 

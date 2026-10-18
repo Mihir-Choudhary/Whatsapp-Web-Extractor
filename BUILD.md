@@ -6,7 +6,7 @@
 ## Prerequisites
 ```bash
 pip install pyinstaller cryptography cramjam websocket-client
-pip install "git+https://github.com/cclgroupltd/ccl_chromium_reader.git"   # Chromium/Chrome/Edge reader
+pip install "git+https://github.com/cclgroupltd/ccl_chromium_reader.git@ef840de30221c4d65bc96d2f4d9057e9ef2f526d"   # Chromium reader, the tested commit
 ```
 
 ## Build (onefile)
@@ -17,7 +17,7 @@ Output:
 - Linux / macOS: `dist/wawf`
 - Windows:       `dist\wawf.exe`
 
-Run it directly, e.g. `./dist/wawf decrypt <profile> --enc-static <b64> -v` or `dist\wawf.exe creds <profile>`.
+Run it directly, e.g. `./dist/wawf <PROFILE> --out ./case -v`, or `dist\wawf.exe` with no arguments for the window.
 
 > **Build on the OS you target.** PyInstaller does not cross-compile. To produce
 > `wawf.exe`, run the same `pyinstaller wawf.spec` command on Windows (or in a Windows VM /
@@ -31,25 +31,27 @@ Run it directly, e.g. `./dist/wawf decrypt <profile> --enc-static <b64> -v` or `
   (+ its `_wa_tokens` tables), `snappy_pure`, `sclone` import normally.
 - `cryptography` submodules via `collect_submodules`.
 
-The full **reconnect** (pure-Python WhatsApp Noise handshake → `companion_enc_static`) is therefore in
-the `.exe` — no Node needed. The Node/Baileys client under `tools/reconnect/` is *not* bundled; it exists
-only for the extra on-demand history-sync capability and needs its own `npm install`.
+The key capture (pure-Python WhatsApp Noise handshake → `companion_enc_static`), `--queue` and `--history`
+(the pure-Python client, `scripts/history_extract.py`) are therefore all in the `.exe` — no Node needed.
+The Node/Baileys client under `tools/reconnect/` is *not* bundled; it is the optional
+`WAWF_HISTORY_ENGINE=node` engine, run from a checkout after its own `npm install`.
 
 ## Helper-script dispatch when frozen
-`memory`, `sqlite`, and `reconnect` shell out to helper scripts that own their own argparse
-(`wa_forensic.py`, `export_sqlite.py`, `wa_reconnect.py`). A onefile binary can't execute a loose `.py`, so
+The SQLite export, the key capture, the queue and history clients and the media download run as helper
+scripts that own their own argparse (`export_sqlite.py`, `wa_reconnect.py`, `queue_capture.py`,
+`history_extract.py`, `mediafetch.py`, ...). A onefile binary can't execute a loose `.py`, so
 `wawf` re-execs itself with a hidden `_runpy` verb (`<exe> _runpy <script> [args…]`) and runs
 the helper's `__main__` in-process via `runpy`. In dev mode it just runs
 `python scripts/<script>` directly. This is transparent to the user.
 
-## Verified (Linux onefile, PyInstaller 6.22.2, Python 3.14)
-- `wawf --help`, subcommand help, clean argparse errors
-- `decrypt` offline — root-key extraction on both Firefox and Chrome profiles (tens of thousands of msgs)
-- `decrypt --enc-static <correct>` — key validated against on-disk ciphertext, all bodies decrypted, 0 failed
-- `decrypt --enc-static <wrong>`   — rejected (exit 3), no output written
-- `creds` — Noise keypair X25519-verified, account identity recovered
-- `sqlite` — parse + key-validate pipeline, refuses a wrong key (exit 3), writes nothing on rejection
-- frozen `.exe`: `_runpy` dispatch (`sqlite`/`memory`), `history` guard, `memory` EOF/platform handling
+## What a build must do
+- `wawf --help`, clean argparse errors (the release workflow runs `--help` on every build)
+- `wawf <PROFILE> --offline` — root key read from Firefox and Chromium profiles, export without text
+- `wawf <PROFILE> --key <correct file> --offline` — key validated against on-disk ciphertext, all bodies decrypted
+- `wawf <PROFILE> --key <wrong file> --offline` — refused (exit 3) rather than writing garbage
+- `wawf <PROFILE>` — device credentials recovered and X25519-verified, key captured over the network
+- `--out sqlite:DIR` — the same validation, refuses a wrong key (exit 3), writes nothing on rejection
+- frozen `.exe`: `_runpy` dispatch of the helpers, `--history` with the Python client
 - exit codes: 0 ok · 1 error · 2 usage · 3 wrong key · 4 file-not-found
 
 ## Windows blocks the binary it just built

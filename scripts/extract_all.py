@@ -4,17 +4,17 @@ profile-pics, and full message-metadata. Works on any Firefox web.whatsapp.com s
 
   python3 scripts/extract_all.py [<origin dir>] [<out dir>]
 """
-import sys, os, sqlite3, csv, glob, datetime as dt
+import sys, os, csv, glob, datetime as dt
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from snappy_pure import uncompress
-from idbutil import store_id
+from idbutil import store_id, connect_ro
 import sclone
 
 O   = sys.argv[1] if len(sys.argv) > 1 else 'evidence/origins/https+++web.whatsapp.com'
 OUT = sys.argv[2] if len(sys.argv) > 2 else 'analysis'
-_mm = glob.glob(O + '/idb/*meogdaerlo*.sqlite')          # per-profile numeric prefix; never hardcode it
+_mm = glob.glob(glob.escape(O) + '/idb/*meogdaerlo*.sqlite')          # per-profile numeric prefix; never hardcode it
 if not _mm: sys.exit(f"message-store IndexedDB (*meogdaerlo*) not found under {O}")
-con = sqlite3.connect(f'file:{_mm[0]}?mode=ro&immutable=1', uri=True)
+con = connect_ro(_mm[0])
 def sid(name):                                            # resolve object_store ids by NAME (per-profile)
     i = store_id(con, name)
     if i is None: sys.exit(f"object store '{name}' not found in model-storage")
@@ -32,9 +32,18 @@ def ts(v):
     return ''
 os.makedirs(OUT, exist_ok=True)
 
+class _Sheet:
+    """csv.writer for files a spreadsheet opens: a text cell that starts like a formula gets a leading
+    apostrophe (shown as text), as in wawf's contacts.csv. Names, group subjects and descriptions and
+    file names are typed by other people, and `=HYPERLINK(...)` in one would run on the examiner's machine."""
+    def __init__(self, f): self.w = csv.writer(f)
+    def writerow(self, row):
+        self.w.writerow([("'" + x) if isinstance(x, str) and x[:1] in ("=", "+", "-", "@", "\t", "\r") else x
+                         for x in row])
+
 # CONTACTS
 with open(f'{OUT}/contacts.csv','w',newline='',encoding='utf-8') as f:
-    w=csv.writer(f); w.writerow(['id','phoneNumber','pushname','name','shortName','textStatus','isAddressBook','businessName'])
+    w=_Sheet(f); w.writerow(['id','phoneNumber','pushname','name','shortName','textStatus','isAddressBook','businessName'])
     n=0
     for o in rows('contact'):
         if not isinstance(o,dict):continue
@@ -43,7 +52,7 @@ with open(f'{OUT}/contacts.csv','w',newline='',encoding='utf-8') as f:
     print('contacts.csv:',n)
 # CHATS
 with open(f'{OUT}/chats.csv','w',newline='',encoding='utf-8') as f:
-    w=csv.writer(f); w.writerow(['id','name','lastActivity','archived','locked','muteExpiration','unreadCount'])
+    w=_Sheet(f); w.writerow(['id','name','lastActivity','archived','locked','muteExpiration','unreadCount'])
     n=0
     for o in rows('chat'):
         if not isinstance(o,dict):continue
@@ -51,7 +60,7 @@ with open(f'{OUT}/chats.csv','w',newline='',encoding='utf-8') as f:
     print('chats.csv:',n)
 # GROUPS
 with open(f'{OUT}/groups.csv','w',newline='',encoding='utf-8') as f:
-    w=csv.writer(f); w.writerow(['id','subject','created','size','announce','restrict','description'])
+    w=_Sheet(f); w.writerow(['id','subject','created','size','announce','restrict','description'])
     n=0
     for o in rows('group-metadata'):
         if not isinstance(o,dict):continue
@@ -60,7 +69,7 @@ with open(f'{OUT}/groups.csv','w',newline='',encoding='utf-8') as f:
     print('groups.csv:',n)
 # PROFILE PICS
 with open(f'{OUT}/profile_pics.csv','w',newline='',encoding='utf-8') as f:
-    w=csv.writer(f); w.writerow(['id','timestamp','eurl','fullDirectPath'])
+    w=_Sheet(f); w.writerow(['id','timestamp','eurl','fullDirectPath'])
     n=0
     for o in rows('profile-pic-thumb'):
         if not isinstance(o,dict):continue
@@ -68,7 +77,7 @@ with open(f'{OUT}/profile_pics.csv','w',newline='',encoding='utf-8') as f:
     print('profile_pics.csv:',n)
 # MESSAGE METADATA (full)
 with open(f'{OUT}/messages_metadata.csv','w',newline='',encoding='utf-8') as f:
-    w=csv.writer(f); w.writerow(['t','from','to','type','mimetype','size','filename','hasThumbnail','starred','ack','chatKey'])
+    w=_Sheet(f); w.writerow(['t','from','to','type','mimetype','size','filename','hasThumbnail','starred','ack','chatKey'])
     n=0
     for o in rows('message'):
         if not isinstance(o,dict):continue

@@ -403,6 +403,16 @@ class Run:
         if self.c.closed.is_set():
             return self.lost_connection()
         self.c.send(WB.node("presence", {"type": "available"}))
+        # Every request travels on the Signal session with the phone. The profile's state normally holds
+        # one; when it does not, sending raised and ended the run. WhatsApp Web starts one from the phone's
+        # prekey bundle before it sends, and so does this.
+        try:
+            if self.c.ensure_session(self.own):
+                say("[i] this Signal state held no session with the phone; started one from its prekey bundle")
+        except Exception as e:
+            if self.c.closed.is_set(): return self.lost_connection()
+            say("[x] could not set up a Signal session with the phone (%s); nothing was requested" % e)
+            self.write_out(); self.c.close(); return 2
         fail = 0; first_fail = None; tripped = False; delay = BASE_DELAY
         probe_silent = probed = served = silent = 0
         for a in targets:

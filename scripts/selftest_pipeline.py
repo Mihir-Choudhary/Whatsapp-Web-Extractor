@@ -134,6 +134,24 @@ check("my own message marked outgoing", "->" in t and ch["120300000009@g.us"][1]
 check("identities exported", len(ids["identities"]) == 3 and len(ids["groups"]) == 1)
 shutil.rmtree(out, ignore_errors=True)
 
+print("\na record holding only a delivery receipt (an id and its ack: no time, type or body)")
+# WhatsApp Web keeps one when a receipt arrives for a message it does not hold. It is not a message:
+# kept as a row that says so, never shown under an invented time or type.
+stub = WD._norm_msg({"id": "true_120300000009@g.us_RCPT1", "ack": 3})
+out, log, code = run(store([stub]))
+ch = json.load(open(os.path.join(out, "chats.json"), encoding="utf-8"))
+t = open(os.path.join(out, "transcripts.txt"), encoding="utf-8").read()
+rows = [m for m in ch["120300000009@g.us"] if m["id"].endswith("_RCPT1")]
+check("kept as one row, body_status receipt-only, with no time, type or text",
+      len(rows) == 1 and rows[0].get("body_status") == "receipt-only" and not rows[0]["t"]
+      and rows[0]["type"] is None and not rows[0]["text"])
+check("the transcript names it for what it is, under no invented time",
+      "[time not recorded] -> " in t and "(receipt only: the message itself is not in the store)" in t)
+check("a record with a time, a type or a body is never taken for one",
+      not WD.receipt_only({"id": "a_b_c", "t": 1760000000}) and not WD.receipt_only({"id": "a_b_c", "type": "revoked"})
+      and not WD.receipt_only({"id": "a_b_c", "msgRowOpaqueData": {"_data": b"x"}}))
+shutil.rmtree(out, ignore_errors=True)
+
 print("\na wrong key is refused, not written")
 # Right key => every body has valid PKCS7. Wrong key => ~0.4% do. The writers must stop.
 out, log, code = run(store(), enc_static=bytes(range(1, 33)))

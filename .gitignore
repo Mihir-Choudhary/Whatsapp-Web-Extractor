@@ -84,3 +84,32 @@ media_retry_out.json
 
 # the tool's OWN linked-device credentials (pair.js) — key material
 wawf_device/
+
+# Everything a history run keeps per linked device (credentials, its own Signal state, the ledger, what
+# the server delivered) lives in tools/reconnect/devices/<account>-<device>/. The Python client's
+# runtime Signal state is signal_runtime.PY.json, which `signal_runtime.json*` above does not match,
+# and its journal of every stanza the server delivered was not covered at all: both sat in
+# tools/reconnect/ one `git add .` away from a commit.
+devices/
+signal_runtime*.json*
+*_journal.jsonl*
+history_metadata.json*
+# a write interrupted half-way leaves its temporary copy (the ledger's holds recovered messages), and
+# the .exe keeps history beside itself when no checkout is around it
+*.json.tmp
+wawf-history/
+# --queue without --out writes here; it holds the device's credentials and the decrypted queue
+server-queue/
+queue_*.json*
+placeholder_resend.json*
+
+# The rest of an export, for an --out pointed at a clone (`--out .`, `--out sqlite:.`): the contact
+# list, the Android databases and recovered media, and the receipts naming what is in them.
+contacts.csv*
+msgstore.db*
+wa.db*
+Media/
+wawf_export.json
+_manifest.json
+sessions.json
+abprops.json

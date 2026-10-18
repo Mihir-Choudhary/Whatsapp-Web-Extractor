@@ -59,6 +59,19 @@ def stream_error_reason(n):
         return "WhatsApp's server is unavailable (503); try again later"
     return "the server ended the session (%s %s)" % (n.get("tag"), code or sorted(tags))
 
+def device_identity(account):
+    """The <device-identity> a prekey message carries: the account's signed device identity
+    (ADVSignedDeviceIdentity) as protobuf, as Baileys' encodeSignedDeviceIdentity(account, true).
+
+    creds_in.json keeps it as {details, accountSignatureKey, accountSignature, deviceSignature}, each
+    base64. It was base64-decoded as if it were one string, so the first prekey message -- sent whenever
+    the session with the phone has to be started -- raised TypeError and ended the run."""
+    if isinstance(account, (bytes, bytearray)): return bytes(account)
+    if isinstance(account, str): return base64.b64decode(account)
+    return b"".join(WR._fld_len(i, base64.b64decode(account[k]))
+                    for i, k in enumerate(("details", "accountSignatureKey", "accountSignature", "deviceSignature"), 1)
+                    if account.get(k))
+
 def _pub33(b):
     return b if len(b) == 33 else b"\x05" + b
 
@@ -404,13 +417,23 @@ class Client:
         return bundle
 
     def ensure_session(self, jid, force=False):
+        """Start a session with `jid` from its prekey bundle when the state holds no open one. -> started?
+        The state is read and changed under the crypto lock, as every Signal operation is: the reader
+        thread may be decrypting a message from the same device meanwhile. The bundle is fetched
+        outside it, since that reply is delivered by the reader thread."""
         addr = _addr(jid)
-        rec = self.signal.load_session(addr)
-        if force or not rec or not rec.have_open_session():
-            SC.SessionBuilder(self.signal, addr).init_outgoing(self.fetch_prekey_bundle(jid))
+        with self._crypto_lock:
+            rec = self.signal.load_session(addr)
+            if not (force or not rec or not rec.have_open_session()):
+                return False
+        bundle = self.fetch_prekey_bundle(jid)
+        with self._crypto_lock:
+            rec = self.signal.load_session(addr)
+            if not force and rec and rec.have_open_session():
+                return False                          # the device started one itself meanwhile
+            SC.SessionBuilder(self.signal, addr).init_outgoing(bundle)
             self.signal.save()
-            return True
-        return False
+        return True
 
     def send_peer(self, jid, message_bytes, attrs=None):
         """Encrypt a Message to one device of our own account and send it as a peer message. -> message id"""
@@ -420,7 +443,7 @@ class Client:
             self.signal.save()
         content = [N("enc", {"v": "2", "type": enc["type"]}, enc["body"])]
         if enc["type"] == "pkmsg":
-            content.append(N("device-identity", {}, base64.b64decode(self.creds["account"])))
+            content.append(N("device-identity", {}, device_identity(self.creds["account"])))
         mid = self.message_id()
         self.send(N("message", dict({"to": jid, "id": mid, "type": "text"}, **(attrs or {})), content))
         self.stats["sent"] += 1

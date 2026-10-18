@@ -120,6 +120,53 @@ chk("group subject resolved", ids.label("120300000009@g.us"), "Weekend plans")
 chk("own identity picked up from localStorage", ids.is_me("133400000001@lid"), True)
 chk("group membership read", len(ids.groups["120300000009@g.us"]["participants"]), 1)
 
+# --- a store whose newest rows are still in the write-ahead log, in an awkwardly named folder ----
+# Firefox keeps IndexedDB in WAL mode; on a profile copied from a running browser the newest messages
+# exist only in <file>-wal. An `immutable` open ignores that file; a raw path in a file: URI is cut at
+# '#' (and '%' starts an escape); and '[12]' in a glob pattern is a character class, so the stores
+# were not found at all. Each of them reads nothing here.
+print("\nwrite-ahead log and an awkward folder name")
+ORIGIN2 = os.path.join(tempfile.mkdtemp(), "Case #12 [A] 100%", "https+++web.whatsapp.com")
+os.makedirs(os.path.join(ORIGIN2, "idb"))
+dbp = os.path.join(ORIGIN2, "idb", "1234-meogdaerlo-x.sqlite")
+w = sqlite3.connect(dbp)
+w.execute("PRAGMA journal_mode=WAL"); w.execute("PRAGMA wal_autocheckpoint=0")
+w.execute("CREATE TABLE object_store(id INTEGER, name TEXT)")
+w.execute("CREATE TABLE object_data(object_store_id INTEGER, data BLOB)")
+w.execute("INSERT INTO object_store VALUES(1,'message')"); w.commit()
+w.execute("PRAGMA wal_checkpoint(TRUNCATE)")          # the tables reach the main file...
+WAL_MSGS = [{"id": "false_120300000009@g.us_W%d" % i, "type": "chat", "t": 10 + i,
+             "msgRowOpaqueData": {"iv": b"\x00" * 16, "_data": b"\x00" * 16, "_scheme": 1},
+             "from": "965000000001@lid"} for i in range(2)]
+for _ in WAL_MSGS:
+    w.execute("INSERT INTO object_data VALUES(1,?)", (snappy_raw(b"x"),))
+w.commit()                                             # ...and the messages only the log
+chk("the messages are only in the log", os.path.getsize(dbp + "-wal") > 0, True)
+seq2 = iter(WAL_MSGS)
+sclone.loads = lambda b: next(seq2)
+try:
+    _e, _ls, _r, msgs2, _m, _i = WD.load(origin=ORIGIN2)
+finally:
+    sclone.loads = real_loads
+w.close()
+chk("messages still in the log are read", sorted(m["id"] for m in msgs2), sorted(m["id"] for m in WAL_MSGS))
+
+# --- evidence on a network share ----------------------------------------------------------------
+# A UNC path in a file: URI was not found (raw), or refused as the URI's host (pathlib's as_uri).
+# This machine's own administrative share stands in for a network share; skipped where there is none.
+if os.name == "nt":
+    import idbutil
+    plain = os.path.join(os.path.dirname(dbp), "plain.sqlite")
+    w2 = sqlite3.connect(plain); w2.execute("CREATE TABLE t(a)"); w2.execute("INSERT INTO t VALUES(1)"); w2.commit(); w2.close()
+    drv, rest = os.path.splitdrive(os.path.abspath(plain))
+    unc = "\\\\localhost\\" + drv[0] + "$" + rest
+    if os.path.isfile(unc):
+        try: got = idbutil.connect_ro(unc).execute("SELECT count(*) FROM t").fetchone()[0]
+        except Exception as e: got = "%s: %s" % (type(e).__name__, e)
+        chk("a store on a network share (UNC path) is read", got, 1)
+    else:
+        print("  --   network-share case skipped (no \\\\localhost\\%s$ share here)" % drv[0])
+
 print()
 if FAIL:
     print("%d FAILED" % len(FAIL))

@@ -237,7 +237,9 @@ def recover(wanted, *paths, verbose=False, log=print):
     for root, sources in jobs:
         stats["roots"] += 1
         for label, pattern, extractors in sources:
-            for path in glob.iglob(os.path.join(root, pattern), recursive=True):
+            # the root is escaped: a '[' in a case folder's name is a glob character class, and every
+            # pattern under it matched nothing -- 0 of 3,135 cached files on such a copy
+            for path in glob.iglob(os.path.join(glob.escape(root), pattern), recursive=True):
                 if not os.path.isfile(path):
                     continue
                 try:

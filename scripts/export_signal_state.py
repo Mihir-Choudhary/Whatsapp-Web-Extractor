@@ -16,10 +16,10 @@ AES-CTR(key=encKey, IV=0) decrypts it. Prekeys/signed-prekeys are plaintext.
 
   python3 export_signal_state.py --origin <web.whatsapp.com dir> [--out signal_state.json]
 """
-import argparse, os, sys, json, base64, glob, sqlite3
+import argparse, os, sys, json, base64, glob
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from snappy_pure import uncompress
-from idbutil import store_id, as_bytes as ab   # shared byte-coercion helper
+from idbutil import store_id, connect_ro, as_bytes as ab   # shared byte-coercion helper
 import sclone
 import signal_sessions                          # browser -> node libsignal session translation
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -95,9 +95,9 @@ def main():
         return
     o = a.origin
     if not o: raise SystemExit("pass --origin (Firefox) or --profile (Chromium)")
-    sigp = glob.glob(o + "/idb/*seigganraolt-s*.sqlite")
+    sigp = glob.glob(glob.escape(o) + "/idb/*seigganraolt-s*.sqlite")
     if not sigp: raise SystemExit("signal-storage IndexedDB not found in " + o)
-    c = sqlite3.connect(f"file:{sigp[0]}?mode=ro&immutable=1", uri=True)
+    c = connect_ro(sigp[0])
     def _sid(name):                                    # store ids are per-profile; look up by NAME, clean error
         i = store_id(c, name)
         if i is None: raise SystemExit(f"signal-storage store '{name}' not found in {o}")

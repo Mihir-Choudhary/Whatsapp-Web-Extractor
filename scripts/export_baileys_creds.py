@@ -8,10 +8,10 @@ extracts the account identity, so we can log back in and capture a fresh compani
 Writes tools/reconnect/creds_in.json.
 """
 from __future__ import annotations
-import argparse, os, sys, json, base64, glob, sqlite3
+import argparse, os, sys, json, base64, glob
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from snappy_pure import uncompress
-from idbutil import store_id
+from idbutil import store_id, connect_ro
 import sclone
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
@@ -29,16 +29,16 @@ def as_bytes(x):
 # ---- engine-agnostic loader: returns (localStorage dict, root_ikm bytes, signal_meta [ {key,value} ]) ----
 def load_firefox(origin):
     ls = {}
-    c = sqlite3.connect(f"file:{origin}/ls/data.sqlite?mode=ro&immutable=1", uri=True)
+    c = connect_ro(f"{origin}/ls/data.sqlite")
     for k, v, comp in c.execute("SELECT key,value,compression_type FROM data"):
         if comp:
             try: v = uncompress(v if isinstance(v, (bytes, bytearray)) else v.encode("latin-1"))
             except Exception: pass
         ls[k] = v.decode("utf-8", "replace") if isinstance(v, (bytes, bytearray)) else v
     c.close()
-    wc = glob.glob(origin + "/idb/*wcanwec__bd*.sqlite")
+    wc = glob.glob(glob.escape(origin) + "/idb/*wcanwec__bd*.sqlite")
     if not wc: raise SystemExit("wawc_db_enc IndexedDB (*wcanwec__bd*) not found in " + origin)
-    kc = sqlite3.connect(f"file:{wc[0]}?mode=ro&immutable=1", uri=True)
+    kc = connect_ro(wc[0])
     kid = store_id(kc, "keys")                                    # by NAME; store ids are per-profile
     krow = kc.execute("SELECT data FROM object_data WHERE object_store_id=?", (kid,)).fetchone() if kid else None
     if not krow: raise SystemExit("root key store 'keys' not found/empty in wawc_db_enc")
@@ -50,8 +50,8 @@ def load_firefox(origin):
     j += 7
     root = d[j:d.find(b"\x00"*8, j)]
     meta = []
-    sg = glob.glob(origin + "/idb/*seigganraolt-s*.sqlite")
-    sig = sqlite3.connect(f"file:{sg[0]}?mode=ro&immutable=1", uri=True) if sg else None
+    sg = glob.glob(glob.escape(origin) + "/idb/*seigganraolt-s*.sqlite")
+    sig = connect_ro(sg[0]) if sg else None
     sid = store_id(sig, "signal-meta-store") if sig else None
     if sig and sid:
         for (dd,) in sig.execute("SELECT data FROM object_data WHERE object_store_id=?", (sid,)):

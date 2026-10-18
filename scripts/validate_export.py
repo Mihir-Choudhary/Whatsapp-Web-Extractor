@@ -71,8 +71,17 @@ def _fields_ok(m):
     extra = set(m) - FIELDS
     if not FIELDS <= set(m) or extra - OPTIONAL - {'body_status'}: return False
     if 'body_status' in m:
-        return not (m.get('text') or '').strip() and m['body_status'] in ('none', 'other-scheme', 'failed', 'encrypted')
+        return not (m.get('text') or '').strip() and m['body_status'] in ('none', 'other-scheme', 'failed', 'encrypted',
+                                                                           'receipt-only')
     return True
+# A record holding only a delivery receipt (an id and its ack; no time, type or body) is kept as a row
+# with body_status receipt-only, shown in the transcript under this time and line, and in msgstore.db
+# in wawf_receipt_only rather than as a message.
+NO_TIME = "time not recorded"
+RECEIPT_LINE = "(receipt only: the message itself is not in the store)"
+receipt_rows = [m for m in msgs if m.get('body_status') == 'receipt-only']
+chk("a receipt-only row is only that: no time, no type, no text",
+    not [m for m in receipt_rows if m.get('t') or m.get('type') or m.get('text')])
 chk("a call log row says how the call ended, how long and what kind",
     all(isinstance(m.get('call'), dict) and set(m['call']) == {'outcome', 'duration_s', 'video'}
         for m in msgs if m.get('type') == 'call_log' and m.get('source', 'cache') == 'cache'))
@@ -82,7 +91,8 @@ chk("every row has exactly the documented fields",
     all(_fields_ok(m) for m in msgs),
     next((sorted(set(m) ^ FIELDS) for m in msgs if not _fields_ok(m)), ''))
 chk("chat key matches each row's chat field", all(m.get('chat') == c for c, ml in ch.items() for m in ml))
-chk("no row has an empty timestamp", not [m for m in msgs if not m.get('t')])
+print("  ..   rows holding only a delivery receipt (no message in the store): %d" % len(receipt_rows))
+chk("no row has an empty timestamp", not [m for m in msgs if not m.get('t') and m.get('body_status') != 'receipt-only'])
 chk("rows sorted by time inside each chat",
     all([m.get('t') for m in ml] == sorted(m.get('t') for m in ml) for ml in ch.values()))
 # Rows carry their message id, so an identical row really is the same record twice. Without the id
@@ -186,7 +196,7 @@ def check_transcript():
     format -- `--out json:PATH` is a legitimate export with no transcript in it."""
     print("\n=== transcripts.txt ===")
     HDR = re.compile(r'^===== (.*?)  \[(.+?)\]  \((group|1:1); (\d+) msgs, (\d+) with text\) =====$')
-    MSG = re.compile(r'^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\] (->|<-) +(.*?): (.*)$')
+    MSG = re.compile(r'^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d|%s)\] (->|<-) +(.*?): (.*)$' % NO_TIME)
     blocks = []; cur = None; stray = []
     for ln in txt.split('\n'):
         m = HDR.match(ln)
@@ -207,8 +217,13 @@ def check_transcript():
           % (len(blocks), sum(len(b['lines']) for b in blocks), sum(b['cont'] for b in blocks),
              sum(b['re'] for b in blocks)))
     chk("no unclassifiable line", not stray, stray[:2])
+    def call_line(c):                      # a call log row reads "(video call: Completed, 48m03s)"
+        d = c.get('duration_s')
+        length = ((", %dh%02dm%02ds" % (d // 3600, d % 3600 // 60, d % 60)) if d >= 3600
+                  else ", %dm%02ds" % (d // 60, d % 60)) if d else ""
+        return "(%s call: %s%s)" % ("video" if c.get('video') else "voice", c.get('outcome') or "outcome not recorded", length)
     # Every chat with any message gets a block, and every message in it gets a line -- a message with
-    # no text of its own is shown as its type, not omitted.
+    # no text of its own is shown as its type, not omitted (a call as how it ended and how long).
     if ch:
         chk("one block per chat", len(blocks) == len([c for c, ml in ch.items() if ml]))
     chk("no duplicate blocks", len({b['jid'] for b in blocks}) == len(blocks))
@@ -228,13 +243,15 @@ def check_transcript():
         if len(rows) != len(b['lines']): continue          # already reported above
         for l, m in zip(b['lines'], rows):
             want = ("(view-once %s: content only on the phones)" % (m.get('type') or 'media') if m.get('view_once')
+                    else call_line(m['call']) if m.get('call')
+                    else RECEIPT_LINE if m.get('body_status') == 'receipt-only'
                     else "(%s)" % (m.get('type') or 'unknown'))
             if not m.get('text') and l[3] != want:
                 mismatched.append((b['jid'], l[0], l[3], want))
     chk("a message with no text of its own is shown as its type", not mismatched, mismatched[:2])
     chk("...and a line's timestamp matches the message it pairs with",
         not [1 for b in (blocks if ch else []) for l, m in zip(b['lines'], ch.get(b['jid'], []))
-             if len(ch.get(b['jid'], [])) == len(b['lines']) and l[0] != m.get('t')])
+             if len(ch.get(b['jid'], [])) == len(b['lines']) and l[0] != (m.get('t') or NO_TIME)])
     chk("every message has a line", not [b for b in blocks if b['msgs'] != len(b['lines'])],
         [(b['jid'], b['msgs'], len(b['lines'])) for b in blocks if b['msgs'] != len(b['lines'])][:2])
     if ch:
@@ -243,7 +260,9 @@ def check_transcript():
             "%d lines vs %d messages" % (sum(len(b['lines']) for b in blocks), len(msgs)))
     chk("blocks ordered busiest first",
         [b['msgs'] for b in blocks] == sorted((b['msgs'] for b in blocks), reverse=True))
-    chk("lines ordered by time", all([l[0] for l in b['lines']] == sorted(l[0] for l in b['lines']) for b in blocks))
+    _when = lambda l: '' if l[0] == NO_TIME else l[0]          # rows with no time sort first, as in chats.json
+    chk("lines ordered by time", all([_when(l) for l in b['lines']] == sorted(_when(l) for l in b['lines'])
+                                     for b in blocks))
     if not ch:
         print("  ..   chats.json is not in this export, so the cross-checks against it are skipped")
     miss = [(b['name'], l[2]) for b in blocks for l in b['lines']
@@ -262,10 +281,18 @@ if txt is None:
 else:
     check_transcript()
 
+def _ro(path):
+    """A read-only file: URI for `path` -- percent-encoded, so a folder named `Case #12` is not cut at
+    the '#', and with an empty authority, so a network share path opens (as idbutil.sqlite_uri; kept
+    here so this checker shares no code with what it checks)."""
+    from urllib.parse import quote
+    p = os.path.abspath(path).replace("\\", "/") if os.sep == "\\" else os.path.abspath(path)
+    return "file://" + quote(p if p.startswith("/") else "/" + p, safe="/:") + "?mode=ro"
+
 if DB:
     print("\n=== sqlite export ===")
-    con = sqlite3.connect('file:%s?mode=ro' % os.path.join(DB, 'msgstore.db'), uri=True)
-    con.execute("ATTACH DATABASE ? AS wa", ('file:%s?mode=ro' % os.path.join(DB, 'wa.db'),))
+    con = sqlite3.connect(_ro(os.path.join(DB, 'msgstore.db')), uri=True)
+    con.execute("ATTACH DATABASE ? AS wa", (_ro(os.path.join(DB, 'wa.db')),))
     q = lambda s: con.execute(s).fetchone()[0]
     # Which tables this database actually has, established ONCE before anything queries them.
     # export_sqlite creates every table in one `executescript`, so for an export THIS repo produced
@@ -290,7 +317,12 @@ if DB:
     print("  ..   messages %d  chats %d  jids %d  contacts %d"
           % (q("SELECT COUNT(*) FROM message"), q("SELECT COUNT(*) FROM chat"),
              q("SELECT COUNT(*) FROM jid"), q("SELECT COUNT(*) FROM wa.wa_contacts")))
-    chk("message count matches chats.json", q("SELECT COUNT(*) FROM message") == len(msgs))
+    # rows holding only a delivery receipt are not messages there: they are in wawf_receipt_only
+    chk("message count matches chats.json", q("SELECT COUNT(*) FROM message") == len(msgs) - len(receipt_rows),
+        "%d vs %d" % (q("SELECT COUNT(*) FROM message"), len(msgs) - len(receipt_rows)))
+    if has('wawf_receipt_only'):
+        chk("every receipt-only row of chats.json is in wawf_receipt_only, and only those",
+            q("SELECT COUNT(*) FROM wawf_receipt_only") == len(receipt_rows))
     # Same policy as the JSON: a repeated key_id means a version whose content differs was kept.
     # Reported, because an Android importer may still object to it, but not a defect here.
     print("  ..   repeated key_id (differing versions kept): %d"
@@ -353,6 +385,11 @@ if DB:
         print("  ..   call_log rows: %d" % q("SELECT COUNT(*) FROM call_log"))
         chk("every call row resolves to a jid",
             q("SELECT COUNT(*) FROM call_log WHERE jid_row_id NOT IN (SELECT _id FROM jid)") == 0)
+        # the message id names the chat: a call in a group must say so, or it reads as a direct call
+        chk("a call made in a group is linked to that group",
+            q("""SELECT COUNT(*) FROM call_log cl LEFT JOIN jid g ON g._id=cl.group_jid_row_id
+                 WHERE cl.call_id LIKE '%@g.us\\_%' ESCAPE '\\'
+                   AND (g.raw_string IS NULL OR instr(cl.call_id, '_' || g.raw_string || '_') = 0)""") == 0)
 
     # the Android correlation chain
     # Recovered group messages pulled before the extractor captured key.participant have no sender to
@@ -374,6 +411,21 @@ if DB:
     print("  ..   inbound senders resolving to a name or number: %d of %d" % (named, tot))
     chk("the sender correlation chain resolves", tot == 0 or named >= tot * 0.9,
         "%d of %d" % (named, tot))
+    # media on disk and message_media agree both ways: no file a message points at is missing, and no
+    # file is left over from an earlier export under a row id that is now another message
+    mdir = os.path.join(DB, 'Media', 'WhatsApp Web')
+    on_disk = {'Media/WhatsApp Web/' + f for f in (os.listdir(mdir) if os.path.isdir(mdir) else [])
+               if os.path.isfile(os.path.join(mdir, f))}
+    linked = {r[0] for r in con.execute("SELECT file_path FROM message_media WHERE file_path LIKE 'Media/%'")}
+    print("  ..   media files on disk: %d, referenced by message_media: %d" % (len(on_disk), len(linked)))
+    chk("every media file a message points at is on disk", linked <= on_disk, sorted(linked - on_disk)[:3])
+    chk("every media file on disk belongs to a message", on_disk <= linked, sorted(on_disk - linked)[:3])
+    # a contact filed under a phone-number jid has that number: Android tools look a person up by it
+    chk("every phone-number contact in wa.db carries its number",
+        q("""SELECT COUNT(*) FROM wa.wa_contacts WHERE jid LIKE '%@s.whatsapp.net'
+             AND COALESCE(number,'') <> substr(jid, 1, instr(jid, '@') - 1)""") == 0,
+        q("""SELECT COUNT(*) FROM wa.wa_contacts WHERE jid LIKE '%@s.whatsapp.net'
+             AND COALESCE(number,'') <> substr(jid, 1, instr(jid, '@') - 1)"""))
     # text agreement with chats.json, at every length. This used to skip texts of 2,000+ characters
     # because JSON truncated there -- which is how a cap that cut 16 messages short went unnoticed.
     jt = collections.Counter(m.get('text') for m in msgs if m.get('text'))

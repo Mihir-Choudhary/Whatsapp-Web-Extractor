@@ -43,7 +43,7 @@ try:
         app.key_mode.set("online"); app.key.set(""); app.fetch_media.set(False)
         app.history.set(False); app.refetch.set(False); app.install_node.set(False); app.queue.set(False)
         app.raw_keys.set(False); app.verbose.set(False); app.audit_mode.set("on"); app.creds.set("")
-        app.case_id.set(""); app.examiner.set(""); app.case_notes.set("")
+        app.case_id.set(""); app.examiner.set(""); app.case_notes.set(""); app.chats.set("")
         app.st_idb.set(""); app.st_ls.set(""); app.st_cache.set("")
     def args():
         cmd, _ = app._command()
@@ -64,6 +64,15 @@ try:
     check("online key capture is the default (no --offline, no --key)", "--offline" not in a and "--key" not in a)
     check("audit database and log file inside the results folder",
           pair(a, "--audit-db") == os.path.join(out, "wawf_audit.db") and pair(a, "--log-file") == os.path.join(out, "wawf.log"))
+
+    print("only some chats")
+    reset(); app.chats.set(" Book club ; +1 555 555 0101;;120363000000000001@g.us "); a = args()
+    check("one --chat per entry, trimmed, empty entries ignored",
+          [a[i + 1] for i, x in enumerate(a) if x == "--chat"] == ["Book club", "+1 555 555 0101", "120363000000000001@g.us"])
+    reset(); a = args()
+    check("no --chat when the field is empty", "--chat" not in a)
+    reset(); app.chats.set("Book club"); app.fmt_raw.set(True)
+    check("chats with the raw dump is refused", refused("raw store dump"))
 
     print("outputs and keys")
     reset(); app.fmt_raw.set(True); app.raw_keys.set(True); a = args()

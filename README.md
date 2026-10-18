@@ -35,7 +35,7 @@ python3 wawf.py <PROFILE> [options]
 ```
 
 <sub>(or install them by hand: `pip install cryptography cramjam websocket-client` and
-`pip install "git+https://github.com/cclgroupltd/ccl_chromium_reader.git"`)</sub>
+`pip install "git+https://github.com/cclgroupltd/ccl_chromium_reader.git@ef840de30221c4d65bc96d2f4d9057e9ef2f526d"`, the commit the tool is tested against)</sub>
 
 (A prebuilt `wawf-linux-x64` binary is also on the [releases page](../../releases/latest), and you can
 build your own binary for any OS with `pyinstaller wawf.spec` — see [BUILD.md](BUILD.md).)
@@ -177,16 +177,29 @@ re-order how a line renders and this file's whole premise is that every line is 
 interpretation of it. Every message in the store is written, including one whose body cannot be
 turned into text: such a row has empty `text` and one extra field, `body_status` — `none` (no body
 was stored, e.g. a message deleted by its sender), `other-scheme` (a body this key does not open), or
-`failed`. `identities.json` is the correlation table itself: jid ↔ lid ↔ phone ↔ name ↔ pushname, where
+`failed`. One more kind of record is not a message at all: `receipt-only` is a message id and its
+delivery state, with no time, no type and no body, which WhatsApp Web keeps when a receipt arrives
+for a message it does not hold. It is kept as a row (`[time not recorded] … (receipt only: the message
+itself is not in the store)` in the transcript), sits in its own `wawf_receipt_only` table in
+`msgstore.db` rather than among the messages, and is replaced when `--history` recovers the message
+itself. `identities.json` is the correlation table itself: jid ↔ lid ↔ phone ↔ name ↔ pushname, where
 each label came from, which contacts are in the address book, plus group subjects, members, **past**
 members and admins. That mapping is the one thing the browser holds and the wire format does not: a
 lid-keyed contact record carries the matching `phoneNumber`, and on disk that is the only place the
-lid→phone link exists.
+lid→phone link exists. `contacts.csv` is the contact store for a spreadsheet: a value a spreadsheet
+would run as a formula (one starting with `=`, `+`, `-` or `@` — names and *about* texts are typed by
+the contacts themselves) is written with a leading `'`; `identities.json` and `wa.db` keep it exactly.
 
 The SQLite export carries the same correlation natively, in the Android shape a msgstore parser
 expects (`message.sender_jid_row_id` → `jid`, `chat.jid_row_id` → `jid`, `jid` → `wa_contacts`), so
 tools built for Android databases resolve senders from it without any extra work. Quoted text lands
 in `message_quoted.text_data`, which is where such a parser looks for it.
+
+Media files are named after their message's row id (`Media/WhatsApp Web/<row id>.<ext>`), and an
+export written again into the same folder numbers its rows afresh, so the files already there are
+renamed to their messages' new row ids. A file whose message is not in the new export (another chat,
+with `--chat`) is moved to `Media/previous-export/`, named after its message key, and not deleted:
+a file downloaded from the CDN may not be downloadable a second time. The audit database records both.
 
 #### Checking an export
 
@@ -241,6 +254,7 @@ A Windows drive letter is never mistaken for a `FORMAT`, so `D:\case\out` works 
 |---|---|
 | `--key FILE` | A `companion_enc_static.txt` captured earlier — decrypt without touching the network. Usually unnecessary: a copy left beside the output is found automatically. A **file**, never the key itself, so no secret reaches your shell history, process list or command auditing. |
 | `--offline` | Never contact WhatsApp. Decrypts with `--key` (or a key file found beside the output); with no key, exports **everything except message text** — chats, senders, timestamps, types, media keys and cached media, reactions, polls, calls, contacts, groups. |
+| `--chat WHO` | Only this conversation: a contact or group name, a phone number with its country code, a lid or a jid; repeat for several. The export holds those chats only and `--history` asks the phone about those chats only — see [One conversation only](#one-conversation-only----chat). |
 | `--partition WHICH` | When a profile holds more than one WhatsApp session: the account number, storage key or layout name to examine. |
 | `--list-partitions` | List every WhatsApp session in the profile (account, messages, key present) and stop. |
 | `--origin DIR` | Firefox `web.whatsapp.com` storage folder instead of a profile folder. |
@@ -251,6 +265,7 @@ A Windows drive letter is never mistaken for a `FORMAT`, so `D:\case\out` works 
 | `--history-refetch` | With `--history`: re-ask for history already recovered, to fill in fields an earlier run did not capture (the group sender). Finds nothing new by design. |
 | `--install-node` | Only with the optional Node engine (`WAWF_HISTORY_ENGINE=node`): allow `--history` to install Node.js via winget when none is found. **Not** covered by `--yes`: it modifies the machine and asks for elevation. A portable Node unzipped beside the tool, or `WAWF_NODE` pointing at one, needs neither. |
 | `--no-audit` | Do **not** write the chain-of-custody database. It is written by default (see below). |
+| `-v`, `--log-file FILE` | Full logs and tracebacks; mirror them to a file. |
 
 Sender resolution is **reported, not assumed** — a run prints where every label came from, so the one
 number that matters is visible:
@@ -261,7 +276,31 @@ senders identified: address-book=14,250  pushname=7,325  phone=543  unresolved=0
 
 `unresolved` counts messages from jids the profile itself holds no name and no number for. On a
 healthy profile it is zero; anything else is a gap in the evidence, not a gap in the tool.
-| `-v`, `--log-file FILE` | Full logs and tracebacks; mirror them to a file. |
+
+### One conversation only — `--chat`
+
+When an examination covers named conversations only, `--chat` keeps everything else out:
+
+```
+wawf <PROFILE> --chat "Book club" --chat +15555550101 --out D:\case\out
+wawf <PROFILE> --chat 123456789012345@lid --history --out D:\case\out
+```
+
+- **A phone number, its lid and its jid are one person.** WhatsApp files newer chats under the lid and
+  older ones under the number; both are found, whichever form is given. A number needs its country code.
+- **A name is matched exactly** (case and spacing aside) against the address-book name, the contact's own
+  name, a group's subject and the chat's name.
+- **Never a guess.** A name or number that fits more than one chat, or none, stops the run (exit 2) and
+  lists the candidates with their numbers; run again with one of those.
+- **The chat must hold at least one message in the browser.** History is asked for as "older than this
+  message", so a contact with no chat in the browser cannot be asked.
+- **What is scoped:** chats.json, transcripts.txt and msgstore.db hold those chats only; identities.json,
+  contacts.csv and wa.db the people in them; group membership the chosen groups only. The receipt
+  (`wawf_export.json`) records the scope. `raw` is refused with `--chat`, because it is an image of the whole store.
+- **What cannot be scoped:** signing in delivers whatever the server holds for the device. `--queue`
+  and `--history` keep that, as received, in their own folders (they say so when `--chat` is given);
+  only the chosen chats' messages are merged into the export. On a profile with several sessions,
+  `--partition` must name the one to search.
 
 ## What a browser holds — and what it does not
 
@@ -511,9 +550,16 @@ address book wins where it has an entry.
 
 It runs **iteratively**: each pass re-anchors every chat on the oldest message recovered so far and pulls
 deeper, accumulating (deduped) until a pass stops finding meaningfully more. Progress is checkpointed to
-`tools/reconnect/history_all.json` after every pass, so it is **crash-safe and resumable** — re-running
+`history_all.json` after every pass, so it is **crash-safe and resumable** — re-running
 `wawf <PROFILE> --history` continues from where the last run left off (older than everything already
 recovered) rather than re-pulling the same window.
+
+**One folder per linked device.** Everything a history run keeps — the credentials and Signal state it
+signs in with, the resume ledger, the per-chat state, the kept chunks and what the server delivered —
+is in `devices/<account>-<device>/` inside `tools/reconnect/` (run from a checkout) or inside
+`wawf-history/` beside the `.exe`. So an examination of one account never resumes, asks for, or exports
+another account's history. Files an earlier version left directly in that folder move into their
+device's own folder on its next run.
 
 **What has to be recovered for this to work.** The phone's answer comes back as a normal end-to-end
 encrypted message, so authenticating as the linked device is not enough — the Signal state has to come
@@ -527,7 +573,8 @@ before it can be recognised as a history reply — indistinguishable from "the p
 A ratchet is live state, though, not a file: the copy in the profile is a snapshot that the phone has
 already moved past. So `wawf` renegotiates the session with your own device from a freshly fetched
 prekey bundle, asks any sender it cannot read to re-encrypt (a retry receipt carrying our keys), and
-**persists everything it learns** in `signal_runtime.json` beside the output, so the next run continues
+**persists everything it learns** in `signal_runtime.py.json` (`signal_runtime.json` for the Node engine) in
+the device's folder, so the next run continues
 from the live ratchet instead of the stale snapshot. That file is key material — protect it like the
 credentials. Your browser's own stored session for this linked device goes stale as a result; WhatsApp
 Web re-establishes it by itself the next time you open it. The profile and the phone are not modified.
@@ -545,7 +592,8 @@ So **an empty pass is not a reason to run it again immediately** — that spends
 extends the quiet window. Diagnose instead:
 
 ```bash
-node tools/reconnect/diag_onehistory.js      # ONE request, every inbound stanza logged
+cd tools/reconnect/devices/<account>-<device>    # the device's folder: the tools read their inputs here
+node ../../diag_onehistory.js                    # ONE request, every inbound stanza logged
 ```
 
 It separates causes that otherwise look identical: no ack means the stanza was never accepted (not a
@@ -563,15 +611,16 @@ offline queue the client had not finished pulling (below), with the phone's answ
    connected. (The Baileys library asks for one batch of 100 and stops; with a ~2,000-item backlog
    that was the whole reason history appeared to stop working.)
 2. **Ask, chat by chat**, skipping chats the phone has said are finished and asking chats that have
-   stayed silent last (`tools/reconnect/history_chat_state.json` remembers both across runs).
+   stayed silent last (`history_chat_state.json` in the device's folder remembers both across runs).
 3. **Each answer** is downloaded, decrypted, kept in `history_chunks/`, then released from the CDN
    the way WhatsApp Web releases it. The log records when the phone produced it.
 4. **Before disconnecting**, if a request went unanswered the client waits for late answers.
    Answers that arrive on a later connection are still banked.
 
-**Side effect.** Draining receives and acknowledges everything pending for the device slot. While the
-tool rides the browser profile's registration (the default, unless `pair.js` has been run), those
-items are not redelivered to the browser.
+**Side effect.** Draining receives everything pending for the device slot. The default client acknowledges
+nothing (`WAWF_HISTORY_ACK=none`), so the server delivers it again to the browser the next time it
+connects. The Node engine acknowledges what it receives; while it rides the browser profile's
+registration (unless `pair.js` has been run), those items are not redelivered to the browser.
 
 Settings (environment variables, all optional):
 
@@ -608,10 +657,11 @@ the least invasive option on an examination machine — nothing is installed and
 
 ```bash
 node tools/reconnect/pair.js           # one-time: link the tool as its OWN device (needs the phone)
-node tools/reconnect/rehydrate_history.js --dry-run   # re-read kept chunks; what would change?
-node tools/reconnect/diag_health.js    # 60s: CONNECT / REGISTERED / SERVED, reported separately
-node tools/reconnect/diag_abprops.js   # which features the server has enabled for this client
-python3 scripts/check_identity.py --profile <PROFILE> --dir tools/reconnect
+python3 scripts/check_identity.py --profile <PROFILE> --dir tools/reconnect/devices/<account>-<device>
+cd tools/reconnect/devices/<account>-<device>   # the tools below read this device's files from here
+node ../../rehydrate_history.js --dry-run       # re-read kept chunks; what would change?
+node ../../diag_health.js    # 60s: CONNECT / REGISTERED / SERVED, reported separately
+node ../../diag_abprops.js   # which features the server has enabled for this client
 ```
 
 `diag_health` matters because a **revoked** companion still completes the handshake and still reaches

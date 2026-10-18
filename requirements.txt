@@ -5,5 +5,7 @@ cryptography
 cramjam                 # pure-Python Snappy (Firefox IndexedDB + cached media)
 websocket-client        # imported as `websocket`; used by the pure-Python reconnect
 # Chromium/Chrome/Edge/Brave/Opera support (LevelDB + V8 deserialization):
-ccl_chromium_reader @ git+https://github.com/cclgroupltd/ccl_chromium_reader.git
+# Pinned to the commit this tool is tested against: chromium_reader.py patches ccl's LevelDB reader
+# internals (to survive damaged copies), so an upstream change there must be taken deliberately.
+ccl_chromium_reader @ git+https://github.com/cclgroupltd/ccl_chromium_reader.git@ef840de30221c4d65bc96d2f4d9057e9ef2f526d
 # For building the standalone binary, additionally: pip install pyinstaller  (see BUILD.md)

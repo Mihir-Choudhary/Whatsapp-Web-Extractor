@@ -126,7 +126,7 @@ def find_profiles(max_depth=4):
 
 def _ls_mentions_wa(ls_dir):
     """Cheap check (no parsing): does this profile's localStorage hold any web.whatsapp.com key?"""
-    for f in glob.glob(os.path.join(ls_dir, "*.l*")):
+    for f in glob.glob(os.path.join(glob.escape(ls_dir), "*.l*")):
         try:
             with open(f, "rb") as fh:
                 if b"web.whatsapp.com" in fh.read(): return True
@@ -447,6 +447,13 @@ class App(tk.Tk):
         self._toggle(c, "Also record what WhatsApp's server is holding for this device "
                         "(online; nothing is taken from it)",
                      self.queue).grid(row=5, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        sc = ttk.Frame(c, style="Card.TFrame", padding=0); sc.configure(borderwidth=0)
+        sc.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 0)); sc.columnconfigure(1, weight=1)
+        ttk.Label(sc, text="Only these chats (optional)", style="Card.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.chats = tk.StringVar()
+        self._tip(ttk.Entry(sc, textvariable=self.chats, font=FONT), "chat").grid(row=0, column=1, sticky="ew")
+        ttk.Label(sc, text="a name, phone number with country code, lid or jid; separate several with ;",
+                  style="Help.TLabel").grid(row=1, column=1, sticky="w")
 
         # 3 — key
         c = self._card(form, "3", "Message key")
@@ -731,6 +738,10 @@ class App(tk.Tk):
         if (self.refetch.get() or self.install_node.get()) and not hist:
             raise ValueError("'Only re-ask chats…' and 'Allow installing Node.js' belong to history recovery; "
                              "tick that too, or untick them.")
+        chats = [x.strip() for x in self.chats.get().split(";") if x.strip()]
+        if chats and self.fmt_raw.get():
+            raise ValueError("The raw store dump is an image of the whole store and cannot hold some chats only; "
+                             "untick it, or clear 'Only these chats'.")
         if self.raw_keys.get() and not self.fmt_raw.get():
             raise ValueError("'Include key material' applies to the raw store dump; tick that output too.")
         if mode == "file" and (not self._keys() or not all(os.path.isfile(k) for k in self._keys())):
@@ -743,6 +754,7 @@ class App(tk.Tk):
         if self.fmt_sqlite.get(): cmd += ["--out", "sqlite:" + os.path.join(out, "database")]
         if self.fmt_raw.get(): cmd += ["--out", "raw:" + os.path.join(out, "raw")]
         if self.raw_keys.get(): cmd += ["--raw-include-keys"]
+        for x in chats: cmd += ["--chat", x]
         if mode == "file":
             # a key file never needs the sign-in; stay offline unless something else must go online
             for k in self._keys():
